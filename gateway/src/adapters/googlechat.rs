@@ -292,17 +292,13 @@ impl GoogleChatAdapter {
         };
 
         let formatted = markdown_to_gchat(text);
-        let url = format!("{}/{}?updateMask=text", self.api_base, message_name);
+        let url = format!(
+            "{}/{}?updateMask=text",
+            self.api_base, message_name
+        );
         let body = serde_json::json!({ "text": formatted });
 
-        match self
-            .client
-            .patch(&url)
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await
-        {
+        match self.client.patch(&url).bearer_auth(&token).json(&body).send().await {
             Ok(r) if r.status().is_success() => {
                 tracing::trace!(message_name = %message_name, "googlechat message edited");
             }
@@ -326,8 +322,7 @@ impl GoogleChatAdapter {
         match reply.command.as_deref() {
             Some("add_reaction") | Some("remove_reaction") | Some("create_topic") => return,
             Some("edit_message") => {
-                self.edit_message(&reply.reply_to, &reply.content.text)
-                    .await;
+                self.edit_message(&reply.reply_to, &reply.content.text).await;
                 return;
             }
             _ => {}
@@ -463,7 +458,10 @@ pub async fn webhook(
 
     if let Some(ref adapter) = state.google_chat {
         if let Some(ref verifier) = adapter.jwt_verifier {
-            let auth_header = match headers.get("authorization").and_then(|v| v.to_str().ok()) {
+            let auth_header = match headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+            {
                 Some(h) => h,
                 None => {
                     warn!("googlechat webhook: missing authorization header");
@@ -533,7 +531,12 @@ pub async fn webhook(
 
     let thread_id = msg.thread.as_ref().map(|t| t.name.clone());
 
-    let message_id = msg.name.rsplit('/').next().unwrap_or(&msg.name).to_string();
+    let message_id = msg
+        .name
+        .rsplit('/')
+        .next()
+        .unwrap_or(&msg.name)
+        .to_string();
 
     // No attachments → emit event synchronously and respond 200
     if media_refs.is_empty() {
@@ -771,9 +774,7 @@ impl GoogleChatTokenCache {
     }
 
     async fn refresh(&self, client: &reqwest::Client) -> Result<(String, u64), String> {
-        let jwt = self
-            .build_jwt()
-            .map_err(|e| format!("JWT build error: {e}"))?;
+        let jwt = self.build_jwt().map_err(|e| format!("JWT build error: {e}"))?;
         let resp = client
             .post("https://oauth2.googleapis.com/token")
             .form(&[
@@ -826,7 +827,8 @@ impl GoogleChatTokenCache {
         let key = jsonwebtoken::EncodingKey::from_rsa_pem(self.private_key.as_bytes())
             .map_err(|e| format!("RSA key parse error: {e}"))?;
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-        jsonwebtoken::encode(&header, &claims, &key).map_err(|e| format!("JWT encode error: {e}"))
+        jsonwebtoken::encode(&header, &claims, &key)
+            .map_err(|e| format!("JWT encode error: {e}"))
     }
 }
 
@@ -1442,10 +1444,7 @@ mod tests {
         let msg = payload.message.as_ref().unwrap();
         assert_eq!(msg.argument_text.as_deref(), Some("hi"));
         assert_eq!(msg.thread.as_ref().unwrap().name, "spaces/SP/threads/t1");
-        assert_eq!(
-            payload.space.as_ref().unwrap().space_type.as_deref(),
-            Some("ROOM")
-        );
+        assert_eq!(payload.space.as_ref().unwrap().space_type.as_deref(), Some("ROOM"));
     }
 
     #[test]
@@ -1808,16 +1807,15 @@ mod tests {
 
     #[tokio::test]
     async fn handle_reply_sends_gateway_response_success() {
-        use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
 
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path_regex("/spaces/.*/messages"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"name": "spaces/TEST/messages/msg_abc"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/TEST/messages/msg_abc"}),
+            ))
             .mount(&mock_server)
             .await;
 
@@ -1856,8 +1854,8 @@ mod tests {
 
     #[tokio::test]
     async fn handle_reply_sends_failure_response_on_api_error() {
-        use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
 
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1898,17 +1896,13 @@ mod tests {
         assert!(!resp.success);
         assert!(resp.message_id.is_none());
         let err = resp.error.expect("error should be set on send failure");
-        assert!(
-            err.contains("500"),
-            "error should include status code, got: {}",
-            err
-        );
+        assert!(err.contains("500"), "error should include status code, got: {}", err);
     }
 
     #[tokio::test]
     async fn handle_reply_empty_message_short_circuits() {
-        use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
 
         let mock_server = MockServer::start().await;
         // Mount a mock that would fail the test if called
@@ -1945,10 +1939,7 @@ mod tests {
         adapter.handle_reply(&reply, &event_tx).await;
 
         let received = event_rx.try_recv();
-        assert!(
-            received.is_ok(),
-            "expected failure GatewayResponse for empty message"
-        );
+        assert!(received.is_ok(), "expected failure GatewayResponse for empty message");
         let resp: GatewayResponse = serde_json::from_str(&received.unwrap()).unwrap();
         assert_eq!(resp.request_id, "req_empty");
         assert!(!resp.success);
@@ -1957,8 +1948,8 @@ mod tests {
 
     #[tokio::test]
     async fn handle_reply_multi_chunk_failure_includes_error() {
-        use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
 
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -2039,16 +2030,15 @@ mod tests {
 
     #[tokio::test]
     async fn handle_reply_edit_message_does_not_send_response() {
-        use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
 
         let mock_server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .and(path_regex("/spaces/.*/messages/.*"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"name": "spaces/SP/messages/msg1"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/SP/messages/msg1"}),
+            ))
             .mount(&mock_server)
             .await;
 
@@ -2083,16 +2073,15 @@ mod tests {
 
     #[tokio::test]
     async fn handle_reply_multi_chunk_sends_gateway_response() {
-        use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
 
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path_regex("/spaces/.*/messages"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"name": "spaces/TEST/messages/first_chunk"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/TEST/messages/first_chunk"}),
+            ))
             .mount(&mock_server)
             .await;
 
@@ -2127,10 +2116,7 @@ mod tests {
         let resp: GatewayResponse = serde_json::from_str(&received.unwrap()).unwrap();
         assert_eq!(resp.request_id, "req_multi");
         assert!(resp.success);
-        assert_eq!(
-            resp.message_id,
-            Some("spaces/TEST/messages/first_chunk".into())
-        );
+        assert_eq!(resp.message_id, Some("spaces/TEST/messages/first_chunk".into()));
     }
 
     #[tokio::test]
@@ -2138,17 +2124,16 @@ mod tests {
         // Mixed success/failure: chunk 1 succeeds, subsequent chunks fail.
         // Expect success=false (any chunk failure marks overall as failed),
         // but message_id is still set so core has a reference.
-        use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
 
         let mock_server = MockServer::start().await;
         // First request: 200 OK with message name
         Mock::given(method("POST"))
             .and(path_regex("/spaces/.*/messages"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"name": "spaces/TEST/messages/first_chunk"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/TEST/messages/first_chunk"}),
+            ))
             .up_to_n_times(1)
             .mount(&mock_server)
             .await;
@@ -2190,10 +2175,7 @@ mod tests {
         let resp: GatewayResponse = serde_json::from_str(&received.unwrap()).unwrap();
         assert_eq!(resp.request_id, "req_partial");
         assert!(!resp.success, "partial failure must report success=false");
-        assert_eq!(
-            resp.message_id,
-            Some("spaces/TEST/messages/first_chunk".into())
-        );
+        assert_eq!(resp.message_id, Some("spaces/TEST/messages/first_chunk".into()));
         let err = resp.error.expect("partial failure should set error");
         assert!(err.contains("500"));
     }
