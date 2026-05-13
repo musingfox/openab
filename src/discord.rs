@@ -89,7 +89,10 @@ impl ChatAdapter for DiscordAdapter {
         let builder = serenity::builder::CreateMessage::new()
             .content(content)
             .reference_message((ChannelId::new(ch_id), MessageId::new(msg_id)));
-        match ChannelId::new(ch_id).send_message(&self.http, builder).await {
+        match ChannelId::new(ch_id)
+            .send_message(&self.http, builder)
+            .await
+        {
             Ok(msg) => Ok(MessageRef {
                 channel: channel.clone(),
                 message_id: msg.id.to_string(),
@@ -105,7 +108,9 @@ impl ChatAdapter for DiscordAdapter {
     async fn delete_message(&self, msg: &MessageRef) -> anyhow::Result<()> {
         let ch_id: u64 = Self::resolve_channel(&msg.channel).parse()?;
         let msg_id: u64 = msg.message_id.parse()?;
-        self.http.delete_message(ChannelId::new(ch_id), MessageId::new(msg_id), None).await?;
+        self.http
+            .delete_message(ChannelId::new(ch_id), MessageId::new(msg_id), None)
+            .await?;
         Ok(())
     }
 
@@ -415,10 +420,13 @@ impl EventHandler for Handler {
         let in_allowed_channel =
             self.allow_all_channels || self.allowed_channels.contains(&channel_id);
 
-        let is_mentioned =
-            msg.mentions_user_id(bot_id) || msg.content.contains(&format!("<@{}>", bot_id))
+        let is_mentioned = msg.mentions_user_id(bot_id)
+            || msg.content.contains(&format!("<@{}>", bot_id))
             || (!self.allowed_role_ids.is_empty()
-                && msg.mention_roles.iter().any(|r| self.allowed_role_ids.contains(&r.get())));
+                && msg
+                    .mention_roles
+                    .iter()
+                    .any(|r| self.allowed_role_ids.contains(&r.get())));
 
         // Bot message gating (from upstream #321)
         if msg.author.bot {
@@ -1341,7 +1349,9 @@ fn resolve_mentions(content: &str, bot_id: UserId, allowed_role_ids: &HashSet<u6
     let out = if allowed_role_ids.is_empty() {
         out
     } else {
-        allowed_role_ids.iter().fold(out, |s, id| s.replace(&format!("<@&{}>", id), ""))
+        allowed_role_ids
+            .iter()
+            .fold(out, |s, id| s.replace(&format!("<@&{}>", id), ""))
     };
     // 3. Other user mentions: keep <@UID> as-is so the LLM can mention back
     // 4. Fallback: replace remaining role mentions only (user mentions are preserved)
