@@ -5,6 +5,7 @@ on:
     paths:
       - "src/**"
       - "gateway/**"
+      - "gateway/Cargo.lock"
       - "Cargo.toml"
       - "Cargo.lock"
       - "Dockerfile*"
