@@ -16,7 +16,7 @@ As a team lead, I want agents to self-organize ("escape room" mode) — I tell t
 Requirements:
 - Extend existing usercron `[[jobs]]` with a `disable_on_success` field
 - Before sending the scheduled message, run the specified command
-- If command exits 0 → goal achieved, post `✅ Goal achieved` to thread, auto-disable the job, do NOT send the regular failure message
+- If command exits 0 (and stdout contains `disable_on_success_match` if set) → goal achieved, post `✅ Goal achieved` to thread, auto-disable the job, do NOT send the regular failure message
 - If command exits non-zero → goal not met, send message as normal (agents continue working)
 - Auto-disable state must persist across restarts
 - Human can re-enable a completed goal by setting `enabled = true`
@@ -66,6 +66,7 @@ channel = "123456789012345678"
 thread_id = ""                                    # auto-created on first fire if empty
 message = "Goal not met: all unit tests must pass. Please continue working."
 disable_on_success = "npm test"                   # command to evaluate goal
+disable_on_success_match = "SUCCESS"              # optional: stdout must contain this string
 disable_on_success_timeout_secs = 60              # command timeout
 disable_on_success_working_dir = "/repo"          # working directory
 enabled = true                                    # scheduler sets to false on success
@@ -76,7 +77,8 @@ enabled = true                                    # scheduler sets to false on s
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `id` | ✅ (when `disable_on_success` set) | — | Stable unique identifier for state persistence. Missing `id` on a job with `disable_on_success` is a **startup error**. |
-| `disable_on_success` | | — | Shell command; exit 0 = goal achieved, auto-disable |
+| `disable_on_success` | | — | Shell command; exit 0 + match = goal achieved, auto-disable |
+| `disable_on_success_match` | | — | If set, stdout must contain this string (in addition to exit 0) for goal to be considered achieved |
 | `disable_on_success_timeout_secs` | | `60` | Max seconds before command is killed |
 | `disable_on_success_working_dir` | | — | Working directory for command execution |
 
@@ -100,9 +102,22 @@ CronJob schedule fires
           Yes  │  No / Timeout
            │   │    │
            ▼   │    ▼
-     Post ✅,       Send message
-     set enabled    to channel/thread
-     = false        (agents keep working)
+     match set?     Send message
+      │    │        to channel/thread
+     Yes   No       (agents keep working)
+      │    │
+      ▼    ▼
+  stdout   Post ✅,
+  contains set enabled
+  match?   = false
+      │
+  ┌───┴───┐
+ Yes      No
+  │        │
+  ▼        ▼
+Post ✅,  Send message
+set enabled (goal not confirmed)
+= false
 ```
 
 ### State Persistence
