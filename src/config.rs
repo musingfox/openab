@@ -336,6 +336,8 @@ pub struct PoolConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CronJobConfig {
+    /// Stable ID for usercron jobs that need scheduler writeback.
+    pub id: Option<String>,
     /// Whether this cronjob is active (default: true)
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -356,6 +358,17 @@ pub struct CronJobConfig {
     /// Timezone (default: "UTC")
     #[serde(default = "default_cron_timezone")]
     pub timezone: String,
+    /// Usercron-only: command to run before firing. Exit 0 plus a matching
+    /// `disable_on_success_match` means the goal is complete and the scheduler
+    /// disables the job in the usercron file.
+    pub disable_on_success: Option<String>,
+    /// Usercron-only: required output marker for `disable_on_success`.
+    pub disable_on_success_match: Option<String>,
+    /// Usercron-only: timeout for `disable_on_success`.
+    #[serde(default = "default_disable_on_success_timeout_secs")]
+    pub disable_on_success_timeout_secs: u64,
+    /// Usercron-only: working directory for `disable_on_success`.
+    pub disable_on_success_working_dir: Option<String>,
 }
 
 fn default_cron_platform() -> String {
@@ -366,6 +379,9 @@ fn default_cron_sender() -> String {
 }
 fn default_cron_timezone() -> String {
     "UTC".into()
+}
+fn default_disable_on_success_timeout_secs() -> u64 {
+    60
 }
 
 /// Controls how tool calls are rendered in chat messages.

@@ -257,6 +257,33 @@ timezone = "UTC"
 
 The external `cronjob.toml` uses `[[jobs]]` (same fields). See [Usercron docs](cronjob.md#usercron--hot-reload-with-cronjobtoml) for details.
 
+### Usercron-only `[[jobs]]` fields
+
+These fields are valid only in the external usercron file, for example `$HOME/.openab/cronjob.toml`. They are rejected in baseline `[[cron.jobs]]` because OpenAB only writes state back to the user-managed cron file.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `id` | string | *required with `disable_on_success`* | Stable job ID used when the scheduler writes `enabled = false` or `thread_id` back to `cronjob.toml`. |
+| `disable_on_success` | string | — | Command to run before sending the scheduled prompt. |
+| `disable_on_success_match` | string | *required with `disable_on_success`* | Marker that must appear in stdout or stderr, in addition to exit code `0`, before the job is considered complete. |
+| `disable_on_success_timeout_secs` | integer | `60` | Timeout for the completion check command. |
+| `disable_on_success_working_dir` | string | — | Working directory for the completion check command. |
+
+Example:
+
+```toml
+[[jobs]]
+id = "fix-unit-tests"
+enabled = true
+schedule = "*/10 * * * *"
+channel = "123456789"
+message = "Unit tests are still failing. Continue fixing them."
+disable_on_success = "npm test && echo OPENAB_GOAL_SUCCESS"
+disable_on_success_match = "OPENAB_GOAL_SUCCESS"
+disable_on_success_timeout_secs = 120
+disable_on_success_working_dir = "/workspace/my-project"
+```
+
 **Cron expression format:**
 
 ```
