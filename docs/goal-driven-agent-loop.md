@@ -47,32 +47,38 @@ Minimal extension to existing `[[cron.jobs]]` — add a single field `disable_on
 
 ```toml
 [[cron.jobs]]
+id = "unit-tests-pass"                            # REQUIRED for disable_on_success jobs
 schedule = "*/10 * * * *"
 channel = "123456789012345678"
 thread_id = ""                                    # optional: auto-created on first fire if empty
 message = "Goal not met: all unit tests must pass. <@&1496247626675257384> please continue."
-disable_on_success = "cd /repo && npm test"       # NEW: command to evaluate goal
-timeout = 60                                      # NEW: command timeout in seconds
-working_dir = "/repo"                             # NEW: optional working directory
+disable_on_success = "npm test"                   # NEW: command to evaluate goal
+disable_on_success_timeout_secs = 60              # NEW: command timeout
+disable_on_success_working_dir = "/repo"          # NEW: working directory for command
+generation = 1                                    # NEW: bump to re-enable after auto-disable
 ```
 
 ### New Fields
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
+| `id` | ✅ (when `disable_on_success` set) | — | Stable unique identifier for state persistence |
 | `disable_on_success` | | — | Shell command; if exit 0, job auto-disables and message is NOT sent |
-| `timeout` | | `60` | Max seconds for `disable_on_success` to run before being killed |
-| `working_dir` | | — | Working directory for command execution |
+| `disable_on_success_timeout_secs` | | `60` | Max seconds for command to run before being killed |
+| `disable_on_success_working_dir` | | — | Working directory for command execution |
+| `generation` | | `1` | Bump this number to re-enable an auto-disabled job |
 
 ### Behavior
 
 When a cron job has `disable_on_success` set:
 
 1. Schedule fires
-2. Run `disable_on_success` command (with `timeout` and `working_dir`)
-3. **exit 0** → Goal achieved. Set `enabled = false` in persisted state. Do NOT send message.
-4. **exit != 0** → Goal not met. Send `message` to channel/thread as normal.
-5. **timeout exceeded** → Treat as exit != 0 (goal not met). Send message.
+2. Check: if persisted `generation` matches config `generation` AND job is auto-disabled → skip (stay disabled)
+3. If config `generation` > persisted `generation` → reset auto-disable state (re-enabled by human)
+4. Run `disable_on_success` command (with `disable_on_success_timeout_secs` and `disable_on_success_working_dir`)
+5. **exit 0** → Goal achieved. Persist auto-disabled state with current `generation`. Do NOT send message.
+6. **exit != 0** → Goal not met. Send `message` to channel/thread as normal.
+7. **timeout exceeded** → Treat as exit != 0 (goal not met). Send message.
 
 ### Thread Lifecycle
 
@@ -85,20 +91,22 @@ All messages go to the **same thread** — agents need conversation history as c
 
 ### Persistence
 
-Auto-disable state must survive restarts. Persisted per job:
+Auto-disable state must survive restarts. Persisted per job (keyed by `id`):
 
 ```json
 {
-  "job_key": "cron-<schedule_hash>-<channel>",
-  "enabled": true,
-  "thread_id": "1504239931940409587",
-  "auto_disabled_at": null
+  "unit-tests-pass": {
+    "generation": 1,
+    "auto_disabled": true,
+    "auto_disabled_at": "2026-05-13T22:00:00Z",
+    "thread_id": "1504239931940409587"
+  }
 }
 ```
 
 Storage: **local JSON state file** (`cron-state.json`) — loaded on startup, written on state change.
 
-Key rule: **Persisted state takes precedence over config for auto-disabled jobs.** When a job is auto-disabled (exit 0), the state file records `auto_disabled_at`. From that point, the config `enabled` field is ignored for this job. To re-enable, the human must **both** set `enabled = true` in config **and** remove the `auto_disabled_at` entry from state (or delete the state entry entirely). This prevents config reload from accidentally resurrecting a completed goal.
+**Re-enable logic:** When config `generation` > persisted `generation`, the auto-disable is cleared and the job runs again. This gives humans a clear, unambiguous way to restart a completed goal — just bump the number.
 
 ### Security
 
