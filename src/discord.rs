@@ -852,7 +852,7 @@ impl EventHandler for Handler {
         // Keep guild command sets empty so only global commands are shown.
         for guild in &ready.guilds {
             let guild_id = guild.id;
-            if let Err(e) = guild_id.set_commands(&ctx.http, Vec::new()).await {
+            if let Err(e) = guild_id.set_commands(&ctx.http, vec![]).await {
                 tracing::warn!(
                     %guild_id,
                     error = %e,
