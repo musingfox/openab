@@ -19,7 +19,7 @@ Requirements:
 - If command exits 0 → goal achieved, auto-disable the job, do NOT send message
 - If command exits non-zero → goal not met, send message as normal (agents continue working)
 - Auto-disable state must persist across restarts
-- Human can re-enable a completed goal by bumping `generation`
+- Human can re-enable a completed goal by setting `enabled = true`
 - All communication stays in a single stable thread
 
 ---
@@ -68,7 +68,6 @@ message = "Goal not met: all unit tests must pass. Please continue working."
 disable_on_success = "npm test"                   # command to evaluate goal
 disable_on_success_timeout_secs = 60              # command timeout
 disable_on_success_working_dir = "/repo"          # working directory
-generation = 1                                    # bump to re-enable after auto-disable
 enabled = true                                    # scheduler sets to false on success
 ```
 
@@ -80,7 +79,6 @@ enabled = true                                    # scheduler sets to false on s
 | `disable_on_success` | | — | Shell command; exit 0 = goal achieved, auto-disable |
 | `disable_on_success_timeout_secs` | | `60` | Max seconds before command is killed |
 | `disable_on_success_working_dir` | | — | Working directory for command execution |
-| `generation` | | `1` | Bump to re-enable an auto-disabled job |
 
 ### Execution Flow
 
@@ -88,7 +86,7 @@ enabled = true                                    # scheduler sets to false on s
 CronJob schedule fires
          │
          ▼
-  Is job auto-disabled AND config generation == persisted generation?
+  Is enabled = false in usercron?
          │
     ┌────┴────┐
    Yes        No
@@ -102,9 +100,9 @@ CronJob schedule fires
           Yes  │  No / Timeout
            │   │    │
            ▼   │    ▼
-     Auto-disable   Send message
-     job, persist   to channel/thread
-     state          (agents keep working)
+     Post ✅,       Send message
+     set enabled    to channel/thread
+     = false        (agents keep working)
 ```
 
 ### State Persistence
@@ -114,23 +112,17 @@ No separate state file needed. When goal is achieved, the **OpenAB scheduler** w
 | Event | Action |
 |-------|--------|
 | Goal achieved (exit 0) | Scheduler posts `✅ Goal achieved: <description>` to thread, then sets `enabled = false` in usercron file |
-| Human re-enables | Human sets `enabled = true` and/or bumps `generation` in usercron file |
+| Human re-enables | Human sets `enabled = true` in usercron file |
 | Thread auto-created | Scheduler writes `thread_id` back to usercron file |
 
 This works because usercron is designed to be runtime-writable (hot-reloaded by the scheduler), unlike global config.
 
-**`enabled` vs `generation` interaction:**
-- Scheduler checks `enabled` first — if `false`, job is skipped entirely
-- `generation` is checked only when `enabled = true` — if config `generation` > last-known generation at time of auto-disable, the job is treated as re-enabled
-- To re-enable: human sets `enabled = true` (scheduler won't auto-re-enable a disabled job just by bumping generation alone)
-
 ### Re-enable Logic
 
 Human edits `$HOME/.openab/cronjob.toml`:
-1. Set `enabled = true` (required — this is what the scheduler checks first)
-2. Optionally bump `generation` (signals a fresh start, resets any internal tracking)
+- Set `enabled = true`
 
-The scheduler hot-reloads the file, sees `enabled = true`, and resumes firing.
+That's it. Scheduler hot-reloads the file, sees `enabled = true`, and resumes firing. No generation counter, no state comparison needed.
 
 ### Thread Lifecycle
 
@@ -199,7 +191,7 @@ Phase 1 `[[cron.jobs]]` entries with `disable_on_success` remain valid and coexi
 
 1. Job is disabled (`enabled = false` in usercron)
 2. Human edits `$HOME/.openab/cronjob.toml`: sets `enabled = true`
-3. Scheduler hot-reloads → job runs again
+3. Scheduler hot-reloads → job fires again on next schedule
 
 ### Timeout
 
