@@ -243,14 +243,62 @@ Recommended: **Option 1** — separate section. Goal semantics (state tracking, 
 2. 3 consecutive rounds with no new commits
 3. Escalation message posted, goal paused
 
+## Security: Shell Execution
+
+`done_check` and `progress_check` execute arbitrary shell commands. Mitigation strategy:
+
+| Phase | Mitigation |
+|-------|-----------|
+| MVP | Trust config source — only repo maintainers can define goals. Document that commands run with agent's permissions. |
+| v2 | Allowed command whitelist + read-only mode for `progress_check` |
+| v3 | Container isolation — run eval commands in ephemeral sandbox with no network/write access to host |
+
+MVP explicitly does NOT sandbox. This is acceptable because config is maintainer-controlled (same trust model as existing `[[cron.jobs]]`).
+
+## Persistence
+
+Goal state **must be persisted** to survive process restarts. Without persistence, `max_rounds` and `stuck_threshold` safety valves can be bypassed by restarts.
+
+Persisted state per goal:
+
+```json
+{
+  "goal_id": "goal-001",
+  "round": 4,
+  "stuck_counter": 1,
+  "last_snapshot": "abc1234...",
+  "last_eval_output": "FAIL src/auth.test.ts...",
+  "status": "active",
+  "history": [
+    { "round": 1, "delta": true, "timestamp": "..." },
+    { "round": 2, "delta": true, "timestamp": "..." },
+    { "round": 3, "delta": false, "timestamp": "..." }
+  ]
+}
+```
+
+MVP storage: local JSON file (`goals-state.json`). Future: DB or object store.
+
+## Escalation Recovery Rules
+
+When the human responds to an escalation:
+
+| Human action | Effect on counters |
+|---|---|
+| 1️⃣ Give hint, continue | `stuck_counter` resets to 0; `round` continues (does NOT reset) |
+| 2️⃣ Human fixes, agents verify | `stuck_counter` resets to 0; `round` continues |
+| 3️⃣ Adjust goal/eval | `stuck_counter` resets to 0; `round` resets to 0 (new goal effectively) |
+| 4️⃣ Abandon goal | `status` = `abandoned`, goal disabled |
+
+Key principle: **`max_rounds` never resets** unless the goal itself is redefined (option 3). This prevents infinite loops even with repeated escalations.
+
 ## Open Questions
 
-1. **Persistence** — Where is goal state stored between rounds? In-memory (lost on restart) or persisted (DB/file)?
-2. **Thread vs channel** — Should each goal auto-create a dedicated thread, or reuse an existing one?
-3. **Multi-agent coordination** — In escape room mode, how do agents avoid conflicting actions? First-come-first-serve? Or coordinator (超渡) assigns sub-tasks?
-4. **Goal lifecycle commands** — How does the human create/pause/cancel goals? Slash commands? Config file reload?
-5. **Observability** — How to surface goal progress history (rounds, deltas, escalations)?
-6. **Security** — `done_check` runs arbitrary shell commands. Sandboxing? Allowed command whitelist?
+1. **Thread vs channel** — Should each goal auto-create a dedicated thread, or reuse an existing one?
+2. **Multi-agent coordination** — In escape room mode, how do agents avoid conflicting actions? First-come-first-serve? Or coordinator (超渡) assigns sub-tasks?
+3. **Goal lifecycle commands** — How does the human create/pause/cancel goals? Slash commands? Config file reload?
+4. **Observability** — How to surface goal progress history (rounds, deltas, escalations)?
+5. **Context window overflow** — Long-running goals accumulate thread history. Should each round message include a condensed summary of prior rounds to prevent context overflow? Or implement a sliding window / summarization step?
 
 ## References
 
