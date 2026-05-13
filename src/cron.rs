@@ -321,6 +321,10 @@ pub fn load_usercron_file(path: &Path, configured_platforms: &[&str]) -> Vec<Cro
             warn!(index = i, platform = %job.platform, "usercron: platform not configured, skipping");
             return false;
         }
+        if job.disable_on_success.is_some() && job.id.is_none() {
+            warn!(index = i, "usercron: job with disable_on_success must have an id field, skipping");
+            return false;
+        }
         true
     }).map(|(_, job)| job).collect()
 }
@@ -758,10 +762,11 @@ fn disable_job_in_usercron(path: &Path, job: &CronJobConfig) -> Result<(), Strin
 
         // Detect id field to identify target job
         if line.trim().starts_with("id") {
-            let value = line
-                .split('=')
-                .nth(1)
-                .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string());
+            let value = line.split('=').nth(1).map(|v| {
+                // Strip inline comments before trimming quotes
+                let v = v.split('#').next().unwrap_or(v);
+                v.trim().trim_matches('"').trim_matches('\'').to_string()
+            });
             if value.as_deref() == Some(job_id) {
                 in_target_job = true;
                 found = true;
@@ -1482,7 +1487,6 @@ command = "echo"
         let job = CronJobConfig {
             id: None,
             enabled: true,
-            id: None,
             schedule: "* * * * *".into(),
             channel: "ch".into(),
             message: "msg".into(),
@@ -1503,7 +1507,6 @@ command = "echo"
         let job = CronJobConfig {
             id: None,
             enabled: true,
-            id: None,
             schedule: "* * * * *".into(),
             channel: "ch".into(),
             message: "msg".into(),
@@ -1524,7 +1527,6 @@ command = "echo"
         let job = CronJobConfig {
             id: None,
             enabled: true,
-            id: None,
             schedule: "* * * * *".into(),
             channel: "ch".into(),
             message: "msg".into(),
@@ -1545,7 +1547,6 @@ command = "echo"
         let job = CronJobConfig {
             id: None,
             enabled: true,
-            id: None,
             schedule: "* * * * *".into(),
             channel: "ch".into(),
             message: "msg".into(),
@@ -1566,7 +1567,6 @@ command = "echo"
         let job = CronJobConfig {
             id: None,
             enabled: true,
-            id: None,
             schedule: "* * * * *".into(),
             channel: "ch".into(),
             message: "msg".into(),
@@ -1587,7 +1587,6 @@ command = "echo"
         let job = CronJobConfig {
             id: None,
             enabled: true,
-            id: None,
             schedule: "* * * * *".into(),
             channel: "ch".into(),
             message: "msg".into(),
@@ -1609,7 +1608,6 @@ command = "echo"
         let job = CronJobConfig {
             id: None,
             enabled: true,
-            id: None,
             schedule: "* * * * *".into(),
             channel: "ch".into(),
             message: "msg".into(),
@@ -1640,9 +1638,8 @@ disable_on_success = "npm test"
         std::fs::write(&path, content).unwrap();
 
         let job = CronJobConfig {
-            id: None,
-            enabled: true,
             id: Some("test-goal".into()),
+            enabled: true,
             schedule: "*/10 * * * *".into(),
             channel: "123".into(),
             message: "test goal".into(),
@@ -1684,9 +1681,8 @@ disable_on_success = "npm test"
         std::fs::write(&path, content).unwrap();
 
         let job = CronJobConfig {
-            id: None,
-            enabled: true,
             id: Some("test-goal".into()),
+            enabled: true,
             schedule: "*/10 * * * *".into(),
             channel: "123".into(),
             message: "test goal".into(),
@@ -1731,9 +1727,8 @@ disable_on_success = "npm test"
         std::fs::write(&path, content).unwrap();
 
         let job = CronJobConfig {
-            id: None,
-            enabled: true,
             id: Some("test-goal".into()),
+            enabled: true,
             schedule: "*/10 * * * *".into(),
             channel: "123".into(),
             message: "test goal".into(),
