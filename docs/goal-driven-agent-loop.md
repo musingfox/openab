@@ -6,314 +6,221 @@ Design spec for a goal-oriented execution mode where agents work autonomously un
 
 Today, agents respond to individual messages reactively. There is no mechanism to assign a persistent **goal** that agents must work toward across multiple rounds, self-organizing their approach without explicit step-by-step instructions.
 
-## Non-Goals (MVP)
-
-- Multi-agent goal contention / auto-claiming
-- Complex scoring or partial-credit evaluation
-- Long-term memory rewrite between rounds
-- LLM judge involvement on every round
-- UI/dashboard for goal management
-
 ## Concept: "Escape Room" Mode
 
 The human sets a goal and a success condition. A CronJob periodically evaluates whether the goal is met. If not, it posts to the channel — agents must **self-organize** to figure out how to achieve it. They are not told what to do, only what the goal is and that it hasn't been met yet.
 
 ```
-Human sets goal + eval command
+Human sets goal via cron config
          │
          ▼
-┌──► CronJob fires (on interval)
+┌──► CronJob fires (on schedule)
 │         │
 │         ▼
-│    Run done_check command
+│    Run disable_on_success command
 │         │
 │    ┌────┴─────┐
-│    │  Pass?   │
+│    │ exit 0?  │
 │    └────┬─────┘
 │     No  │  Yes
 │     │   │    │
 │     ▼   │    ▼
-│  Post to channel:    Goal achieved ✅
-│  "Goal not met,      Disable CronJob
-│   keep working"      Notify human
+│  Send message:     Goal achieved ✅
+│  agents continue   Auto-disable job
+│  working           (no message sent)
 │         │
 │         ▼
 │  Agents discuss & act
 │  (self-organized)
 │         │
 └─────────┘
-     Next interval
+     Next schedule
 ```
 
-## Goal Schema
+---
+
+# Phase 1: Cron Auto-Disable on Success (MVP)
+
+Minimal extension to existing `[[cron.jobs]]` — add a single field `disable_on_success`.
+
+## Configuration
 
 ```toml
-[[goals]]
-id = "goal-001"
-description = "All unit tests pass on main branch"
-done_check = "cd /repo && npm test"
-progress_check = "cd /repo && git log --oneline -5"
-interval = "10m"
-max_rounds = 10
-stuck_threshold = 3          # rounds without state delta → escalate
+[[cron.jobs]]
+schedule = "*/10 * * * *"
 channel = "123456789012345678"
-thread_id = ""               # optional: confine to existing thread
-owner = ""                   # optional: assigned agent UID
-enabled = true
+thread_id = ""                                    # optional: auto-created on first fire if empty
+message = "Goal not met: all unit tests must pass. <@&1496247626675257384> please continue."
+disable_on_success = "cd /repo && npm test"       # NEW: command to evaluate goal
+timeout = 60                                      # NEW: command timeout in seconds
+working_dir = "/repo"                             # NEW: optional working directory
 ```
+
+### New Fields
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `id` | ✅ | — | Unique goal identifier |
-| `description` | ✅ | — | Human-readable goal statement |
-| `done_check` | ✅ | — | Shell command; exit 0 = goal achieved |
-| `progress_check` | | — | Command to capture state snapshot for delta detection |
-| `interval` | | `"10m"` | Evaluation interval (e.g. `5m`, `1h`) |
-| `max_rounds` | | `10` | Hard cap on evaluation rounds |
-| `stuck_threshold` | | `3` | Consecutive rounds without state delta before escalation |
-| `channel` | ✅ | — | Target channel for agent communication |
-| `thread_id` | | — | Confine discussion to a specific thread |
-| `owner` | | — | Agent UID responsible for execution |
-| `enabled` | | `true` | Toggle without removing config |
+| `disable_on_success` | | — | Shell command; if exit 0, job auto-disables and message is NOT sent |
+| `timeout` | | `60` | Max seconds for `disable_on_success` to run before being killed |
+| `working_dir` | | — | Working directory for command execution |
 
-## Runner Loop State Machine
+### Behavior
 
-```
-         ┌─────────┐
-         │  IDLE   │ ◄── goal created, waiting for first interval
-         └────┬────┘
-              │ interval fires
-              ▼
-         ┌─────────┐
-         │  EVAL   │ ◄── run done_check
-         └────┬────┘
-              │
-       ┌──────┴──────┐
-       │             │
-   exit 0        exit != 0
-       │             │
-       ▼             ▼
-  ┌────────┐   ┌──────────┐
-  │  DONE  │   │ COMPARE  │ ◄── compute state delta
-  └────────┘   └────┬─────┘
-                    │
-             ┌──────┴──────┐
-             │             │
-        has delta      no delta
-             │             │
-             ▼             ▼
-       ┌──────────┐  ┌──────────┐
-       │ CONTINUE │  │  STUCK   │ ◄── increment stuck_counter
-       └──────────┘  └────┬─────┘
-                          │
-                   stuck_counter >= threshold?
-                     │            │
-                    Yes           No
-                     │            │
-                     ▼            ▼
-               ┌───────────┐  ┌──────────┐
-               │ ESCALATE  │  │ CONTINUE │
-               └───────────┘  └──────────┘
+When a cron job has `disable_on_success` set:
+
+1. Schedule fires
+2. Run `disable_on_success` command (with `timeout` and `working_dir`)
+3. **exit 0** → Goal achieved. Set `enabled = false` in persisted state. Do NOT send message.
+4. **exit != 0** → Goal not met. Send `message` to channel/thread as normal.
+5. **timeout exceeded** → Treat as exit != 0 (goal not met). Send message.
+
+### Thread Lifecycle
+
+| Scenario | Behavior |
+|----------|----------|
+| `thread_id` provided | Use that thread for all fires |
+| `thread_id` empty | Auto-create a thread on first fire; persist `thread_id` in state |
+
+All messages go to the **same thread** — agents need conversation history as context.
+
+### Persistence
+
+Auto-disable state must survive restarts. Persisted per job:
+
+```json
+{
+  "job_key": "cron-<schedule_hash>-<channel>",
+  "enabled": true,
+  "thread_id": "1504239931940409587",
+  "auto_disabled_at": null
+}
 ```
 
-### State Transitions
+Storage: **local JSON state file** (`cron-state.json`) — loaded on startup, written on state change.
 
-| From | Event | To | Action |
-|------|-------|----|--------|
-| IDLE | interval fires | EVAL | Run `done_check` |
-| EVAL | exit 0 | DONE | Notify channel ✅, disable goal |
-| EVAL | exit != 0 | COMPARE | Run `progress_check`, compute delta |
-| COMPARE | has delta | CONTINUE | Reset stuck_counter, post round message |
-| COMPARE | no delta | STUCK | Increment stuck_counter |
-| STUCK | counter < threshold | CONTINUE | Post round message with warning |
-| STUCK | counter >= threshold | ESCALATE | Notify human, pause goal |
-| Any | round > max_rounds | ESCALATE | Hard stop, notify human |
+Key rule: **config reload does NOT re-enable an auto-disabled job.** Only explicit `enabled = true` in config (human intent) can re-enable it.
 
-## State Snapshot & Delta Detection
+### Security
 
-Each round captures a **state snapshot** via `progress_check`. Delta is computed by comparing current snapshot to previous round's snapshot.
+`disable_on_success` executes arbitrary shell commands. MVP mitigation:
 
-### Supported Delta Signals (MVP)
+- Trust config source (same model as existing `[[cron.jobs]]` message execution)
+- Only repo maintainers can define cron jobs
+- Commands run with agent's permissions
+- `timeout` prevents runaway processes
 
-| Signal | How to detect |
-|--------|---------------|
-| New commits | `git log --oneline` diff |
-| File changes | `git diff --stat` |
-| Test result change | Test output diff (pass/fail count) |
-| PR/Issue status | `gh pr view` / `gh issue view` |
-| Artifact existence | `ls` / `stat` on expected path |
+## Phase 1 Non-Goals
 
-If no `progress_check` is defined, delta detection falls back to comparing `done_check` stdout/stderr between rounds.
-
-## Round Message Format
-
-Posted to channel/thread each round when goal is not yet achieved:
-
-```
-🔐 Goal: All unit tests pass on main branch
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Round: 4 / 10
-Status: ❌ Not achieved
-Eval output:
-  FAIL src/auth.test.ts — TypeError: undefined is not a function
-  Tests: 12 passed, 1 failed
-Progress: ✅ Delta detected (new commit abc1234)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-法師們，繼續想辦法。
-```
-
-When stuck (no delta):
-
-```
-🔐 Goal: All unit tests pass on main branch
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Round: 7 / 10
-Status: ❌ Not achieved
-Eval output:
-  FAIL src/auth.test.ts — TypeError: undefined is not a function
-Progress: ⚠️ No state delta (2 / 3 rounds until escalation)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-法師們，繼續想辦法。
-```
-
-## Escalation Payload
-
-When stuck_threshold is reached or max_rounds exceeded:
-
-```
-⚠️ Goal Stuck — Escalating
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Goal: All unit tests pass on main branch
-Last successful delta: Round 5 — fixed auth.test.ts (commit abc1234)
-Blocked reason: No state change for 3 consecutive rounds
-Current eval output:
-  FAIL src/auth.test.ts — TypeError: undefined is not a function
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-需要主人決策：
-1️⃣ 給提示讓法師繼續
-2️⃣ 主人自己修，修完再讓法師 verify
-3️⃣ 調整 goal 或 eval command
-4️⃣ 放棄此 goal
-```
-
-## Done Confirmation (Optional LLM Judge)
-
-When `done_check` passes (exit 0), an optional LLM judge can confirm intent alignment:
-
-```
-done_check passes
-       │
-       ▼
-  LLM Judge: "Does the current state satisfy the goal description?"
-       │
-  ┌────┴────┐
-  │         │
-confirm   reject + reason
-  │         │
-  ▼         ▼
-DONE     CONTINUE (post rejection reason to channel)
-```
-
-This is a **tie-breaker only** — not involved in every round. Only fires after Layer 1 (deterministic check) passes.
-
-## Integration with Existing CronJob
-
-This feature extends the existing `[[cron.jobs]]` system. Implementation options:
-
-1. **New config section** `[[goals]]` — separate from `[[cron.jobs]]`, dedicated runner logic
-2. **Extension of cron** — add `goal_mode = true` fields to existing cron entries
-
-Recommended: **Option 1** — separate section. Goal semantics (state tracking, delta detection, escalation) are fundamentally different from simple scheduled messages.
+- State delta / progress detection
+- Stuck detection / escalation
+- LLM judge
+- Max rounds
+- Multi-agent coordination logic
+- Goal lifecycle slash commands
 
 ## MVP Test Scenario
 
 **Setup:**
 1. A repo with one failing test
-2. Goal: `done_check = "npm test"` with exit 0 = success
-3. Agent has write access to the repo
+2. Cron job: `disable_on_success = "cd /repo && npm test"`, schedule every 10 min
+3. Agents have write access to the repo
 
 **Expected behavior:**
-1. CronJob fires → runs `npm test` → fails → posts round message
+1. Cron fires → `npm test` fails (exit 1) → message sent to thread
 2. Agents discuss in thread, identify the bug, push a fix
-3. Next CronJob fires → runs `npm test` → passes → posts ✅ Done
-4. Goal disabled
+3. Next cron fires → `npm test` passes (exit 0) → job auto-disables, no message sent
+4. Done. Job stays disabled until human re-enables.
 
-**Stuck scenario:**
-1. Agents cannot figure out the fix
-2. 3 consecutive rounds with no new commits
-3. Escalation message posted, goal paused
+**Edge cases:**
+- Process restarts between fires → state file preserves `thread_id` and `enabled` status
+- Command hangs → killed after `timeout` seconds, treated as failure, message sent
+- Human sets `enabled = true` in config → job re-activates (intentional reset)
 
-## Security: Shell Execution
+---
 
-`done_check` and `progress_check` execute arbitrary shell commands. Mitigation strategy:
+# Phase 2: Full Goal Runner (Future Design)
 
-| Phase | Mitigation |
-|-------|-----------|
-| MVP | Trust config source — only repo maintainers can define goals. Document that commands run with agent's permissions. |
-| v2 | Allowed command whitelist + read-only mode for `progress_check` |
-| v3 | Container isolation — run eval commands in ephemeral sandbox with no network/write access to host |
+When Phase 1 is proven, extend with richer goal semantics.
 
-MVP explicitly does NOT sandbox. This is acceptable because config is maintainer-controlled (same trust model as existing `[[cron.jobs]]`).
+## Additional Capabilities
 
-## Persistence
+### State Delta Detection
 
-Goal state **must be persisted** to survive process restarts. Without persistence, `max_rounds` and `stuck_threshold` safety valves can be bypassed by restarts.
+Track progress between rounds using a `progress_check` command:
 
-Persisted state per goal:
-
-```json
-{
-  "goal_id": "goal-001",
-  "round": 4,
-  "stuck_counter": 1,
-  "last_snapshot": "abc1234...",
-  "last_eval_output": "FAIL src/auth.test.ts...",
-  "status": "active",
-  "history": [
-    { "round": 1, "delta": true, "timestamp": "..." },
-    { "round": 2, "delta": true, "timestamp": "..." },
-    { "round": 3, "delta": false, "timestamp": "..." }
-  ]
-}
+```toml
+[[goals]]
+id = "goal-001"
+description = "All unit tests pass"
+done_check = "cd /repo && npm test"
+progress_check = "cd /repo && git log --oneline -5"
+interval = "10m"
+max_rounds = 10
+stuck_threshold = 3
+channel = "123456789012345678"
 ```
 
-MVP storage: **local JSON state file** (`goals-state.json`) — loaded on startup, written after each round. This is a hard requirement, not optional. Future: DB or object store.
+Delta signals: git commits, file changes, test result transitions, PR status, artifact existence.
 
-## Escalation Recovery Rules
+### Stuck Detection & Escalation
 
-When the human responds to an escalation:
+| Signal | Judgment |
+|--------|----------|
+| Has state delta + eval fail | Progressing, continue |
+| No state delta + eval fail | Stuck, increment counter |
+| Counter >= stuck_threshold | Escalate to human |
+| Round > max_rounds | Hard stop, escalate |
 
-| Human action | Effect on counters |
+### Escalation Message
+
+```
+⚠️ Goal Stuck — Escalating
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Goal: All unit tests pass
+Last successful delta: Round 5 — commit abc1234
+Blocked reason: No state change for 3 consecutive rounds
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1️⃣ Give hint, continue
+2️⃣ Human fixes, agents verify
+3️⃣ Adjust goal/eval command
+4️⃣ Abandon goal
+```
+
+### Escalation Recovery Rules
+
+| Human action | Effect |
 |---|---|
-| 1️⃣ Give hint, continue | `stuck_counter` resets to 0; `round` continues (does NOT reset) |
-| 2️⃣ Human fixes, agents verify | `stuck_counter` resets to 0; `round` continues |
-| 3️⃣ Adjust goal/eval | `stuck_counter` resets to 0; `round` resets to 0 (new goal effectively) |
-| 4️⃣ Abandon goal | `status` = `abandoned`, goal disabled |
+| 1️⃣ Give hint | `stuck_counter` resets; `round` continues |
+| 2️⃣ Human fixes | `stuck_counter` resets; `round` continues |
+| 3️⃣ Adjust goal | Full reset (new goal) |
+| 4️⃣ Abandon | Goal disabled |
 
-Key principle: **`max_rounds` never resets** unless the goal itself is redefined (option 3). This prevents infinite loops even with repeated escalations.
+Key: **`max_rounds` never resets** unless goal is redefined.
 
-## Thread Lifecycle (MVP)
+### LLM Judge (Tie-Breaker Only)
 
-Each goal **must** run in a single, persistent thread to preserve agent context across rounds.
+After `done_check` passes, optionally confirm intent alignment via LLM. Not involved every round.
 
-| Scenario | Behavior |
-|----------|----------|
-| `thread_id` provided | Use that thread for all rounds |
-| `thread_id` empty | Auto-create a dedicated thread on first round; persist `thread_id` in goal state |
+### Round Message Format
 
-Rules:
-- All round messages, agent discussions, and escalations happen in the **same thread**
-- Thread is never re-created between rounds
-- Thread title updated with status: `🔐 Goal: <description> [Round N/max]`
+```
+🔐 Goal: All unit tests pass
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Round: 4 / 10
+Status: ❌ Not achieved
+Eval output: FAIL src/auth.test.ts — TypeError
+Progress: ✅ Delta detected (commit abc1234)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
 
-This ensures agents always have full conversation history as context.
+---
 
 ## Open Questions
 
-1. **Multi-agent coordination** — In escape room mode, how do agents avoid conflicting actions? First-come-first-serve? Or coordinator (超渡) assigns sub-tasks?
-2. **Goal lifecycle commands** — How does the human create/pause/cancel goals? Slash commands? Config file reload?
-3. **Observability** — How to surface goal progress history (rounds, deltas, escalations)?
-4. **Context window overflow** — Long-running goals accumulate thread history. Should each round message include a condensed summary of prior rounds to prevent context overflow? Or implement a sliding window / summarization step?
+1. **Multi-agent coordination** — How do agents avoid conflicting actions in escape room mode?
+2. **Goal lifecycle commands** — Slash commands? Config reload?
+3. **Observability** — How to surface goal progress history?
+4. **Context window overflow** — Summarization strategy for long-running goals?
 
 ## References
 
