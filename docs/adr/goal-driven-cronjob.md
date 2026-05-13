@@ -55,11 +55,11 @@ Phase 1 proves the concept. Phase 2 adds sophistication only after validation.
 
 ### Configuration
 
-`disable_on_success` is **only supported in usercron** (`.openab/usercron/cronjob.toml`), NOT in global config. This is because auto-disable needs to write state back to the file, and only usercron is agent-writable.
+`disable_on_success` is **only supported in usercron** (`$HOME/.openab/cronjob.toml`), NOT in global config. This is because auto-disable needs to write state back to the file, and only usercron is writable by the OpenAB scheduler at runtime.
 
 ```toml
-# .openab/usercron/cronjob.toml
-[[cron.jobs]]
+# $HOME/.openab/cronjob.toml (usercron format uses [[jobs]])
+[[jobs]]
 id = "unit-tests-pass"                            # required for disable_on_success jobs
 schedule = "*/10 * * * *"
 channel = "123456789012345678"
@@ -69,7 +69,7 @@ disable_on_success = "npm test"                   # command to evaluate goal
 disable_on_success_timeout_secs = 60              # command timeout
 disable_on_success_working_dir = "/repo"          # working directory
 generation = 1                                    # bump to re-enable after auto-disable
-enabled = true                                    # agent sets to false on success
+enabled = true                                    # scheduler sets to false on success
 ```
 
 ### New Fields
@@ -109,25 +109,28 @@ CronJob schedule fires
 
 ### State Persistence
 
-No separate state file needed. When goal is achieved, agent writes `enabled = false` directly to `.openab/usercron/cronjob.toml`. State lives in the config itself.
+No separate state file needed. When goal is achieved, the **OpenAB scheduler** writes `enabled = false` directly to `$HOME/.openab/cronjob.toml`. State lives in the config itself.
 
 | Event | Action |
 |-------|--------|
-| Goal achieved (exit 0) | Post `✅ Goal achieved: <description>` to thread, then set `enabled = false` in usercron file |
-| Human re-enables | Human sets `enabled = true` (or bumps `generation`) |
-| Thread auto-created | Agent writes `thread_id` back to usercron file |
+| Goal achieved (exit 0) | Scheduler posts `✅ Goal achieved: <description>` to thread, then sets `enabled = false` in usercron file |
+| Human re-enables | Human sets `enabled = true` and/or bumps `generation` in usercron file |
+| Thread auto-created | Scheduler writes `thread_id` back to usercron file |
 
-This works because usercron is designed to be agent-writable, unlike global config.
+This works because usercron is designed to be runtime-writable (hot-reloaded by the scheduler), unlike global config.
+
+**`enabled` vs `generation` interaction:**
+- Scheduler checks `enabled` first — if `false`, job is skipped entirely
+- `generation` is checked only when `enabled = true` — if config `generation` > last-known generation at time of auto-disable, the job is treated as re-enabled
+- To re-enable: human sets `enabled = true` (scheduler won't auto-re-enable a disabled job just by bumping generation alone)
 
 ### Re-enable Logic
 
-Human edits `.openab/usercron/cronjob.toml`:
-- Set `enabled = true`, or
-- Bump `generation` (e.g. `generation = 2`)
+Human edits `$HOME/.openab/cronjob.toml`:
+1. Set `enabled = true` (required — this is what the scheduler checks first)
+2. Optionally bump `generation` (signals a fresh start, resets any internal tracking)
 
-Either action signals intentional re-activation. No ambiguity, no separate state file to manage.
-
-Human bumps `generation = 2` in config → job reactivates. No ambiguity, no conflict with existing fields.
+The scheduler hot-reloads the file, sees `enabled = true`, and resumes firing.
 
 ### Thread Lifecycle
 
@@ -154,14 +157,13 @@ Future phases may add container isolation or command whitelists.
 
 ### Phase 1 (This ADR)
 
-1. Parse new fields from usercron `[[cron.jobs]]` (`.openab/usercron/cronjob.toml`)
+1. Parse new fields from usercron `[[jobs]]` (`$HOME/.openab/cronjob.toml`)
 2. On cron fire, if `disable_on_success` is set:
    - Check `enabled` — if false, skip
-   - Check `generation` — if config > last known, treat as re-enabled
    - Execute command with `disable_on_success_timeout_secs` and `disable_on_success_working_dir`
-   - exit 0 → post `✅ Goal achieved` to thread, write `enabled = false` to usercron file
+   - exit 0 → scheduler posts `✅ Goal achieved` to thread, writes `enabled = false` to usercron file
    - exit != 0 / timeout exceeded → send message as normal
-3. Thread auto-creation: if `thread_id` empty, create thread on first fire, write back to usercron file
+3. Thread auto-creation: if `thread_id` empty, create thread on first fire, scheduler writes back to usercron file
 4. No separate state file — usercron IS the state
 
 ### Phase 2 (Future — Not This ADR)
@@ -189,15 +191,15 @@ Phase 1 `[[cron.jobs]]` entries with `disable_on_success` remain valid and coexi
 
 ### Restart Resilience
 
-1. Job is auto-disabled (agent wrote `enabled = false` to usercron)
+1. Job is auto-disabled (scheduler wrote `enabled = false` to usercron)
 2. Process restarts
 3. Usercron loaded → `enabled = false` → job stays disabled
 
 ### Re-enable
 
 1. Job is disabled (`enabled = false` in usercron)
-2. Human edits usercron: sets `enabled = true` (or bumps `generation`)
-3. Next fire → job runs again
+2. Human edits `$HOME/.openab/cronjob.toml`: sets `enabled = true`
+3. Scheduler hot-reloads → job runs again
 
 ### Timeout
 
