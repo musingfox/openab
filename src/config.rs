@@ -356,6 +356,14 @@ pub struct CronJobConfig {
     /// Timezone (default: "UTC")
     #[serde(default = "default_cron_timezone")]
     pub timezone: String,
+    /// Shell command to evaluate goal; exit 0 (+ optional match) = goal achieved, auto-disable job.
+    pub disable_on_success: Option<String>,
+    /// If set, stdout of disable_on_success must contain this string (in addition to exit 0).
+    pub disable_on_success_match: Option<String>,
+    /// Timeout in seconds for disable_on_success command (default: 60).
+    pub disable_on_success_timeout_secs: Option<u64>,
+    /// Working directory for disable_on_success command.
+    pub disable_on_success_working_dir: Option<String>,
 }
 
 fn default_cron_platform() -> String {

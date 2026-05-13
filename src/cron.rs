@@ -461,6 +461,7 @@ pub async fn run_scheduler(
 
                 // Evaluate all jobs: baseline first, then usercron
                 let all_jobs = baseline_jobs.iter().chain(usercron_jobs.iter());
+                let baseline_len = baseline_jobs.len();
                 for (idx, job) in all_jobs.enumerate() {
                     if !should_fire(&job.schedule, job.tz) {
                         continue;
@@ -472,6 +473,42 @@ pub async fn run_scheduler(
                             continue;
                         }
                     }
+
+                    // Check disable_on_success before firing (usercron jobs only)
+                    if job.config.disable_on_success.is_some() {
+                        let is_usercron = idx >= baseline_len;
+                        if evaluate_disable_on_success(&job.config) {
+                            info!(
+                                schedule = %job.config.schedule,
+                                channel = %job.config.channel,
+                                "✅ disable_on_success: goal achieved, disabling job"
+                            );
+                            // Write enabled=false back to usercron file
+                            if is_usercron {
+                                if let Some(ref path) = usercron_path {
+                                    if let Err(e) = disable_job_in_usercron(path, &job.config) {
+                                        error!(error = %e, "failed to disable job in usercron file");
+                                    }
+                                }
+                            }
+                            // Post success notification to channel
+                            if let Some(adapter) = adapters.get(&job.config.platform) {
+                                let channel = ChannelRef {
+                                    platform: job.config.platform.clone(),
+                                    channel_id: job.config.channel.clone(),
+                                    thread_id: job.config.thread_id.clone(),
+                                    parent_id: None,
+                                    origin_event_id: None,
+                                };
+                                let msg = format!("✅ Goal achieved: {}", job.config.message);
+                                let _ = adapter.send_message(&channel, &msg).await;
+                            }
+                            // Trigger hot-reload on next tick
+                            last_usercron_mtime = None;
+                            continue;
+                        }
+                    }
+
                     info!(
                         schedule = %job.config.schedule,
                         channel = %job.config.channel,
@@ -601,7 +638,7 @@ async fn fire_cronjob(
             .or(Some(reply_channel.channel_id.clone())),
         is_bot: true,
         timestamp: Some(Utc::now().to_rfc3339()),
-        message_id: None, // cron jobs don't originate from a message
+        message_id: None,  // cron jobs don't originate from a message
         receiver_id: None, // cron jobs are self-triggered, no external receiver
     };
     let sender_json = match serde_json::to_string(&sender) {
@@ -631,6 +668,124 @@ async fn fire_cronjob(
             .send_message(&reply_channel, &format!("⚠️ cronjob error: {e}"))
             .await;
     }
+}
+
+/// Evaluate the `disable_on_success` command for a cron job.
+/// Returns `true` if the goal is achieved (command exits 0 and optional match passes).
+fn evaluate_disable_on_success(job: &CronJobConfig) -> bool {
+    let cmd = match &job.disable_on_success {
+        Some(c) => c,
+        None => return false,
+    };
+
+    let timeout_secs = job.disable_on_success_timeout_secs.unwrap_or(60);
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(cmd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    if let Some(ref dir) = job.disable_on_success_working_dir {
+        command.current_dir(dir);
+    }
+
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(command = %cmd, error = %e, "disable_on_success: failed to spawn command");
+            return false;
+        }
+    };
+
+    // Wait with timeout
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return false;
+                }
+                break;
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    warn!(command = %cmd, timeout_secs, "disable_on_success: command timed out, killing");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                warn!(command = %cmd, error = %e, "disable_on_success: error waiting for command");
+                return false;
+            }
+        }
+    }
+
+    // Check optional match string against stdout
+    if let Some(ref match_str) = job.disable_on_success_match {
+        let stdout = child
+            .stdout
+            .map(|mut s| {
+                let mut buf = String::new();
+                use std::io::Read;
+                let _ = s.read_to_string(&mut buf);
+                buf
+            })
+            .unwrap_or_default();
+        if !stdout.contains(match_str.as_str()) {
+            info!(
+                command = %cmd,
+                match_str = %match_str,
+                "disable_on_success: exit 0 but stdout does not contain match string"
+            );
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Disable a job in the usercron TOML file by setting `enabled = false`.
+/// Uses a simple text-based approach to preserve formatting.
+fn disable_job_in_usercron(path: &Path, job: &CronJobConfig) -> Result<(), String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("failed to read usercron file: {e}"))?;
+
+    // Parse the file to find the matching job and update it
+    let mut parsed: toml::Value =
+        toml::from_str(&content).map_err(|e| format!("failed to parse usercron file: {e}"))?;
+
+    let jobs = parsed
+        .get_mut("jobs")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| "no [[jobs]] array in usercron file".to_string())?;
+
+    // Find the job by matching schedule + channel + message
+    let found = jobs.iter_mut().find(|j| {
+        let sched_match = j.get("schedule").and_then(|v| v.as_str()) == Some(&job.schedule);
+        let chan_match = j.get("channel").and_then(|v| v.as_str()) == Some(&job.channel);
+        let msg_match = j.get("message").and_then(|v| v.as_str()) == Some(&job.message);
+        sched_match && chan_match && msg_match
+    });
+
+    match found {
+        Some(entry) => {
+            if let Some(table) = entry.as_table_mut() {
+                table.insert("enabled".to_string(), toml::Value::Boolean(false));
+            }
+        }
+        None => return Err("could not find matching job in usercron file".to_string()),
+    }
+
+    let new_content = toml::to_string_pretty(&parsed)
+        .map_err(|e| format!("failed to serialize usercron file: {e}"))?;
+
+    std::fs::write(path, new_content).map_err(|e| format!("failed to write usercron file: {e}"))?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1098,6 +1253,10 @@ platform = "slack"
             sender_name: "test".into(),
             thread_id: None,
             timezone: "UTC".into(),
+            disable_on_success: None,
+            disable_on_success_match: None,
+            disable_on_success_timeout_secs: None,
+            disable_on_success_working_dir: None,
         }];
         assert!(validate_cronjobs(&jobs, &["discord"]).is_ok());
     }
@@ -1113,6 +1272,10 @@ platform = "slack"
             sender_name: "test".into(),
             thread_id: None,
             timezone: "UTC".into(),
+            disable_on_success: None,
+            disable_on_success_match: None,
+            disable_on_success_timeout_secs: None,
+            disable_on_success_working_dir: None,
         }];
         let err = validate_cronjobs(&jobs, &["discord"]).unwrap_err();
         assert!(err.to_string().contains("invalid cron expression"));
@@ -1129,6 +1292,10 @@ platform = "slack"
             sender_name: "test".into(),
             thread_id: None,
             timezone: "Mars/Olympus".into(),
+            disable_on_success: None,
+            disable_on_success_match: None,
+            disable_on_success_timeout_secs: None,
+            disable_on_success_working_dir: None,
         }];
         let err = validate_cronjobs(&jobs, &["discord"]).unwrap_err();
         assert!(err.to_string().contains("invalid timezone"));
@@ -1145,6 +1312,10 @@ platform = "slack"
             sender_name: "test".into(),
             thread_id: None,
             timezone: "UTC".into(),
+            disable_on_success: None,
+            disable_on_success_match: None,
+            disable_on_success_timeout_secs: None,
+            disable_on_success_working_dir: None,
         }];
         let err = validate_cronjobs(&jobs, &["discord"]).unwrap_err();
         assert!(err.to_string().contains("unknown platform"));
@@ -1161,6 +1332,10 @@ platform = "slack"
             sender_name: "test".into(),
             thread_id: None,
             timezone: "UTC".into(),
+            disable_on_success: None,
+            disable_on_success_match: None,
+            disable_on_success_timeout_secs: None,
+            disable_on_success_working_dir: None,
         }];
         let err = validate_cronjobs(&jobs, &["discord"]).unwrap_err();
         assert!(err.to_string().contains("not configured"));
@@ -1177,6 +1352,10 @@ platform = "slack"
             sender_name: "test".into(),
             thread_id: None,
             timezone: "UTC".into(),
+            disable_on_success: None,
+            disable_on_success_match: None,
+            disable_on_success_timeout_secs: None,
+            disable_on_success_working_dir: None,
         }];
         assert!(validate_cronjobs(&jobs, &["discord"]).is_ok());
     }
@@ -1192,6 +1371,10 @@ platform = "slack"
             sender_name: "test".into(),
             thread_id: None,
             timezone: "UTC".into(),
+            disable_on_success: None,
+            disable_on_success_match: None,
+            disable_on_success_timeout_secs: None,
+            disable_on_success_working_dir: None,
         }];
         assert!(validate_cronjobs(&jobs, &["discord"]).is_err());
     }
@@ -1268,5 +1451,244 @@ command = "echo"
         std::fs::write(&path, "").unwrap();
         let jobs = load_usercron_file(&path, &["discord"]);
         assert!(jobs.is_empty());
+    }
+
+    // --- disable_on_success ---
+
+    #[test]
+    fn evaluate_disable_on_success_none_returns_false() {
+        let job = CronJobConfig {
+            enabled: true,
+            schedule: "* * * * *".into(),
+            channel: "ch".into(),
+            message: "msg".into(),
+            platform: "discord".into(),
+            sender_name: "cron".into(),
+            thread_id: None,
+            timezone: "UTC".into(),
+            disable_on_success: None,
+            disable_on_success_match: None,
+            disable_on_success_timeout_secs: None,
+            disable_on_success_working_dir: None,
+        };
+        assert!(!evaluate_disable_on_success(&job));
+    }
+
+    #[test]
+    fn evaluate_disable_on_success_exit_zero_returns_true() {
+        let job = CronJobConfig {
+            enabled: true,
+            schedule: "* * * * *".into(),
+            channel: "ch".into(),
+            message: "msg".into(),
+            platform: "discord".into(),
+            sender_name: "cron".into(),
+            thread_id: None,
+            timezone: "UTC".into(),
+            disable_on_success: Some("true".into()),
+            disable_on_success_match: None,
+            disable_on_success_timeout_secs: Some(5),
+            disable_on_success_working_dir: None,
+        };
+        assert!(evaluate_disable_on_success(&job));
+    }
+
+    #[test]
+    fn evaluate_disable_on_success_exit_nonzero_returns_false() {
+        let job = CronJobConfig {
+            enabled: true,
+            schedule: "* * * * *".into(),
+            channel: "ch".into(),
+            message: "msg".into(),
+            platform: "discord".into(),
+            sender_name: "cron".into(),
+            thread_id: None,
+            timezone: "UTC".into(),
+            disable_on_success: Some("false".into()),
+            disable_on_success_match: None,
+            disable_on_success_timeout_secs: Some(5),
+            disable_on_success_working_dir: None,
+        };
+        assert!(!evaluate_disable_on_success(&job));
+    }
+
+    #[test]
+    fn evaluate_disable_on_success_match_present_returns_true() {
+        let job = CronJobConfig {
+            enabled: true,
+            schedule: "* * * * *".into(),
+            channel: "ch".into(),
+            message: "msg".into(),
+            platform: "discord".into(),
+            sender_name: "cron".into(),
+            thread_id: None,
+            timezone: "UTC".into(),
+            disable_on_success: Some("echo SUCCESS".into()),
+            disable_on_success_match: Some("SUCCESS".into()),
+            disable_on_success_timeout_secs: Some(5),
+            disable_on_success_working_dir: None,
+        };
+        assert!(evaluate_disable_on_success(&job));
+    }
+
+    #[test]
+    fn evaluate_disable_on_success_match_absent_returns_false() {
+        let job = CronJobConfig {
+            enabled: true,
+            schedule: "* * * * *".into(),
+            channel: "ch".into(),
+            message: "msg".into(),
+            platform: "discord".into(),
+            sender_name: "cron".into(),
+            thread_id: None,
+            timezone: "UTC".into(),
+            disable_on_success: Some("echo NOPE".into()),
+            disable_on_success_match: Some("SUCCESS".into()),
+            disable_on_success_timeout_secs: Some(5),
+            disable_on_success_working_dir: None,
+        };
+        assert!(!evaluate_disable_on_success(&job));
+    }
+
+    #[test]
+    fn evaluate_disable_on_success_timeout_returns_false() {
+        let job = CronJobConfig {
+            enabled: true,
+            schedule: "* * * * *".into(),
+            channel: "ch".into(),
+            message: "msg".into(),
+            platform: "discord".into(),
+            sender_name: "cron".into(),
+            thread_id: None,
+            timezone: "UTC".into(),
+            disable_on_success: Some("sleep 10".into()),
+            disable_on_success_match: None,
+            disable_on_success_timeout_secs: Some(1),
+            disable_on_success_working_dir: None,
+        };
+        assert!(!evaluate_disable_on_success(&job));
+    }
+
+    #[test]
+    fn evaluate_disable_on_success_working_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = CronJobConfig {
+            enabled: true,
+            schedule: "* * * * *".into(),
+            channel: "ch".into(),
+            message: "msg".into(),
+            platform: "discord".into(),
+            sender_name: "cron".into(),
+            thread_id: None,
+            timezone: "UTC".into(),
+            disable_on_success: Some("pwd".into()),
+            disable_on_success_match: Some(dir.path().to_str().unwrap().into()),
+            disable_on_success_timeout_secs: Some(5),
+            disable_on_success_working_dir: Some(dir.path().to_str().unwrap().into()),
+        };
+        assert!(evaluate_disable_on_success(&job));
+    }
+
+    #[test]
+    fn disable_job_in_usercron_sets_enabled_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cronjob.toml");
+        let content = r#"
+[[jobs]]
+schedule = "*/10 * * * *"
+channel = "123"
+message = "test goal"
+platform = "discord"
+disable_on_success = "npm test"
+"#;
+        std::fs::write(&path, content).unwrap();
+
+        let job = CronJobConfig {
+            enabled: true,
+            schedule: "*/10 * * * *".into(),
+            channel: "123".into(),
+            message: "test goal".into(),
+            platform: "discord".into(),
+            sender_name: "openab-cron".into(),
+            thread_id: None,
+            timezone: "UTC".into(),
+            disable_on_success: Some("npm test".into()),
+            disable_on_success_match: None,
+            disable_on_success_timeout_secs: None,
+            disable_on_success_working_dir: None,
+        };
+
+        disable_job_in_usercron(&path, &job).unwrap();
+
+        let updated = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&updated).unwrap();
+        let jobs = parsed["jobs"].as_array().unwrap();
+        assert_eq!(jobs[0]["enabled"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn disable_job_in_usercron_preserves_other_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cronjob.toml");
+        let content = r#"
+[[jobs]]
+schedule = "0 9 * * *"
+channel = "456"
+message = "daily report"
+platform = "discord"
+
+[[jobs]]
+schedule = "*/10 * * * *"
+channel = "123"
+message = "test goal"
+platform = "discord"
+disable_on_success = "npm test"
+"#;
+        std::fs::write(&path, content).unwrap();
+
+        let job = CronJobConfig {
+            enabled: true,
+            schedule: "*/10 * * * *".into(),
+            channel: "123".into(),
+            message: "test goal".into(),
+            platform: "discord".into(),
+            sender_name: "openab-cron".into(),
+            thread_id: None,
+            timezone: "UTC".into(),
+            disable_on_success: Some("npm test".into()),
+            disable_on_success_match: None,
+            disable_on_success_timeout_secs: None,
+            disable_on_success_working_dir: None,
+        };
+
+        disable_job_in_usercron(&path, &job).unwrap();
+
+        let updated = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&updated).unwrap();
+        let jobs = parsed["jobs"].as_array().unwrap();
+        // First job should be unchanged
+        assert!(jobs[0].get("enabled").is_none() || jobs[0]["enabled"].as_bool() == Some(true));
+        // Second job should be disabled
+        assert_eq!(jobs[1]["enabled"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn cronjob_config_parses_disable_on_success_fields() {
+        let toml_str = r#"
+[[jobs]]
+schedule = "*/10 * * * *"
+channel = "123"
+message = "goal"
+disable_on_success = "npm test"
+disable_on_success_match = "SUCCESS"
+disable_on_success_timeout_secs = 30
+disable_on_success_working_dir = "/repo"
+"#;
+        let parsed: UsercronFile = toml::from_str(toml_str).unwrap();
+        let job = &parsed.jobs[0];
+        assert_eq!(job.disable_on_success.as_deref(), Some("npm test"));
+        assert_eq!(job.disable_on_success_match.as_deref(), Some("SUCCESS"));
+        assert_eq!(job.disable_on_success_timeout_secs, Some(30));
+        assert_eq!(job.disable_on_success_working_dir.as_deref(), Some("/repo"));
     }
 }
