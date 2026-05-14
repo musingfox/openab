@@ -12,9 +12,6 @@ use std::time::SystemTime;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-const CRON_TRIGGER_TRUNCATED_NOTICE: &str =
-    "\n\n...\n(full cron prompt sent to agent; visible trigger truncated)";
-
 /// Parse a 5-field POSIX cron expression into a `Schedule`.
 ///
 /// The `cron` crate expects a 6-field expression (with seconds), so we prepend "0".
@@ -222,36 +219,6 @@ fn render_run(start: u32, end: u32) -> String {
     } else {
         format!("{}-{}", start, end)
     }
-}
-
-fn take_chars(s: &str, limit: usize) -> String {
-    s.chars().take(limit).collect()
-}
-
-fn cron_trigger_message(sender_name: &str, message: &str, limit: usize) -> String {
-    let prefix = format!("🕐 [{}]: ", sender_name);
-    let full = format!("{prefix}{message}");
-    if full.chars().count() <= limit {
-        return full;
-    }
-
-    let prefix_len = prefix.chars().count();
-    if prefix_len >= limit {
-        return take_chars(&prefix, limit);
-    }
-
-    let notice_len = CRON_TRIGGER_TRUNCATED_NOTICE.chars().count();
-    if prefix_len + notice_len >= limit {
-        let available = limit.saturating_sub(prefix_len);
-        return format!("{prefix}{}", take_chars(message, available));
-    }
-
-    let available = limit - prefix_len - notice_len;
-    format!(
-        "{prefix}{}{}",
-        take_chars(message, available),
-        CRON_TRIGGER_TRUNCATED_NOTICE
-    )
 }
 
 /// Check whether a cron schedule should fire right now.
@@ -581,10 +548,11 @@ async fn fire_cronjob(
         origin_event_id: None,
     };
 
-    let trigger_content =
-        cron_trigger_message(&job.sender_name, &job.message, adapter.message_limit());
     let trigger_msg = match adapter
-        .send_message(&thread_channel, &trigger_content)
+        .send_message(
+            &thread_channel,
+            &format!("🕐 [{}]: {}", job.sender_name, job.message),
+        )
         .await
     {
         Ok(msg) => msg,
@@ -965,28 +933,6 @@ mod tests {
     fn should_fire_every_minute_returns_true() {
         let schedule = parse_cron_expr("* * * * *").unwrap();
         assert!(should_fire(&schedule, chrono_tz::UTC));
-    }
-
-    #[test]
-    fn cron_trigger_message_keeps_short_prompt_unchanged() {
-        assert_eq!(
-            cron_trigger_message("DailyOps", "summarize yesterday", 2000),
-            "🕐 [DailyOps]: summarize yesterday"
-        );
-    }
-
-    #[test]
-    fn cron_trigger_message_truncates_long_prompt_to_platform_limit() {
-        let msg = cron_trigger_message("PR-Screening", &"x".repeat(4000), 2000);
-        assert!(msg.chars().count() <= 2000);
-        assert!(msg.starts_with("🕐 [PR-Screening]: "));
-        assert!(msg.contains("visible trigger truncated"));
-    }
-
-    #[test]
-    fn cron_trigger_message_handles_tiny_limits() {
-        let msg = cron_trigger_message("VeryLongSenderName", "payload", 8);
-        assert_eq!(msg.chars().count(), 8);
     }
 
     #[test]

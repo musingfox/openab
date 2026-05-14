@@ -275,7 +275,6 @@ usercron_path = "cronjob.toml"
 - **Isolation**: Cron failures are logged but never block interactive chat traffic.
 - **Stateless**: No persistence needed. Schedules are re-evaluated from config on restart.
 - **Graceful shutdown**: In-flight cron tasks are waited on (up to 30 seconds) during shutdown.
-- **Long prompts**: The full configured `message` is always sent to the agent. If the visible trigger message would exceed the platform limit, only the visible trigger is truncated before delivery.
 
 ## Sender Identity
 
