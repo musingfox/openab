@@ -47,6 +47,8 @@ kubectl exec -it <pod> -- hermes model                 # Interactive provider pi
 
 ### xAI Grok OAuth (Recommended)
 
+> ⚠️ **Requires an active [SuperGrok paid subscription](https://x.ai/grok) ($30/mo).** Auth will succeed without one, but the API silently returns empty responses — the bot appears to work but never replies.
+
 xAI Grok OAuth uses a loopback redirect flow — the callback listener binds `127.0.0.1:56121` inside the pod. You need a port-forward so your browser's redirect reaches the pod:
 
 ```bash
@@ -69,7 +71,7 @@ kubectl exec <pod> -- hermes config set model.provider xai-oauth
 kubectl exec <pod> -- hermes config set model.default grok-4.3
 ```
 
-> **Note:** You need an active [SuperGrok subscription](https://x.ai/grok) ($30/mo). Auth will succeed without one, but the API returns empty responses.
+> **Note:** Tokens are stored in `~/.hermes/auth.json` and auto-refresh in the background.
 
 ### Providers That Don't Need Port-Forward
 
