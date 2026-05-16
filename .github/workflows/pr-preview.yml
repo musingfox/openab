@@ -18,6 +18,7 @@ on:
           - copilot
           - cursor
           - gemini
+          - hermes
           - opencode
         default: 'default'
 

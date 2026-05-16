@@ -1,0 +1,52 @@
+# --- Build stage ---
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY src/ src/
+RUN touch src/main.rs && cargo build --release
+
+# --- Runtime stage ---
+FROM python:3.12-slim-bookworm
+
+# Create agent user first so WORKDIR gets correct ownership
+RUN useradd -m -u 1000 agent
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl procps ripgrep tini git ffmpeg xz-utils && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Hermes Agent — pinned to known commit with checksum verification
+# Root install uses FHS layout: binary at /usr/local/bin/hermes, code at /usr/local/lib/hermes-agent
+# HERMES_HOME points to agent user's data dir for OAuth tokens and config
+ARG HERMES_INSTALL_COMMIT=cc07e30f45267c00fac97ea5569c606aca5a1ffb
+ARG HERMES_INSTALL_SHA256=cb94b83b96cc924716bd1651411955da7495912ef68affe6788840e6cf147d41
+RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_INSTALL_COMMIT}/scripts/install.sh" \
+      -o /tmp/install-hermes.sh && \
+    echo "${HERMES_INSTALL_SHA256}  /tmp/install-hermes.sh" | sha256sum -c - && \
+    HERMES_HOME=/home/agent/.hermes bash /tmp/install-hermes.sh && \
+    rm /tmp/install-hermes.sh && \
+    chmod -R a+rX /root/.local/share/uv && \
+    chmod a+rx /root /root/.local /root/.local/share && \
+    ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes-acp /usr/local/bin/hermes-acp
+
+# Install gh CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV HOME=/home/agent
+WORKDIR /home/agent
+
+COPY --from=builder --chown=1000:1000 /build/target/release/openab /usr/local/bin/openab
+
+RUN chown -R agent:agent /home/agent
+
+USER agent
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
