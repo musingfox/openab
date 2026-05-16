@@ -1066,6 +1066,12 @@ async fn handle_message(
                         warn!(filename, error = %e, "image post-processing failed");
                         failed_image_files.push(filename.to_string());
                     }
+                    Err(media::MediaFetchError::HttpStatus(status))
+                        if status.is_client_error() =>
+                    {
+                        warn!(filename, %status, "image download denied");
+                        failed_image_files.push(filename.to_string());
+                    }
                     Err(e) => {
                         warn!(filename, error = %e, "image download failed");
                     }

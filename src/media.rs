@@ -272,13 +272,18 @@ pub async fn download_and_encode_image(
     let (output_bytes, output_mime) = match resize_and_compress(&bytes) {
         Ok(result) => result,
         Err(e) => {
-            error!(
-                filename,
-                error = %e,
-                size = bytes.len(),
-                "resize failed after successful validation"
-            );
-            return Err(MediaFetchError::ProcessingFailed(e));
+            if bytes.len() <= 1024 * 1024 {
+                debug!(filename, error = %e, "resize failed, using validated original");
+                (bytes.to_vec(), mime.to_string())
+            } else {
+                error!(
+                    filename,
+                    error = %e,
+                    size = bytes.len(),
+                    "resize failed after successful validation"
+                );
+                return Err(MediaFetchError::ProcessingFailed(e));
+            }
         }
     };
 
