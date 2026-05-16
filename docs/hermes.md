@@ -1,6 +1,6 @@
 # Hermes Agent
 
-[Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous Research supports ACP natively via `--acp --stdio`.
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous Research supports ACP natively via the `hermes acp` subcommand (or the `hermes-acp` binary).
 
 Hermes acts as a multi-provider inference gateway — it handles OAuth token lifecycle, credential storage, and provider routing so OAB agents don't need to manage auth directly.
 
@@ -21,8 +21,7 @@ helm install openab openab/openab \
   --set agents.hermes.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.hermes.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
   --set agents.hermes.image=ghcr.io/openabdev/openab-hermes:latest \
-  --set agents.hermes.command=hermes \
-  --set agents.hermes.args='{--acp,--stdio}' \
+  --set agents.hermes.command=hermes-acp \
   --set agents.hermes.workingDir=/home/agent
 ```
 
@@ -32,8 +31,7 @@ helm install openab openab/openab \
 
 ```toml
 [agent]
-command = "hermes"
-args = ["--acp", "--stdio"]
+command = "hermes-acp"
 working_dir = "/home/agent"
 ```
 
@@ -64,8 +62,7 @@ Any provider can also be configured with an API key via environment variables:
 
 ```toml
 [agent]
-command = "hermes"
-args = ["--acp", "--stdio"]
+command = "hermes-acp"
 working_dir = "/home/agent"
 env = { XAI_API_KEY = "${XAI_API_KEY}" }
 ```
@@ -77,6 +74,23 @@ Switch providers without restarting the pod:
 ```bash
 kubectl exec -it <pod> -- hermes model
 ```
+
+## Credential Persistence
+
+Hermes stores OAuth tokens in `~/.hermes/`. To persist credentials across pod restarts, mount a PVC:
+
+```yaml
+# In your Helm values or pod spec:
+volumes:
+  - name: hermes-credentials
+    persistentVolumeClaim:
+      claimName: hermes-credentials-pvc
+volumeMounts:
+  - name: hermes-credentials
+    mountPath: /home/agent/.hermes
+```
+
+Without a volume mount, you'll need to re-authenticate after every pod restart.
 
 ## Advantages
 
