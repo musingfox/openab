@@ -77,10 +77,11 @@ kubectl exec -it <pod> -- hermes model
 
 ## Credential Persistence
 
-Hermes stores OAuth tokens in `~/.hermes/`. To persist credentials across pod restarts, mount a PVC:
+Hermes stores OAuth tokens in `~/.hermes/`. The OpenAB Helm chart's default persistence covers this automatically (PVC mounted at `workingDir`).
+
+If deploying manually (without the Helm chart), mount persistent storage at `/home/agent` or `/home/agent/.hermes`:
 
 ```yaml
-# In your Helm values or pod spec:
 volumes:
   - name: hermes-credentials
     persistentVolumeClaim:
@@ -89,8 +90,6 @@ volumeMounts:
   - name: hermes-credentials
     mountPath: /home/agent/.hermes
 ```
-
-Without a volume mount, you'll need to re-authenticate after every pod restart.
 
 ## Advantages
 
