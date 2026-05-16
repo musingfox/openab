@@ -8,15 +8,23 @@ RUN touch src/main.rs && cargo build --release
 
 # --- Runtime stage ---
 FROM python:3.12-slim-bookworm
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini git && rm -rf /var/lib/apt/lists/*
+
+# Create agent user first so WORKDIR gets correct ownership
+RUN useradd -m -u 1000 agent
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl procps ripgrep tini git ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install Hermes Agent — pinned to known commit with checksum verification
+# Root install uses FHS layout: binary at /usr/local/bin/hermes, code at /usr/local/lib/hermes-agent
+# HERMES_HOME points to agent user's data dir for OAuth tokens and config
 ARG HERMES_INSTALL_COMMIT=cc07e30f45267c00fac97ea5569c606aca5a1ffb
 ARG HERMES_INSTALL_SHA256=cb94b83b96cc924716bd1651411955da7495912ef68affe6788840e6cf147d41
 RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_INSTALL_COMMIT}/scripts/install.sh" \
       -o /tmp/install-hermes.sh && \
     echo "${HERMES_INSTALL_SHA256}  /tmp/install-hermes.sh" | sha256sum -c - && \
-    bash /tmp/install-hermes.sh && \
+    HERMES_HOME=/home/agent/.hermes bash /tmp/install-hermes.sh && \
     rm /tmp/install-hermes.sh
 
 # Install gh CLI
@@ -32,8 +40,7 @@ WORKDIR /home/agent
 
 COPY --from=builder --chown=1000:1000 /build/target/release/openab /usr/local/bin/openab
 
-RUN useradd -m -u 1000 agent && \
-    mkdir -p /home/agent/.hermes && chown -R agent:agent /home/agent/.hermes
+RUN chown -R agent:agent /home/agent
 
 USER agent
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
