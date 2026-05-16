@@ -26,9 +26,8 @@ RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HE
     echo "${HERMES_INSTALL_SHA256}  /tmp/install-hermes.sh" | sha256sum -c - && \
     HERMES_HOME=/home/agent/.hermes bash /tmp/install-hermes.sh && \
     rm /tmp/install-hermes.sh && \
-    cd /usr/local/lib/hermes-agent && \
-    rm -rf venv && python3 -m venv venv && \
-    venv/bin/pip install --no-cache-dir -e ".[acp]" && \
+    chmod -R a+rX /root/.local/share/uv && \
+    chmod a+rx /root /root/.local /root/.local/share && \
     ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes-acp /usr/local/bin/hermes-acp
 
 # Install gh CLI
