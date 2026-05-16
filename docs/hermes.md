@@ -49,7 +49,9 @@ kubectl exec -it <pod> -- hermes model                 # Interactive provider pi
 
 > ⚠️ **Requires an active [SuperGrok paid subscription](https://x.ai/grok) ($30/mo).** Auth will succeed without one, but the API silently returns empty responses — the bot appears to work but never replies.
 
-xAI Grok OAuth uses a loopback redirect flow — the callback listener binds `127.0.0.1:56121` inside the pod. You need a port-forward so your browser's redirect reaches the pod:
+xAI Grok OAuth uses a loopback redirect flow — the callback listener binds `127.0.0.1:56121` inside the pod/container.
+
+#### Option A: Kubernetes (port-forward)
 
 ```bash
 # Terminal 1: port-forward
@@ -62,16 +64,53 @@ kubectl exec -it deployment/<your-deployment> -- hermes auth add xai-oauth --no-
 1. Copy the printed authorize URL → open in your local browser
 2. Approve access on accounts.x.ai
 3. Browser redirects to `127.0.0.1:56121/callback` → port-forward delivers it to the pod
-4. Terminal shows "Login successful!"
+4. Terminal shows `Added xai-oauth OAuth credential #1: "xai-oauth-oauth-1"`
 
-After auth, set the default model:
+#### Option B: ECS / Remote (curl-the-callback)
+
+ECS Fargate doesn't support port-forward. Use two exec sessions instead:
 
 ```bash
-kubectl exec <pod> -- hermes config set model.provider xai-oauth
-kubectl exec <pod> -- hermes config set model.default grok-4.3
+# Terminal 1: start the auth listener
+monksh <name>   # or: aws ecs execute-command ... --command bash
+hermes auth add xai-oauth --no-browser
+# → prints authorize URL with &state=XXXXX in it
+# → "Waiting for callback on http://127.0.0.1:56121/callback"
 ```
 
-> **Note:** Tokens are stored in `~/.hermes/auth.json` and auto-refresh in the background.
+Open the authorize URL in your browser and approve. The browser will redirect to
+`http://127.0.0.1:56121/callback?code=...` and fail ("Could not establish connection").
+**Copy the `code` value** from the page or URL bar. The `state` value comes from the
+authorize URL printed in Terminal 1.
+
+```bash
+# Terminal 2: exec into the SAME container
+monksh <name>
+curl "http://127.0.0.1:56121/callback?code=<THE_CODE>&state=<THE_STATE>"
+```
+
+Terminal 1 should print:
+```
+Added xai-oauth OAuth credential #1: "xai-oauth-oauth-1"
+```
+
+> ⚠️ The code expires in seconds — be fast. If you get `invalid_grant`, re-run `hermes auth add` and try again.
+
+#### After auth: set the default model
+
+```bash
+hermes config set model.provider xai-oauth
+hermes config set model.default grok-4.3
+```
+
+#### Fix file ownership (important for exec-based auth)
+
+When running auth/config commands via `kubectl exec` or ECS exec (which runs as root),
+fix ownership so the `agent` user can read the files:
+
+```bash
+chown -R agent:agent /home/agent/.hermes/
+```
 
 ### Providers That Don't Need Port-Forward
 
