@@ -751,15 +751,16 @@ async fn check_disable_on_success(
     marker: &str,
 ) -> DisableOnSuccessResult {
     let timeout_secs = job.disable_on_success_timeout_secs.max(1);
-    let mut child = shell_command(command);
+    let mut cmd = shell_command(command);
     if let Some(dir) = non_empty_opt(job.disable_on_success_working_dir.as_deref()) {
-        child.current_dir(dir);
+        cmd.current_dir(dir);
     }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
 
-    let output = match timeout(std::time::Duration::from_secs(timeout_secs), child.output()).await
-    {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => {
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
             warn!(
                 id = job.id.as_deref().unwrap_or(""),
                 command,
@@ -768,27 +769,74 @@ async fn check_disable_on_success(
             );
             return DisableOnSuccessResult::NotAchieved("command failed to start");
         }
-        Err(_) => {
+    };
+
+    // Take stdout/stderr handles and drain them concurrently to prevent pipe buffer deadlock.
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut out) = stdout_handle {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await;
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut err) = stderr_handle {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await;
+        }
+        buf
+    });
+
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
+    tokio::pin!(deadline);
+
+    tokio::select! {
+        status = child.wait() => {
+            let status = match status {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        id = job.id.as_deref().unwrap_or(""),
+                        command,
+                        error = %e,
+                        "disable_on_success command wait failed"
+                    );
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    return DisableOnSuccessResult::NotAchieved("command failed to start");
+                }
+            };
+            if !status.success() {
+                stdout_task.abort();
+                stderr_task.abort();
+                return DisableOnSuccessResult::NotAchieved("command exited non-zero");
+            }
+            let stdout_buf = stdout_task.await.unwrap_or_default();
+            let stderr_buf = stderr_task.await.unwrap_or_default();
+            let stdout = String::from_utf8_lossy(&stdout_buf);
+            let stderr = String::from_utf8_lossy(&stderr_buf);
+            if stdout.contains(marker) || stderr.contains(marker) {
+                DisableOnSuccessResult::Achieved
+            } else {
+                DisableOnSuccessResult::NotAchieved("success marker not found")
+            }
+        }
+        _ = &mut deadline => {
+            // Timeout — kill the child to avoid orphan processes.
+            let _ = child.kill().await;
+            stdout_task.abort();
+            stderr_task.abort();
             warn!(
                 id = job.id.as_deref().unwrap_or(""),
                 command,
                 timeout_secs,
                 "disable_on_success command timed out"
             );
-            return DisableOnSuccessResult::NotAchieved("command timed out");
+            DisableOnSuccessResult::NotAchieved("command timed out")
         }
-    };
-
-    if !output.status.success() {
-        return DisableOnSuccessResult::NotAchieved("command exited non-zero");
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stdout.contains(marker) || stderr.contains(marker) {
-        DisableOnSuccessResult::Achieved
-    } else {
-        DisableOnSuccessResult::NotAchieved("success marker not found")
     }
 }
 
@@ -839,7 +887,10 @@ fn update_usercron_job(
         anyhow::bail!("usercron job id {:?} not found", id);
     }
 
-    std::fs::write(path, doc.to_string())?;
+    // Atomic write: write to temp file then rename to avoid corruption on crash.
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -1448,6 +1499,18 @@ message = "a"
         assert!(matches!(
             check_disable_on_success(&job, "printf SUCCESS; exit 1", "SUCCESS").await,
             DisableOnSuccessResult::NotAchieved("command exited non-zero")
+        ));
+    }
+
+    #[tokio::test]
+    async fn disable_on_success_kills_child_on_timeout() {
+        let mut job = test_cron_job();
+        job.disable_on_success_timeout_secs = 1;
+
+        let result = check_disable_on_success(&job, "sleep 999", "SUCCESS").await;
+        assert!(matches!(
+            result,
+            DisableOnSuccessResult::NotAchieved("command timed out")
         ));
     }
 
