@@ -1,93 +1,92 @@
-# Reference Architecture: CI-to-Discord Notifications
+# Reference Architecture: CI-to-Discord Notification
 
 > **This doc is meant to be used with Kiro or any coding CLI.** Prompt your AI agent with something like:
 >
 > ```
-> per https://github.com/openabdev/openab/blob/main/docs/refarch/ci-discord-notify.md set up CI-to-Discord notifications for my repo
+> per https://github.com/openabdev/openab/blob/main/docs/refarch/ci-discord-notify.md set up CI notifications to my Discord channel
 > ```
 >
-> and it will guide you through (or handle) the full setup.
+> and it will guide you through the full setup.
 
-Send GitHub Actions CI results (pass/fail) to a Discord channel thread via webhook, with clickable links and dynamic thread routing extracted from PR descriptions.
+Send GitHub Actions CI results (pass/fail) to a Discord channel or thread via webhook, with clickable links, duration, and bot mentions.
 
 ## Architecture
 
 ```
 +-- GitHub Actions ----------------------------------------+
 |                                                          |
-|  +-- CI Workflow (ci.yml) ----------------------------+  |
+|  +-- ci.yml ------------------------------------------+  |
 |  |                                                    |  |
-|  |  [checkout] -> [build/test] -> [collect metadata]  |  |
-|  |                                    |               |  |
-|  |                                    v               |  |
-|  +----------------------------------------------------+  |
-|                                       |                  |
-|  +-- Notify Workflow (notify-discord.yml) ------------+  |
-|  |  (reusable, workflow_call)                         |  |
-|  |                                                    |  |
-|  |  inputs: status, failed_step, duration,            |  |
-|  |          commit_msg, commit_author, pr_body        |  |
-|  |                                                    |  |
-|  |  1. Extract Thread ID from PR body                 |  |
-|  |     (regex: ^Thread:\s*<id>)                       |  |
-|  |  2. Fallback to env var DISCORD_THREAD_ID          |  |
-|  |  3. Build Discord embed (green/red sidebar)        |  |
-|  |  4. POST to webhook ?thread_id=<id>               |  |
-|  +----------------------------------------------------+  |
-|           |                                              |
-+-----------+----------------------------------------------+
-            |
-            v  (HTTPS POST)
-+-- Discord -----------------------------------+
-|                                              |
-|  Webhook URL ──► Channel / Thread            |
-|                                              |
-|  ┌─────────────────────────────────────────┐ |
-|  │ ✅ CI success — 7iac/chiac@main         │ |
-|  │ 👤 pahud — feat(x): add feature (#42)   │ |
-|  │ ⏱️ 2m 15s                               │ |
-|  │ @超渡法師(KIRO)                          │ |
-|  └─────────────────────────────────────────┘ |
-|                                              |
-+----------------------------------------------+
+|  |  [check] ──► cargo fmt / clippy / test             |  |
+|  |     │                                              |  |
+|  |     │ outputs: status, duration, commit_msg,       |  |
+|  |     │          commit_author, commit_sha           |  |
+|  |     ▼                                              |  |
+|  |  [notify] (if: always())                           |  |
+|  |     │  calls ──► notify-discord.yml (reusable)     |  |
+|  |     │                                              |  |
+|  +-----|----------------------------------------------+  |
+|        │                                                 |
+|        │  inputs: status, commit_msg, pr_body, ...       |
+|        │  secrets: DISCORD_WEBHOOK_URL                    |
+|        │  vars: DISCORD_THREAD_ID, DISCORD_MENTION_UID   |
+|        │                                                 |
++--------|─────────────────────────────────────────────────+
+         │
+         │ HTTP POST (webhook + ?thread_id=xxx)
+         ▼
++-- Discord -----------------------------------------------+
+|                                                          |
+|  #channel or thread                                      |
+|  ┌─────────────────────────────────────────────────┐     |
+|  │ ✅ feat: add new provider        ← clickable    │     |
+|  │ ──────────────────────────────────────────────  │     |
+|  │ ✅ CI success — repo@main                       │     |
+|  │ 👤 author                                       │     |
+|  │ ⏱️ 3m42s                                        │     |
+|  │ View Run                          ← clickable   │     |
+|  └─────────────────────────────────────────────────┘     |
+|  @bot-mention                                            |
+|                                                          |
++----------------------------------------------------------+
 ```
 
-## How It Works
+## Key Design Decisions
 
-1. **CI workflow** runs build/test steps and collects metadata (status, duration, failed step, commit info) as job outputs.
-2. **Notify workflow** is called as a reusable `workflow_call` workflow, receiving metadata as inputs.
-3. **Thread routing**: The notify workflow extracts a Discord thread ID from the PR body (`Thread: <id>`), falling back to a repository-level environment variable.
-4. **Embed format**: Uses Discord embed (not plain `content`) so markdown links are clickable. Green sidebar for success, red for failure.
-5. **Mention**: Optionally pings a Discord user/bot via `DISCORD_MENTION_USER_ID` env var.
+| Decision | Rationale |
+|----------|-----------|
+| Reusable workflow (`workflow_call`) | Any CI workflow can call it; single source of truth |
+| `if: always()` on notify job | Fires on success, failure, and cancellation |
+| Discord embed (not plain content) | Supports clickable title, colored sidebar, markdown in description |
+| Thread ID from PR body | Dynamic routing — each PR notifies its own thread |
+| Fallback to repo variable | Push-to-main events still get notified somewhere |
+| `printf` for newlines | `jq --arg` preserves real `\n` from printf output |
 
-## Prerequisites
+## Setup
 
-- A Discord server with a channel for CI notifications
-- A Discord webhook URL (Channel Settings → Integrations → Webhooks)
-- A GitHub repository with Actions enabled
-- A GitHub Actions environment named `discord-notify` with the following configured:
-  - **Secret**: `DISCORD_WEBHOOK_URL` — the webhook URL
-  - **Variable**: `DISCORD_THREAD_ID` — default thread ID (fallback)
-  - **Variable**: `DISCORD_MENTION_USER_ID` — Discord user ID to ping (optional)
+### 1. Create a Discord Webhook
 
-## Setup Steps
+Server Settings → Integrations → Webhooks → New Webhook → Copy URL.
 
-### Step 1: Create the Discord Webhook
+### 2. Configure Repository Secrets & Variables
 
-1. In your Discord server, go to the target channel → Edit Channel → Integrations → Webhooks.
-2. Create a new webhook, name it (e.g., "GH CI Webhook").
-3. Copy the webhook URL.
+| Type | Name | Value |
+|------|------|-------|
+| **Secret** | `DISCORD_WEBHOOK_URL` | The webhook URL (contains token — keep secret) |
+| **Variable** | `DISCORD_THREAD_ID` | Default thread ID for fallback notifications |
+| **Variable** | `DISCORD_MENTION_USER_ID` | Discord user/bot ID to mention (e.g. `1234567890`) |
 
-### Step 2: Configure GitHub Environment
+Set via CLI:
 
-1. In your repo, go to Settings → Environments → New environment → name it `discord-notify`.
-2. Add secret `DISCORD_WEBHOOK_URL` with the webhook URL.
-3. Add variable `DISCORD_THREAD_ID` with your default Discord thread ID.
-4. (Optional) Add variable `DISCORD_MENTION_USER_ID` with the Discord user ID to mention.
+```bash
+gh secret set DISCORD_WEBHOOK_URL --repo <owner>/<repo>
+gh variable set DISCORD_THREAD_ID --repo <owner>/<repo> --body "<thread_id>"
+gh variable set DISCORD_MENTION_USER_ID --repo <owner>/<repo> --body "<user_id>"
+```
 
-### Step 3: Create the Reusable Notify Workflow
+### 3. Create the Reusable Workflow
 
-Create `.github/workflows/notify-discord.yml`:
+`.github/workflows/notify-discord.yml`:
 
 ```yaml
 name: Discord Notify
@@ -110,6 +109,9 @@ on:
       commit_author:
         required: false
         type: string
+      commit_sha:
+        required: false
+        type: string
       pr_body:
         required: false
         type: string
@@ -120,7 +122,6 @@ on:
 jobs:
   notify:
     runs-on: ubuntu-latest
-    environment: discord-notify
     steps:
       - name: Send Discord notification
         env:
@@ -132,6 +133,7 @@ jobs:
           DURATION: ${{ inputs.duration }}
           COMMIT_MSG: ${{ inputs.commit_msg }}
           COMMIT_AUTHOR: ${{ inputs.commit_author }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
           PR_BODY: ${{ inputs.pr_body }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           REPO: ${{ github.repository }}
@@ -147,39 +149,41 @@ jobs:
           [ -z "$THREAD_ID" ] && THREAD_ID="$DEFAULT_THREAD_ID"
 
           if [ "$STATUS" = "success" ]; then
-            COLOR=3066993
-            EMOJI="✅"
+            COLOR=3066993; EMOJI="✅"
           else
-            COLOR=15158332
-            EMOJI="❌"
+            COLOR=15158332; EMOJI="❌"
           fi
 
-          # Build description with clickable links
-          DESC="${EMOJI} **CI ${STATUS}** — [\`${REPO}@${REF}\`](${RUN_URL})"
+          # Embed title = commit msg (clickable link to PR or commit)
+          TITLE="${COMMIT_MSG:-CI ${STATUS}}"
           if [ -n "$PR" ]; then
-            DESC="${DESC} | [PR #${PR}](${SERVER_URL}/${REPO}/pull/${PR})"
+            TITLE_URL="${SERVER_URL}/${REPO}/pull/${PR}"
+          elif [ -n "$COMMIT_SHA" ]; then
+            TITLE_URL="${SERVER_URL}/${REPO}/commit/${COMMIT_SHA}"
+          else
+            TITLE_URL="${RUN_URL}"
           fi
-          if [ -n "$COMMIT_AUTHOR" ]; then
-            DESC="${DESC}\n👤 ${COMMIT_AUTHOR}"
-            if [ -n "$COMMIT_MSG" ] && [ -n "$PR" ]; then
-              DESC="${DESC} — [${COMMIT_MSG}](${SERVER_URL}/${REPO}/pull/${PR})"
-            elif [ -n "$COMMIT_MSG" ]; then
-              DESC="${DESC} — \`${COMMIT_MSG}\`"
-            fi
-          fi
-          [ -n "$DURATION" ] && DESC="${DESC}\n⏱️ ${DURATION}"
-          [ "$STATUS" != "success" ] && [ -n "$FAILED_STEP" ] && \
-            DESC="${DESC}\n💥 Failed at: **${FAILED_STEP}**"
 
-          # Build JSON payload with embed
+          # Build description using printf for real newlines
+          DESC="${EMOJI} **CI ${STATUS}** — \`${REPO}@${REF}\`"
+          [ -n "$PR" ] && DESC="${DESC} | PR #${PR}"
+          [ -n "$COMMIT_AUTHOR" ] && DESC=$(printf "%s\n👤 %s" "$DESC" "$COMMIT_AUTHOR")
+          [ -n "$DURATION" ] && DESC=$(printf "%s\n⏱️ %s" "$DESC" "$DURATION")
+          [ "$STATUS" != "success" ] && [ -n "$FAILED_STEP" ] && \
+            DESC=$(printf "%s\n💥 Failed at: **%s**" "$DESC" "$FAILED_STEP")
+          DESC=$(printf "%s\n[View Run](%s)" "$DESC" "$RUN_URL")
+
+          # Build JSON payload
           CONTENT=""
           [ -n "$MENTION_USER_ID" ] && CONTENT="<@${MENTION_USER_ID}>"
 
           PAYLOAD=$(jq -n \
             --arg content "$CONTENT" \
+            --arg title "$TITLE" \
+            --arg url "$TITLE_URL" \
             --arg desc "$DESC" \
             --argjson color "$COLOR" \
-            '{content: $content, embeds: [{description: $desc, color: $color}]}')
+            '{content: $content, embeds: [{title: $title, url: $url, description: $desc, color: $color}]}')
 
           URL="${WEBHOOK_URL}"
           [ -n "$THREAD_ID" ] && URL="${URL}?thread_id=${THREAD_ID}"
@@ -189,29 +193,43 @@ jobs:
             -d "$PAYLOAD"
 ```
 
-### Step 4: Call from Your CI Workflow
+### 4. Wire Into Your CI Workflow
 
-Add a notify job at the end of your CI workflow:
+Add a `notify` job at the end of any workflow:
 
 ```yaml
 jobs:
   check:
     runs-on: ubuntu-latest
     outputs:
-      failed_step: ${{ steps.report.outputs.failed_step }}
-      duration: ${{ steps.report.outputs.duration }}
-      commit_msg: ${{ steps.report.outputs.commit_msg }}
-      commit_author: ${{ steps.report.outputs.commit_author }}
+      duration: ${{ steps.duration.outputs.value }}
+      commit_msg: ${{ steps.meta.outputs.commit_msg }}
+      commit_author: ${{ steps.meta.outputs.commit_author }}
+      failed_step: ${{ steps.meta.outputs.failed_step }}
     steps:
-      # ... your build/test steps ...
+      - name: Record start time
+        id: start
+        run: echo "ts=$(date +%s)" >> "$GITHUB_OUTPUT"
 
-      - name: Collect CI metadata
-        id: report
+      # ... your build/test steps (give each an id) ...
+
+      - name: Collect metadata
+        id: meta
         if: always()
         run: |
           echo "commit_msg=$(git log -1 --pretty=%s)" >> "$GITHUB_OUTPUT"
           echo "commit_author=$(git log -1 --pretty=%an)" >> "$GITHUB_OUTPUT"
-          # Add duration/failed_step logic as needed
+          # Detect which step failed
+          FAILED=""
+          # if [ "${{ steps.test.outcome }}" = "failure" ]; then FAILED="Tests"; fi
+          echo "failed_step=${FAILED}" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate duration
+        id: duration
+        if: always()
+        run: |
+          ELAPSED=$(( $(date +%s) - ${{ steps.start.outputs.ts }} ))
+          echo "value=$((ELAPSED/60))m$((ELAPSED%60))s" >> "$GITHUB_OUTPUT"
 
   notify:
     needs: [check]
@@ -223,33 +241,29 @@ jobs:
       duration: ${{ needs.check.outputs.duration }}
       commit_msg: ${{ needs.check.outputs.commit_msg }}
       commit_author: ${{ needs.check.outputs.commit_author }}
+      commit_sha: ${{ github.event.pull_request.head.sha || github.sha }}
       pr_body: ${{ github.event.pull_request.body }}
     secrets:
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 ```
 
-## Dynamic Thread Routing
+### 5. Dynamic Thread Routing via PR Description
 
-To route notifications to a specific Discord thread per PR, add this line anywhere in the PR description:
+Add a `Thread:` line anywhere in your PR description:
 
 ```
 Thread: 1505664791719710810
 ```
 
-The notify workflow extracts this value and appends `?thread_id=<id>` to the webhook URL. This lets different PRs notify different threads (e.g., per-feature discussion threads).
+The workflow extracts the first match and posts to that thread. If absent, it falls back to `DISCORD_THREAD_ID` variable.
 
-If no `Thread:` line is found, it falls back to the `DISCORD_THREAD_ID` environment variable.
+## Gotchas
 
-## Customization
-
-| What | How |
-|------|-----|
-| Change colors | Edit `COLOR` values (Discord decimal color codes) |
-| Add more metadata | Add inputs to the reusable workflow, pass from CI |
-| Multiple channels | Create additional webhooks, use conditional logic |
-| Suppress mentions | Remove `DISCORD_MENTION_USER_ID` variable |
-| Thread per branch | Maintain a mapping of branch → thread ID |
-
-## Reference Implementation
-
-See [7iac/chiac](https://github.com/7iac/chiac) for a working example using this pattern with a Rust CI pipeline and self-hosted runners.
+| Issue | Solution |
+|-------|----------|
+| `content` field doesn't support markdown links | Use `embeds` with `title`/`url` for clickable links |
+| `\n` in `jq --arg` becomes literal `\\n` | Use `printf` to produce real newlines before passing to jq |
+| Duplicate YAML keys silently break workflows | Validate with `actionlint` or check Actions run errors |
+| Webhook URL contains a token | Always store as a **secret**, never in workflow files or docs |
+| `if: always()` required on notify job | Otherwise it's skipped when upstream jobs fail |
+| Mention requires numeric Discord user ID | Use `<@USER_ID>` format in `content` (not in embed) |
