@@ -44,6 +44,7 @@ struct TelegramPhoto {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TelegramDocument {
     file_id: String,
     file_name: Option<String>,
@@ -51,12 +52,14 @@ struct TelegramDocument {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TelegramVoice {
     file_id: String,
     mime_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TelegramAudio {
     file_id: String,
     file_name: Option<String>,

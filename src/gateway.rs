@@ -546,6 +546,7 @@ pub async fn run_gateway_adapter(
     let allow_all_channels = params.allow_all_channels;
     let allowed_channels = params.allowed_channels;
     let allowed_users = params.allowed_users;
+    let allow_all_users = params.allow_all_users;
     let streaming = params.streaming;
     let stt_config = params.stt;
 

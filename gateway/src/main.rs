@@ -127,7 +127,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                     adapters::telegram::handle_reply(
                                         &reply,
                                         token,
-                                        &client,
+                                        client,
                                         &state_for_recv.event_tx,
                                         &reaction_state,
                                     )
@@ -139,7 +139,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             "line" => {
                                 if let Some(ref access_token) = state_for_recv.line_access_token {
                                     adapters::line::dispatch_line_reply(
-                                        &client,
+                                        client,
                                         access_token,
                                         &state_for_recv.reply_token_cache,
                                         &reply,
