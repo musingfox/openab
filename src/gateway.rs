@@ -801,6 +801,12 @@ pub async fn run_gateway_adapter(
                                         }
                                     }
 
+                                    // Guard: skip empty turns (e.g. audio-only with STT disabled)
+                                    if prompt.trim().is_empty() && extra_blocks.is_empty() {
+                                        tracing::debug!(platform = %event.platform, sender = %event.sender.id, "empty prompt + no content blocks, skipping");
+                                        continue;
+                                    }
+
                                     tasks.spawn(async move {
                                         // If supergroup with no thread_id, create a forum topic
                                         let thread_channel = if event.channel.channel_type == "supergroup"
