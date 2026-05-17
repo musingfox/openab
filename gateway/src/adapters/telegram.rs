@@ -30,6 +30,8 @@ struct TelegramMessage {
     #[serde(default)]
     entities: Vec<TelegramEntity>,
     #[serde(default)]
+    caption_entities: Vec<TelegramEntity>,
+    #[serde(default)]
     photo: Vec<TelegramPhoto>,
     document: Option<TelegramDocument>,
     voice: Option<TelegramVoice>,
@@ -172,6 +174,7 @@ pub async fn webhook(
     let mentions: Vec<String> = msg
         .entities
         .iter()
+        .chain(msg.caption_entities.iter())
         .filter(|e| e.entity_type == "mention")
         .filter_map(|e| {
             text.get(e.offset..e.offset + e.length)
@@ -198,6 +201,11 @@ pub async fn webhook(
     );
     event.content.attachments = attachments;
 
+
+    // Guard: skip empty events (no text + no attachments)
+    if event.content.text.trim().is_empty() && event.content.attachments.is_empty() {
+        return axum::http::StatusCode::OK;
+    }
     let json = serde_json::to_string(&event).unwrap();
     info!(chat_id = %msg.chat.id, sender = %sender_name, "telegram → gateway");
     let _ = state.event_tx.send(json);
@@ -392,7 +400,7 @@ async fn download_telegram_media(
 
     let (data_bytes, mime, filename) = if attachment_type == "image" {
         match resize_and_compress(&bytes) {
-            Ok((c, _m)) => (c, content_type, format!("{}.jpg", file_id)),
+            Ok((c, m)) => (c, m, format!("{}.jpg", file_id)),
             Err(e) => {
                 error!(err = %e, "Telegram image processing failed");
                 return None;
@@ -435,7 +443,7 @@ async fn download_telegram_document(
     const TEXT_EXTS: &[&str] = &[
         "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml", "rs", "py", "js",
         "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp", "rb", "sh", "bash", "sql",
-        "html", "css", "ini", "cfg", "conf", "env",
+        "html", "css", "ini", "cfg", "conf",
     ];
     if !TEXT_EXTS.contains(&ext.as_str()) {
         tracing::debug!(file_name, "skipping non-text file attachment");

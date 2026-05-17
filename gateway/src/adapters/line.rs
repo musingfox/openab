@@ -168,6 +168,11 @@ pub async fn webhook(
         );
         gateway_event.content.attachments = attachments;
 
+
+        // Guard: skip empty events (no text + no attachments)
+        if gateway_event.content.text.trim().is_empty() && gateway_event.content.attachments.is_empty() {
+            continue;
+        }
         // Cache the reply token for hybrid Reply/Push dispatch
         if let Some(ref reply_token) = event.reply_token {
             let mut cache = state
@@ -332,7 +337,7 @@ async fn download_line_media(
 
     let (data_bytes, mime, filename) = if attachment_type == "image" {
         match resize_and_compress(&bytes) {
-            Ok((c, _m)) => (c, content_type, format!("{}.jpg", message_id)),
+            Ok((c, m)) => (c, m, format!("{}.jpg", message_id)),
             Err(e) => {
                 error!(err = %e, "LINE image processing failed");
                 return None;
