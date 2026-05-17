@@ -10,6 +10,30 @@
 
 Send GitHub Actions CI results (pass/fail) to a Discord channel or thread via webhook, with clickable links, duration, and bot mentions.
 
+## Problem
+
+When CI runs in GitHub Actions, the only way to know the result is to check the GitHub UI or wait for an email. For teams collaborating in Discord, this creates friction:
+
+- **No visibility** — CI failures go unnoticed until someone manually checks GitHub
+- **Slow feedback loop** — contributors wait without knowing their PR is broken
+- **Context switching** — developers must leave Discord to check CI status
+- **No accountability** — nobody gets pinged when CI breaks
+
+## Challenges
+
+| Challenge | Why it's hard |
+|-----------|---------------|
+| Notify regardless of outcome | GitHub Actions skips downstream jobs when upstream fails — need `if: always()` |
+| Clickable links in Discord | Webhook `content` field does NOT support markdown links — must use embeds |
+| Newlines in embed description | `jq --arg` treats `\n` as literal backslash-n — need `printf` for real newlines |
+| Route to the right thread | Different PRs need notifications in different threads — need dynamic extraction |
+| Don't repeat yourself | Multiple CI workflows need the same notification logic — need reusable workflow |
+| Keep secrets safe | Webhook URL contains a token — must never appear in workflow files or logs |
+
+## Solution
+
+A **reusable workflow** (`notify-discord.yml`) that any CI workflow calls as its final job. It posts a Discord embed with clickable title, colored sidebar, and bot mention — routing to the correct thread based on the PR description.
+
 ## Architecture
 
 ```
