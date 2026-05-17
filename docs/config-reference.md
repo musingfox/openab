@@ -41,6 +41,9 @@ Discord adapter. Requires a Discord bot token.
 | `allow_user_messages` | string | `"involved"` | `"involved"` — reply in threads bot has participated in without @mention; channel messages require @mention; DMs always process. `"mentions"` — always require @mention. `"multibot-mentions"` — like `"involved"`, but require @mention once another bot has posted in the thread. |
 | `allow_dm` | bool | `false` | `true` = respond to Discord DMs; `false` = ignore DMs. `allowed_users` still applies in DMs. Each DM user consumes one session slot. |
 | `max_bot_turns` | u32 | `100` | Max consecutive bot turns per thread before throttling (soft limit). Human message resets the counter. A compiled-in hard cap of 1000 consecutive bot messages is always enforced. |
+| `message_processing_mode` | string | `"per-message"` | How incoming messages are batched before dispatch. `"per-message"` — each message triggers its own ACP turn (default). `"per-thread"` — all messages in a thread share one buffer; messages arriving while the agent is busy are batched into a single turn. `"per-lane"` — each (thread, sender) pair gets its own buffer. See [Message Dispatch Modes](message-dispatch-modes.md). |
+| `max_buffered_messages` | u32 | `10` | Per-thread/lane mpsc channel capacity. Only applies when `message_processing_mode` is `"per-thread"` or `"per-lane"`. |
+| `max_batch_tokens` | u32 | `24000` | Soft token cap per batched ACP turn (~4 chars/token). Only applies when `message_processing_mode` is `"per-thread"` or `"per-lane"`. |
 
 ---
 
@@ -60,6 +63,9 @@ Slack adapter using Socket Mode. Requires both a Bot User OAuth Token and an App
 | `trusted_bot_ids` | string[] | `[]` | Slack Bot User IDs (`U...`) or Bot IDs (`B...`). `U...` matching resolves event Bot IDs via Slack `bots.info`, so the bot token needs `users:read`. |
 | `allow_user_messages` | string | `"involved"` | Same as Discord. |
 | `max_bot_turns` | u32 | `100` | Same as Discord. |
+| `message_processing_mode` | string | `"per-message"` | Same as Discord. See [Message Dispatch Modes](message-dispatch-modes.md). |
+| `max_buffered_messages` | u32 | `10` | Same as Discord. |
+| `max_batch_tokens` | u32 | `24000` | Same as Discord. |
 
 ---
 
@@ -77,6 +83,9 @@ Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Googl
 | `allowed_channels` | string[] | `[]` | Chat/group IDs to allow. Only checked when `allow_all_channels` resolves to false. |
 | `allow_all_users` | bool \| omit | auto-detect | `true` = any user; `false` = only `allowed_users`. Omitted = inferred from list. |
 | `allowed_users` | string[] | `[]` | User IDs to allow. Only checked when `allow_all_users` resolves to false. |
+| `message_processing_mode` | string | `"per-message"` | Same as Discord. See [Message Dispatch Modes](message-dispatch-modes.md). |
+| `max_buffered_messages` | u32 | `10` | Same as Discord. |
+| `max_batch_tokens` | u32 | `24000` | Same as Discord. |
 
 ---
 
@@ -314,6 +323,9 @@ Key mapping (`values.yaml` → `config.toml`):
 | `agents.<name>.discord.allowBotMessages` | `[discord] allow_bot_messages` |
 | `agents.<name>.discord.trustedBotIds` | `[discord] trusted_bot_ids` |
 | `agents.<name>.discord.allowUserMessages` | `[discord] allow_user_messages` |
+| `agents.<name>.discord.messageProcessingMode` | `[discord] message_processing_mode` |
+| `agents.<name>.discord.maxBufferedMessages` | `[discord] max_buffered_messages` |
+| `agents.<name>.discord.maxBatchTokens` | `[discord] max_batch_tokens` |
 | `agents.<name>.slack.*` | `[slack] *` (same pattern) |
 | `agents.<name>.pool.maxSessions` | `[pool] max_sessions` |
 | `agents.<name>.pool.sessionTtlHours` | `[pool] session_ttl_hours` |
