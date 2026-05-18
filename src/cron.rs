@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::process::Command;
 use tokio::sync::Mutex;
-use tokio::time::timeout;
 use toml_edit::{value, DocumentMut};
 use tracing::{debug, error, info, warn};
 
