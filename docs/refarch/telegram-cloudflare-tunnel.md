@@ -11,15 +11,15 @@ Telegram Cloud
 Cloudflare Edge (your_custom.domain.com)
     │ Tunnel (QUIC)
     ▼
-┌──────────────────────────────────────────────────────┐
-│  Single Pod                                          │
-│                                                      │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────┐  │
-│  │ cloudflared │─▶│ gateway :8080│◀─│    OAB     │  │
-│  │ (sidecar)   │  │ (sidecar)    │ws│ (main)     │  │
-│  └─────────────┘  └──────────────┘  └────────────┘  │
-│       localhost         localhost                     │
-└──────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│ Single Pod                                          │
+│                                                     │
+│ ┌─────────────┐ ┌──────────────┐ ┌──────────────┐  │
+│ │ cloudflared │─▶│gateway :8080 │◀─│     OAB     │  │
+│ │ (sidecar)   │ │  (sidecar)   │ws│   (main)    │  │
+│ └─────────────┘ └──────────────┘ └──────────────┘  │
+│    localhost          localhost                      │
+└─────────────────────────────────────────────────────┘
 ```
 
 All three components run as containers in the **same pod**:
