@@ -29,7 +29,7 @@ This enables a "GitOps for ECS" workflow where pushing a YAML change triggers th
 │                                                      │
 │  ┌────────────┐  ┌──────────────┐  ┌─────────────┐  │
 │  │ State Store│  │  Reconciler  │  │  ECS API /  │  │
-│  │ (S3 + DDB) │◄─│  Controller  │─►│  CloudMap   │  │
+│  │   (S3)     │◄─│  Controller  │─►│  CloudMap   │  │
 │  │            │  │              │  │             │  │
 │  └────────────┘  └──────────────┘  └─────────────┘  │
 │                        ▲                             │
@@ -48,7 +48,7 @@ This enables a "GitOps for ECS" workflow where pushing a YAML change triggers th
 2. Describe current ECS services/tasks (observed state)
 3. Compute diff
 4. Apply changes: create, update, or delete ECS resources
-5. Write status back to DynamoDB
+5. Write status back to S3 (separate prefix)
 6. Sleep / wait for next event
 
 ---
@@ -77,83 +77,135 @@ spec:
     subnets: [subnet-abc, subnet-def]
     securityGroups: [sg-123]
     assignPublicIp: false
-status:
-  phase: Running
-  observedGeneration: 3
-  conditions:
-    - type: Available
-      status: "True"
-      lastTransitionTime: "2026-05-18T10:00:00Z"
 ```
 
 Key fields:
 - `spec.taskDefinition` — maps directly to ECS RegisterTaskDefinition
 - `spec.backend` — OAB-specific config injected as environment/secrets
 - `spec.networking` — ECS awsvpc configuration
-- `status` — written back by the controller (stored in DDB, not in the S3 YAML)
 
 ---
 
-## 4. State Store Design
+## 4. State Store Design (S3-Only)
 
-| Concern | Store | Rationale |
-|---------|-------|-----------|
-| Desired state (manifests) | S3 | Human-readable, versioned, git-syncable |
-| Status + generation tracking | DynamoDB | Fast reads, conditional writes for optimistic concurrency |
-| Leader election lock | DynamoDB | TTL-based lease via conditional PutItem |
+```
+s3://oab-control-plane/
+  ├── manifests/{namespace}/{name}.yaml   ← desired state (oabctl writes)
+  └── status/{namespace}/{name}.json      ← observed state (controller writes)
+```
 
-S3 event notifications (→ EventBridge → SQS) trigger the controller on manifest changes. A periodic full-reconciliation (every 30–60s) catches drift from out-of-band changes.
+| Concern | Mechanism | Rationale |
+|---------|-----------|-----------|
+| Desired state | `s3://…/manifests/` | Human-readable, git-syncable, versioned via S3 versioning |
+| Status / observed state | `s3://…/status/` | Controller writes after each reconcile cycle |
+| Generation tracking | S3 object VersionId | Each `oabctl apply` creates a new version; controller compares |
+| Change detection | S3 Event Notifications → EventBridge | Triggers controller on manifest PUT/DELETE |
+| Consistency | S3 strong read-after-write | Sufficient for single-controller architecture |
+
+**Why no DynamoDB in Phase 1:**
+- Single controller instance — no leader election needed
+- S3 strong read-after-write consistency (since Dec 2020) is sufficient
+- Fewer moving parts, zero additional infra cost
+- DDB can be added in Phase 2 for multi-replica leader election and fast status queries
 
 ---
 
-## 5. Controller Lifecycle
+## 5. CLI UX (`oabctl`)
+
+### Core Commands
+
+```bash
+oabctl apply -f agent.yaml          # declare/update desired state
+oabctl get oabservice               # list all services + status
+oabctl get oabservice my-agent      # single service detail
+oabctl delete oabservice my-agent   # mark for deletion
+oabctl diff -f agent.yaml           # show local vs remote diff
+oabctl logs my-agent                # shortcut to ECS task logs
+oabctl wait my-agent --for=Available # block until condition met
+```
+
+### `apply` Semantics
+
+```
+$ oabctl apply -f prod/my-agent.yaml
+
+✓ Schema validated
+✓ Uploaded to s3://oab-control-plane/manifests/prod/my-agent.yaml
+✓ Generation: v3 → v4
+⏳ Waiting for reconciliation...
+✓ Service my-agent reconciled (2/2 tasks running)
+```
+
+Behavior:
+- Object doesn't exist → create (PUT to S3)
+- Object exists → update (PUT overwrites, new S3 version)
+- Immutable fields (namespace) → reject with error
+- `--wait=false` to skip waiting for reconciliation
+
+### `apply` Implementation (Phase 1)
+
+```
+oabctl apply -f agent.yaml
+  │
+  ├─ 1. Parse & validate YAML against schema (local, fast fail)
+  ├─ 2. s3:PutObject → s3://oab-control-plane/manifests/{ns}/{name}.yaml
+  └─ 3. (if --wait) Poll status/{ns}/{name}.json until phase=Running or timeout
+```
+
+No API server needed — `oabctl` talks directly to S3 via AWS SDK. Auth is standard IAM (role, profile, env vars).
+
+---
+
+## 6. Controller Lifecycle
 
 ### Reconcile Actions
 
 | Diff | Action |
 |------|--------|
 | Manifest exists, no ECS service | RegisterTaskDefinition → CreateService |
-| Manifest spec changed | RegisterTaskDefinition (new revision) → UpdateService |
-| Manifest deleted | UpdateService (desiredCount=0) → DeleteService → DeregisterTaskDefinition |
+| Manifest spec changed (new S3 version) | RegisterTaskDefinition (new revision) → UpdateService |
+| Manifest deleted from S3 | UpdateService (desiredCount=0) → DeleteService → DeregisterTaskDefinition |
 | ECS state drifted from spec | UpdateService to re-converge |
-
-### Leader Election
-
-When running multiple controller replicas for HA:
-- Use DynamoDB conditional writes with a TTL-based lease
-- Only the leader performs reconciliation; standbys poll for lease expiry
-- Single-replica deployments skip leader election entirely
 
 ### Finalizers
 
 Before deleting an ECS service, the controller:
 1. Drains active connections (set desiredCount=0, wait for task stop)
 2. Cleans up CloudMap service discovery entries
-3. Removes the DynamoDB status record
+3. Removes the status JSON from S3
 4. Only then acknowledges deletion
 
 ---
 
-## 6. MVP Scope
+## 7. MVP Scope
 
-Phase 1 (minimal viable control plane):
+### Phase 1 (minimal viable control plane)
 
-1. **S3 bucket** with YAML manifests (one file per OABService)
-2. **Single-instance ECS task** running the controller (no leader election)
-3. **Poll S3 every 30s**, reconcile against ECS DescribeServices
-4. **Write status** to DynamoDB table
-5. Support `create` and `update` operations only (manual delete via console)
+1. **S3 bucket** — manifests/ and status/ prefixes, versioning enabled
+2. **Single-instance ECS task** running the controller
+3. **Poll-based** — ListObjects + GetObject every 30s
+4. **`oabctl apply`** — validates and uploads YAML to S3
+5. **`oabctl get`** — reads status/ prefix, displays table
+6. Support `create` and `update` only (delete = manual remove from S3)
 
-Phase 2 additions:
-- Event-driven triggers (S3 → EventBridge → controller)
-- Multi-replica with DDB leader election
-- Delete reconciliation with finalizers
-- CLI tool for `oab apply -f manifest.yaml` (uploads to S3)
-- Rollback via manifest generation history
+### Phase 2
+
+- Event-driven triggers (S3 → EventBridge → controller wakes immediately)
+- `oabctl delete` with finalizer support
+- `oabctl diff` and `oabctl logs`
+- DynamoDB for leader election (multi-replica controller)
+- Rollback via S3 version history (`oabctl rollback my-agent --to-version=v3`)
+
+### Phase 3
+
+- Multi-region (controller per region, shared manifest bucket with replication)
+- Dependency graph (service A depends on service B)
+- Auto-scaling policies in manifest spec
+- GitOps integration (GitHub Actions → `oabctl apply` on push)
 
 ---
 
-## 7. Alternatives Considered
+## 8. Alternatives Considered
 
 | Alternative | Why not chosen |
 |-------------|---------------|
@@ -162,18 +214,20 @@ Phase 2 additions:
 | CDK Pipelines | Deployment tool, not a runtime controller with drift detection |
 | Step Functions orchestrator | Stateless execution model, no continuous reconciliation |
 | Run K8s anyway (EKS) | Valid but adds operational overhead for teams that chose ECS |
+| DynamoDB as primary store | Adds infra; S3 sufficient for single-controller Phase 1 |
 
 ---
 
-## 8. Open Questions
+## 9. Open Questions
 
-1. **Secrets management** — inject via ECS Secrets (SSM/SecretsManager) or controller-managed env vars?
-2. **Multi-region** — single controller per region, or a global controller with regional reconcilers?
+1. **Secrets management** — inject via ECS Secrets (SSM/SecretsManager reference in task def) or controller-managed?
+2. **Multi-region** — single controller per region, or global controller with regional reconcilers?
 3. **Observability** — CloudWatch metrics from the controller, or push to a shared OAB dashboard?
 4. **Upgrade strategy** — how does the controller upgrade itself without downtime?
+5. **Networking isolation** — shared VPC or per-service security group rules?
 
 ---
 
-## 9. Decision
+## 10. Decision
 
-We adopt the CRD + Operator pattern on ECS as described above. The controller will be implemented as a standalone ECS service that reconciles OABService manifests stored in S3 against actual ECS state. This gives ECS-native teams the same declarative, self-healing deployment experience that K8s operators provide, without requiring a Kubernetes cluster.
+We adopt the CRD + Operator pattern on ECS with an **S3-only state store** and a **`oabctl` CLI** for the operator interface. The controller runs as a single ECS service that reconciles OABService manifests (stored in S3) against actual ECS state. DynamoDB is deferred to Phase 2 when multi-replica HA is needed. This gives ECS-native teams the same declarative, self-healing deployment experience that K8s operators provide — with minimal infrastructure footprint.
