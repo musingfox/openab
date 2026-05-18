@@ -170,7 +170,15 @@ Send a message to your Telegram bot — you should see the gateway log the incom
 ## Security Considerations
 
 - **Webhook validation:** Set `TELEGRAM_SECRET_TOKEN` on the gateway and configure it in the Telegram webhook to validate inbound requests.
-- **User restriction:** Set `allow_all_users = false` and specify `allowed_users` in the OAB config to restrict who can interact with the bot.
+- **User restriction (recommended):** By default the chart sets `allow_all_users = true`. For production, restrict access in your Helm values:
+  ```yaml
+  agents:
+    kiro:
+      gateway:
+        allowAllUsers: false
+        allowedUsers:
+          - "YOUR_TELEGRAM_USER_ID"
+  ```
 - **WebSocket auth:** Set `GATEWAY_WS_TOKEN` to authenticate the OAB → Gateway WebSocket connection.
 - **Tunnel token:** Store the Cloudflare tunnel token in a Kubernetes Secret rather than inline in the deployment spec for production use.
 
