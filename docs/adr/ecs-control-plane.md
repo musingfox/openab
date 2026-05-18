@@ -114,34 +114,45 @@ spec:
 
 FARGATE_SPOT is suitable for stateless agents that can tolerate interruption (OAB reconnects automatically). For agents with long-running sessions or strict SLA requirements, use FARGATE.
 
-### Secrets (OAuth / API Keys)
+### Secrets & Bot Provisioning
 
-Each agent owns its own bot token and credentials — no shared secrets across services. Secrets are stored in SSM Parameter Store (or Secrets Manager) and referenced by path in the manifest:
+Each agent owns its own bot token. The controller **provisions** the Discord bot token automatically by calling the Discord API, then stores it in AWS Secrets Manager.
 
 ```yaml
 spec:
+  channel:
+    type: discord
+    applicationId: "1234567890"    # Discord Application ID (pre-created)
   secrets:
-    - name: DISCORD_TOKEN
-      valueFrom: /oab/prod/my-agent/discord-token
     - name: OPENAI_API_KEY
-      valueFrom: /oab/prod/my-agent/openai-key
+      valueFrom: /oab/prod/my-agent/openai-key   # operator-managed
 ```
 
-The controller maps these to ECS task definition `secrets` (injected at runtime, never stored in S3):
+**Controller-managed secrets (auto-provisioned):**
 
-```json
-{
-  "secrets": [
-    { "name": "DISCORD_TOKEN", "valueFrom": "arn:aws:ssm:us-east-1:123456789:parameter/oab/prod/my-agent/discord-token" }
-  ]
-}
+On first `oabctl apply`, the controller:
+1. Calls Discord API to generate/reset the bot token for the given `applicationId`
+2. Stores the token in Secrets Manager at `oab/{namespace}/{name}/discord-token`
+3. References it in the ECS task definition `secrets` field
+
 ```
+oabctl apply -f my-agent.yaml
+  → Controller detects new OABService
+  → POST https://discord.com/api/v10/applications/{id}/bot/reset
+  → secretsmanager:CreateSecret → oab/prod/my-agent/discord-token
+  → RegisterTaskDefinition (with secret reference)
+  → CreateService
+```
+
+**Operator-managed secrets (manual):**
+
+Non-bot secrets (API keys, model credentials) are managed by the operator via AWS console/CLI and referenced by path in `spec.secrets`.
 
 Design principles:
-- **One bot token per agent** — no shared credentials, no routing complexity
-- **Controller references only** — it never reads, creates, or rotates secrets
-- **Operator manages secret lifecycle** — via AWS console, CLI, or Terraform
-- **Naming convention**: `/oab/{namespace}/{service-name}/{secret-name}`
+- **Bot token = controller-managed** — provisioned via Discord API, stored in Secrets Manager, rotated by controller
+- **API keys = operator-managed** — stored in SSM/Secrets Manager by operator, referenced by path
+- **Naming convention**: `oab/{namespace}/{service-name}/{secret-name}`
+- **No secrets in S3** — manifests never contain secret values, only references or application IDs
 
 ---
 
