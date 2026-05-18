@@ -272,18 +272,13 @@ pub async fn download_and_encode_image(
     let (output_bytes, output_mime) = match resize_and_compress(&bytes) {
         Ok(result) => result,
         Err(e) => {
-            if bytes.len() <= 1024 * 1024 {
-                debug!(filename, error = %e, "resize failed, using validated original");
-                (bytes.to_vec(), mime.to_string())
-            } else {
-                error!(
-                    filename,
-                    error = %e,
-                    size = bytes.len(),
-                    "resize failed after successful validation"
-                );
-                return Err(MediaFetchError::ProcessingFailed(e));
-            }
+            error!(
+                filename,
+                error = %e,
+                size = bytes.len(),
+                "resize failed after successful validation"
+            );
+            return Err(MediaFetchError::ProcessingFailed(e));
         }
     };
 
@@ -754,6 +749,26 @@ mod tests {
             result,
             Err(MediaFetchError::InvalidImageBody { .. })
         ));
+    }
+
+    #[test]
+    fn truncated_png_body_must_not_produce_content_block() {
+        // Valid PNG magic bytes (8 bytes) + partial IHDR -- body is too short to decode.
+        // Previously: the <=1MB fallback in download_and_encode_image forwarded raw bytes
+        // after resize_and_compress failed, reproducing the #776 poisoning class.
+        // After removing the fallback, resize_and_compress failure must propagate as Err.
+        let mut truncated = vec![0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        truncated.extend_from_slice(&[0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52]);
+        // validate_image_response passes (magic bytes match PNG) -- the fallback was the bug.
+        assert!(
+            validate_image_response(Some("image/png"), &truncated).is_ok(),
+            "magic-byte check still passes for truncated body"
+        );
+        // resize_and_compress catches the truncated body at full-decode time.
+        assert!(
+            resize_and_compress(&truncated).is_err(),
+            "truncated PNG must fail at decode -- no raw-byte fallback allowed"
+        );
     }
 
     #[test]

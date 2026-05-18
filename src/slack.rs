@@ -1236,7 +1236,7 @@ fn strip_mime_params(mimetype: &str) -> &str {
 /// Without sanitization, a user-controlled filename such as `<!here>` or
 /// `` `<@U123>` `` would be rendered as a Slack mention or @-here ping.
 pub(crate) fn sanitize_slack_filename(s: &str) -> String {
-    s.replace('`', "'").replace('<', "(").replace('>', ")")
+    s.replace('&', "&amp;").replace('`', "'").replace('<', "(").replace('>', ")")
 }
 
 /// True only when a Slack non-bot event represents a real user message
@@ -1433,6 +1433,16 @@ mod tests {
             sanitize_slack_filename("`<!here>`"),
             "'(!here)'"
         );
+    }
+
+    #[test]
+    fn sanitize_escapes_ampersand_before_angle_brackets() {
+        // Slack mrkdwn decodes HTML entities before markup parsing.
+        // "&lt;@here&gt;" would round-trip back to "<@here>" and trigger a mention
+        // ping if & is not escaped. The & must be escaped first so downstream
+        // Slack entity decoding cannot reconstruct a mrkdwn delimiter.
+        assert_eq!(sanitize_slack_filename("&lt;@here&gt;"), "&amp;lt;@here&amp;gt;");
+        assert_eq!(sanitize_slack_filename("file&name.png"), "file&amp;name.png");
     }
 
     // --- strip_mime_params tests ---
