@@ -41,6 +41,8 @@ struct Cli {
 enum Commands {
     /// Authenticate with xAI via browser OAuth (PKCE)
     Login,
+    /// Authenticate with xAI via device-code flow (headless/K8s/ECS)
+    LoginDevice,
     /// Start the proxy server
     Serve {
         /// Listen port
@@ -98,6 +100,8 @@ fn save_tokens(store: &TokenStore) -> Result<()> {
 struct OidcDiscovery {
     authorization_endpoint: String,
     token_endpoint: String,
+    #[serde(default)]
+    device_authorization_endpoint: String,
 }
 
 async fn discover_endpoints() -> Result<OidcDiscovery> {
@@ -250,6 +254,98 @@ async fn do_login() -> Result<()> {
     println!("\n✅ Login successful! Token saved to {:?}", token_path());
     println!("   Run `xai-proxy serve` to start the proxy.");
     Ok(())
+}
+
+// === Device-Code Login (headless) ===
+
+async fn do_login_device() -> Result<()> {
+    info!("Starting xAI device-code login...");
+    let discovery = discover_endpoints().await?;
+
+    let device_endpoint = if discovery.device_authorization_endpoint.is_empty() {
+        "https://auth.x.ai/oauth2/device/code".to_string()
+    } else {
+        discovery.device_authorization_endpoint
+    };
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&device_endpoint)
+        .form(&[
+            ("client_id", XAI_OAUTH_CLIENT_ID),
+            ("scope", XAI_OAUTH_SCOPE),
+        ])
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("Device authorization failed: {}", body));
+    }
+
+    let device_resp: serde_json::Value = resp.json().await?;
+    let device_code = device_resp["device_code"]
+        .as_str()
+        .ok_or_else(|| anyhow!("No device_code in response"))?;
+    let user_code = device_resp["user_code"]
+        .as_str()
+        .ok_or_else(|| anyhow!("No user_code in response"))?;
+    let verification_uri = device_resp["verification_uri"]
+        .as_str()
+        .or_else(|| device_resp["verification_url"].as_str())
+        .unwrap_or("https://auth.x.ai/oauth2/device");
+    let interval = device_resp["interval"].as_u64().unwrap_or(5);
+
+    println!("\n  Go to:     {}", verification_uri);
+    println!("  Enter code: {}\n", user_code);
+    println!("Waiting for authorization...");
+
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+
+        let resp = client
+            .post(&discovery.token_endpoint)
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("client_id", XAI_OAUTH_CLIENT_ID),
+                ("device_code", device_code),
+            ])
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let payload: serde_json::Value = resp.json().await?;
+
+        if status.is_success() {
+            let access_token = payload["access_token"]
+                .as_str()
+                .ok_or_else(|| anyhow!("No access_token"))?;
+            let refresh_token = payload["refresh_token"]
+                .as_str()
+                .ok_or_else(|| anyhow!("No refresh_token"))?;
+            let expires_in = payload["expires_in"].as_u64().unwrap_or(3600);
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
+            let store = TokenStore {
+                access_token: access_token.to_string(),
+                refresh_token: refresh_token.to_string(),
+                expires_at: now + expires_in,
+                token_endpoint: discovery.token_endpoint,
+            };
+            save_tokens(&store)?;
+            println!("\n✅ Login successful! Token saved to {:?}", token_path());
+            println!("   Run `xai-proxy serve` to start the proxy.");
+            return Ok(());
+        }
+
+        let error = payload["error"].as_str().unwrap_or_default();
+        match error {
+            "authorization_pending" | "slow_down" => continue,
+            "expired_token" => return Err(anyhow!("Device code expired. Try again.")),
+            "access_denied" => return Err(anyhow!("Authorization denied by user.")),
+            _ => return Err(anyhow!("Device-code error: {} — {:?}", error, payload)),
+        }
+    }
 }
 
 // === Token Refresh ===
@@ -433,6 +529,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Login => do_login().await,
+        Commands::LoginDevice => do_login_device().await,
         Commands::Serve { port, bind } => do_serve(&bind, port).await,
     }
 }
