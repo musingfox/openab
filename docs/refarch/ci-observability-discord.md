@@ -33,8 +33,8 @@ When CI runs in GitHub Actions, the only way to know the result is to check the 
 | Challenge | Why it's hard |
 |-----------|---------------|
 | Notify regardless of outcome | GitHub Actions skips downstream jobs when upstream fails — need `if: always()` |
-| Clickable links in Discord | Webhook `content` field does NOT support markdown links — must use embeds |
-| Newlines in embed description | `jq --arg` treats `\n` as literal backslash-n — need `printf` for real newlines |
+| Clickable links in Discord | Webhook `content` doesn't support markdown links — bare URLs auto-link |
+| Newlines in message | Shell variables + `jq --arg` lose newlines — must write to file and use `jq --rawfile` |
 | Route to the right thread | Different PRs need notifications in different threads — need dynamic extraction |
 | Don't repeat yourself | Multiple CI workflows need the same notification logic — need reusable workflow |
 | Keep secrets safe | Webhook URL contains a token — must never appear in workflow files or logs |
@@ -99,7 +99,7 @@ GitHub Actions ──finish──► HTTP POST ──► Discord thread
 
 ## Solution
 
-A **reusable workflow** (`notify-discord.yml`) that any CI workflow calls as its final job. It posts a Discord embed with clickable title, colored sidebar, and user mention — routing to the correct thread based on the PR description.
+A **reusable workflow** (`notify-discord.yml`) that any CI workflow calls as its final job. It posts all CI metadata in the Discord `content` field (with real newlines) and mentions the target bot/user — routing to the correct thread based on the PR description.
 
 ## Architecture
 
@@ -130,14 +130,12 @@ A **reusable workflow** (`notify-discord.yml`) that any CI workflow calls as its
 |                                                          |
 |  #channel or thread                                      |
 |  ┌─────────────────────────────────────────────────┐     |
-|  │ ✅ feat: add new provider        ← clickable    │     |
-|  │ ──────────────────────────────────────────────  │     |
-|  │ ✅ CI success — repo@main                       │     |
-|  │ 👤 author                                       │     |
+|  │ ✅ **CI success** — `repo@main`                 │     |
+|  │ 👤 author — `feat: add new provider`            │     |
 |  │ ⏱️ 3m42s                                        │     |
-|  │ View Run                          ← clickable   │     |
+|  │ https://github.com/.../actions/runs/123         │     |
+|  │ @bot-mention                                    │     |
 |  └─────────────────────────────────────────────────┘     |
-|  @user-mention                                            |
 |                                                          |
 +----------------------------------------------------------+
 ```
@@ -148,10 +146,11 @@ A **reusable workflow** (`notify-discord.yml`) that any CI workflow calls as its
 |----------|-----------|
 | Reusable workflow (`workflow_call`) | Any CI workflow can call it; single source of truth |
 | `if: always()` on notify job | Fires on success, failure, and cancellation |
-| Discord embed (not plain content) | Supports clickable title, colored sidebar, markdown in description |
+| All info in `content` (not embed) | Bots can read `content` directly; embeds are invisible to most bot frameworks |
 | Thread ID from PR body | Dynamic routing — each PR notifies its own thread |
 | Fallback to repo variable | Push-to-main events still get notified somewhere |
-| `printf` for newlines | `jq --arg` preserves real `\n` from printf output |
+| Write message to file + `jq --rawfile` | Guarantees real newlines in JSON payload (shell variables lose trailing newlines) |
+| `allowed_mentions: {parse: ["users"]}` | Required for webhook `<@UID>` mentions to actually ping |
 
 ## Setup
 
@@ -213,6 +212,7 @@ on:
 jobs:
   notify:
     runs-on: ubuntu-latest
+    environment: discord-notify
     steps:
       - name: Send Discord notification
         env:
@@ -240,41 +240,28 @@ jobs:
           [ -z "$THREAD_ID" ] && THREAD_ID="$DEFAULT_THREAD_ID"
 
           if [ "$STATUS" = "success" ]; then
-            COLOR=3066993; EMOJI="✅"
+            EMOJI="✅"
           else
-            COLOR=15158332; EMOJI="❌"
+            EMOJI="❌"
           fi
 
-          # Embed title = commit msg (clickable link to PR or commit)
-          TITLE="${COMMIT_MSG:-CI ${STATUS}}"
-          if [ -n "$PR" ]; then
-            TITLE_URL="${SERVER_URL}/${REPO}/pull/${PR}"
-          elif [ -n "$COMMIT_SHA" ]; then
-            TITLE_URL="${SERVER_URL}/${REPO}/commit/${COMMIT_SHA}"
-          else
-            TITLE_URL="${RUN_URL}"
-          fi
+          # Build message into a temp file for proper newlines
+          {
+            printf '%s **CI %s** — `%s@%s`' "$EMOJI" "$STATUS" "$REPO" "$REF"
+            [ -n "$PR" ] && printf ' | PR #%s' "$PR"
+            echo ""
+            [ -n "$COMMIT_AUTHOR" ] && printf '👤 %s' "$COMMIT_AUTHOR"
+            [ -n "$COMMIT_MSG" ] && printf ' — `%s`' "$COMMIT_MSG"
+            [ -n "$COMMIT_AUTHOR" ] && echo ""
+            [ -n "$DURATION" ] && echo "⏱️ ${DURATION}"
+            [ "$STATUS" != "success" ] && [ -n "$FAILED_STEP" ] && echo "💥 Failed at: **${FAILED_STEP}**"
+            echo "$RUN_URL"
+            [ -n "$MENTION_USER_ID" ] && echo "<@${MENTION_USER_ID}>"
+          } > /tmp/msg.txt
 
-          # Build description using printf for real newlines
-          DESC="${EMOJI} **CI ${STATUS}** — \`${REPO}@${REF}\`"
-          [ -n "$PR" ] && DESC="${DESC} | PR #${PR}"
-          [ -n "$COMMIT_AUTHOR" ] && DESC=$(printf "%s\n👤 %s" "$DESC" "$COMMIT_AUTHOR")
-          [ -n "$DURATION" ] && DESC=$(printf "%s\n⏱️ %s" "$DESC" "$DURATION")
-          [ "$STATUS" != "success" ] && [ -n "$FAILED_STEP" ] && \
-            DESC=$(printf "%s\n💥 Failed at: **%s**" "$DESC" "$FAILED_STEP")
-          DESC=$(printf "%s\n[View Run](%s)" "$DESC" "$RUN_URL")
-
-          # Build JSON payload
-          CONTENT=""
-          [ -n "$MENTION_USER_ID" ] && CONTENT="<@${MENTION_USER_ID}>"
-
-          PAYLOAD=$(jq -n \
-            --arg content "$CONTENT" \
-            --arg title "$TITLE" \
-            --arg url "$TITLE_URL" \
-            --arg desc "$DESC" \
-            --argjson color "$COLOR" \
-            '{content: $content, embeds: [{title: $title, url: $url, description: $desc, color: $color}]}')
+          # Use jq to read file content and build safe JSON
+          PAYLOAD=$(jq -n --rawfile msg /tmp/msg.txt \
+            '{content: $msg, allowed_mentions: {parse: ["users"]}}')
 
           URL="${WEBHOOK_URL}"
           [ -n "$THREAD_ID" ] && URL="${URL}?thread_id=${THREAD_ID}"
@@ -352,9 +339,10 @@ The workflow extracts the first match and posts to that thread. If absent, it fa
 
 | Issue | Solution |
 |-------|----------|
-| `content` field doesn't support markdown links | Use `embeds` with `title`/`url` for clickable links |
-| `\n` in `jq --arg` becomes literal `\\n` | Use `printf` to produce real newlines before passing to jq |
-| Duplicate YAML keys silently break workflows | Validate with `actionlint` or check Actions run errors |
+| `content` field doesn't support markdown links | URLs are auto-linked by Discord; use bare URLs for clickability |
+| `\n` in shell variables becomes literal `\\n` in JSON | Write message to a file, use `jq --rawfile` to read it |
+| Bots can't read embed content | Put all info in `content` field, not embeds |
 | Webhook URL contains a token | Always store as a **secret**, never in workflow files or docs |
 | `if: always()` required on notify job | Otherwise it's skipped when upstream jobs fail |
-| Mention requires numeric Discord user ID | Use `<@USER_ID>` format in `content` (not in embed) |
+| Mention doesn't ping | Add `allowed_mentions: {parse: ["users"]}` to payload |
+| Mention alone doesn't trigger bot | Include message text alongside `<@UID>` in content |
