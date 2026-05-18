@@ -114,6 +114,35 @@ spec:
 
 FARGATE_SPOT is suitable for stateless agents that can tolerate interruption (OAB reconnects automatically). For agents with long-running sessions or strict SLA requirements, use FARGATE.
 
+### Secrets (OAuth / API Keys)
+
+Each agent owns its own bot token and credentials — no shared secrets across services. Secrets are stored in SSM Parameter Store (or Secrets Manager) and referenced by path in the manifest:
+
+```yaml
+spec:
+  secrets:
+    - name: DISCORD_TOKEN
+      valueFrom: /oab/prod/my-agent/discord-token
+    - name: OPENAI_API_KEY
+      valueFrom: /oab/prod/my-agent/openai-key
+```
+
+The controller maps these to ECS task definition `secrets` (injected at runtime, never stored in S3):
+
+```json
+{
+  "secrets": [
+    { "name": "DISCORD_TOKEN", "valueFrom": "arn:aws:ssm:us-east-1:123456789:parameter/oab/prod/my-agent/discord-token" }
+  ]
+}
+```
+
+Design principles:
+- **One bot token per agent** — no shared credentials, no routing complexity
+- **Controller references only** — it never reads, creates, or rotates secrets
+- **Operator manages secret lifecycle** — via AWS console, CLI, or Terraform
+- **Naming convention**: `/oab/{namespace}/{service-name}/{secret-name}`
+
 ---
 
 ## 4. State Store Design (S3-Only)
