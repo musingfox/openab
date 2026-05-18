@@ -67,6 +67,13 @@ struct TokenStore {
 }
 
 fn token_path() -> PathBuf {
+    if let Ok(p) = std::env::var("XAI_PROXY_TOKEN_PATH") {
+        let path = PathBuf::from(p);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        return path;
+    }
     let dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".xai-proxy");
@@ -519,6 +526,10 @@ async fn do_serve(bind: &str, port: u16) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
