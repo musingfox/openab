@@ -39,9 +39,9 @@ pub enum MediaFetchError {
     HttpStatus(reqwest::StatusCode),
     /// Body was a valid image but post-processing (resize/compress) failed.
     /// Unlike `InvalidImageBody`, the bytes decoded successfully — this is an
-    /// unexpected processing error, not a content validation failure. The Slack
-    /// adapter notifies the user; Discord logs at warn level (no user-facing
-    /// notification, as Discord attachment URLs have different auth semantics).
+    /// unexpected processing error, not a content validation failure. Both the
+    /// Slack and Discord adapters surface this as a user-facing warning alongside
+    /// other image-validation failures.
     ProcessingFailed(image::ImageError),
 }
 
@@ -337,6 +337,11 @@ pub async fn download_and_transcribe(
             return None;
         }
     };
+
+    if bytes.len() as u64 > MAX_SIZE {
+        error!(filename, size = bytes.len(), "downloaded audio exceeds 25MB limit");
+        return None;
+    }
 
     crate::stt::transcribe(
         &HTTP_CLIENT,
