@@ -1050,7 +1050,7 @@ async fn handle_message(
                     Err(media::MediaFetchError::NotAnImage) => {}
                     Err(media::MediaFetchError::SizeExceeded { actual, limit }) => {
                         warn!(filename, actual, limit, "image exceeds size limit");
-                        failed_image_files.push(format!("{filename} (exceeds {limit} byte limit)"));
+                        failed_image_files.push(filename.to_string());
                     }
                     Err(
                         media::MediaFetchError::UnsupportedResponseType { .. }
@@ -1074,6 +1074,7 @@ async fn handle_message(
                     }
                     Err(e) => {
                         warn!(filename, error = %e, "image download failed");
+                        failed_image_files.push(filename.to_string());
                     }
                 }
             }
@@ -1232,9 +1233,12 @@ fn strip_mime_params(mimetype: &str) -> &str {
 
 /// Sanitize a filename for safe embedding in a Slack mrkdwn message.
 ///
-/// Backticks (`) and angle brackets (`<`, `>`) are Slack markup delimiters.
-/// Without sanitization, a user-controlled filename such as `<!here>` or
-/// `` `<@U123>` `` would be rendered as a Slack mention or @-here ping.
+/// Ampersands (`&`), backticks (`` ` ``), and angle brackets (`<`, `>`) are escaped.
+/// `&` is encoded as `&amp;` first because Slack decodes HTML entities before parsing
+/// mrkdwn — a filename like `&lt;@here&gt;` would otherwise round-trip back to
+/// `<@here>` and trigger a mention ping. Backticks and angle brackets are Slack
+/// mrkdwn delimiters; without escaping, `<!here>` or `` `<@U123>` `` would render
+/// as mentions or @-here pings.
 pub(crate) fn sanitize_slack_filename(s: &str) -> String {
     s.replace('&', "&amp;").replace('`', "'").replace('<', "(").replace('>', ")")
 }

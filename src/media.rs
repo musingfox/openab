@@ -6,7 +6,7 @@ use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder, ImageReader};
 use std::io::Cursor;
 use std::sync::LazyLock;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 /// Reusable HTTP client for downloading attachments (shared across adapters).
 pub static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -39,8 +39,9 @@ pub enum MediaFetchError {
     HttpStatus(reqwest::StatusCode),
     /// Body was a valid image but post-processing (resize/compress) failed.
     /// Unlike `InvalidImageBody`, the bytes decoded successfully — this is an
-    /// unexpected processing error, not a content validation failure. Callers
-    /// should surface the same user-facing warning as `InvalidImageBody`.
+    /// unexpected processing error, not a content validation failure. The Slack
+    /// adapter notifies the user; Discord logs at warn level (no user-facing
+    /// notification, as Discord attachment URLs have different auth semantics).
     ProcessingFailed(image::ImageError),
 }
 
@@ -83,7 +84,7 @@ fn hex_prefix(body: &[u8]) -> String {
 
 /// Validate the HTTP response Content-Type and body magic bytes.
 ///
-/// If Content-Type is present and explicitly non-binary (e.g. `text/html` from
+/// If Content-Type is present and explicitly text-typed (e.g. `text/html` from
 /// Slack's auth redirect when `files:read` scope is missing), rejects immediately.
 /// Generic types such as `application/octet-stream` and absent headers pass through
 /// to the magic-byte check, which is the authoritative gate for image validity.
@@ -121,7 +122,7 @@ fn validate_image_response(
         }
         Some(image::ImageFormat::Gif) => {
             validate_gif_body(body).map_err(|e| {
-                debug!(error = %e, "GIF validation failed");
+                warn!(error = %e, "GIF validation failed");
                 MediaFetchError::InvalidImageBody {
                     magic_prefix_hex: hex_prefix(body),
                 }
@@ -160,9 +161,9 @@ fn validate_gif_body(raw: &[u8]) -> image::ImageResult<()> {
 /// Returns `Err(MediaFetchError::NotAnImage)` when the URL or MIME hint don't
 /// indicate an image — callers should skip silently.  Returns
 /// `Err(MediaFetchError::SizeExceeded)` when the declared `size` exceeds the limit
-/// before any request is made.  Returns other `Err` variants (`Network`,
-/// `HttpStatus`, `UnsupportedResponseType`, `InvalidImageBody`) after a request
-/// attempt — callers should surface these to the user.  Returns
+/// before any request is made, or when the downloaded body exceeds the limit.  Returns
+/// other `Err` variants (`Network`, `HttpStatus`, `UnsupportedResponseType`,
+/// `InvalidImageBody`) after a request attempt — callers should surface these to the user.  Returns
 /// `Err(MediaFetchError::ProcessingFailed)` when the body is a valid image but
 /// resize/compression fails — callers should warn the user and skip.
 ///
@@ -318,12 +319,24 @@ pub async fn download_and_transcribe(
         req = req.header("Authorization", format!("Bearer {token}"));
     }
 
-    let resp = req.send().await.ok()?;
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(url, error = %e, "audio download request failed");
+            return None;
+        }
+    };
     if !resp.status().is_success() {
         error!(url, status = %resp.status(), "audio download failed");
         return None;
     }
-    let bytes = resp.bytes().await.ok()?.to_vec();
+    let bytes = match resp.bytes().await {
+        Ok(b) => b.to_vec(),
+        Err(e) => {
+            error!(url, error = %e, "audio body read failed");
+            return None;
+        }
+    };
 
     crate::stt::transcribe(
         &HTTP_CLIENT,
@@ -479,7 +492,13 @@ pub async fn download_and_read_text_file(
         tracing::warn!(url, status = %resp.status(), "text file download failed");
         return None;
     }
-    let bytes = resp.bytes().await.ok()?;
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(url, error = %e, "text file body read failed");
+            return None;
+        }
+    };
     let actual_size = bytes.len() as u64;
 
     // Defense-in-depth: verify actual download size
@@ -778,6 +797,8 @@ mod tests {
             actual: Some("text/html".into()),
         }
         .to_string();
+        let s = MediaFetchError::UnsupportedResponseType { actual: None }.to_string();
+        assert!(s.contains("none"), "None branch should render as 'none'");
         let _ = MediaFetchError::InvalidImageBody {
             magic_prefix_hex: "3c21444f43545950".into(),
         }
@@ -795,6 +816,15 @@ mod tests {
             ),
         ))
         .to_string();
+    }
+
+    #[test]
+    fn validate_accepts_webp_by_magic_bytes() {
+        let img = image::RgbImage::new(1, 1);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::WebP).unwrap();
+        let webp_body = buf.into_inner();
+        assert!(validate_image_response(Some("image/webp"), &webp_body).is_ok());
     }
 
     #[test]

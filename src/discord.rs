@@ -645,6 +645,7 @@ impl EventHandler for Handler {
         // image -> encode, video -> URL for agent-side inspection).
         let mut extra_blocks = Vec::new();
         let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
+        let mut failed_image_files: Vec<String> = Vec::new();
         let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
@@ -745,6 +746,7 @@ impl EventHandler for Handler {
                             error = %e,
                             "image attachment failed"
                         );
+                        failed_image_files.push(attachment.filename.clone());
                     }
                 }
             }
@@ -775,6 +777,23 @@ impl EventHandler for Handler {
                 }
             }
         };
+
+        // Notify user if any images couldn't be processed.
+        if !failed_image_files.is_empty() {
+            let file_list = failed_image_files
+                .iter()
+                .map(|n| format!("`{}`", n.replace('`', "'")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let warn_msg = format!(
+                ":warning: I couldn't process the image(s) you shared ({}). \
+                 The files may be inaccessible or in an unsupported format (PNG/JPEG/GIF/WebP only).",
+                file_list
+            );
+            if let Err(e) = adapter.send_message(&thread_channel, &warn_msg).await {
+                tracing::warn!(error = %e, "failed to send image warning to user");
+            }
+        }
 
         let trigger_msg = discord_msg_ref(&msg);
 
