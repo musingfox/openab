@@ -757,16 +757,16 @@ mod tests {
         // Previously: the <=1MB fallback in download_and_encode_image forwarded raw bytes
         // after resize_and_compress failed, reproducing the #776 poisoning class.
         // After removing the fallback, resize_and_compress failure must propagate as Err.
-        let mut truncated = vec![0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-        truncated.extend_from_slice(&[0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52]);
-        // validate_image_response passes (magic bytes match PNG) -- the fallback was the bug.
+        let truncated: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG magic
+            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // partial IHDR
+        ];
         assert!(
-            validate_image_response(Some("image/png"), &truncated).is_ok(),
+            validate_image_response(Some("image/png"), truncated).is_ok(),
             "magic-byte check still passes for truncated body"
         );
-        // resize_and_compress catches the truncated body at full-decode time.
         assert!(
-            resize_and_compress(&truncated).is_err(),
+            resize_and_compress(truncated).is_err(),
             "truncated PNG must fail at decode -- no raw-byte fallback allowed"
         );
     }
