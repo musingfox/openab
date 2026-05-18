@@ -1,0 +1,42 @@
+name: CI (xai-proxy)
+
+on:
+  pull_request:
+    paths:
+      - "xai-proxy/**"
+  push:
+    branches: [main]
+    paths:
+      - "xai-proxy/**"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: xai-proxy
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: xai-proxy
+
+      - name: cargo check
+        run: cargo check
+
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo build (release)
+        run: cargo build --release
