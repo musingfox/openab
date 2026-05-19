@@ -2,6 +2,7 @@ mod manifest;
 mod apply;
 mod get;
 mod delete;
+mod logs;
 
 use clap::{Parser, Subcommand};
 
@@ -43,6 +44,23 @@ enum Commands {
         #[arg(long, default_value = "prod")]
         namespace: String,
     },
+    /// Stream logs from an OAB agent's ECS task
+    Logs {
+        /// Agent name
+        name: String,
+        /// ECS cluster name
+        #[arg(long, default_value = "default")]
+        cluster: String,
+        /// Namespace
+        #[arg(long, default_value = "prod")]
+        namespace: String,
+        /// Follow log output (like tail -f)
+        #[arg(long, short, default_value_t = false)]
+        follow: bool,
+        /// Number of recent log lines to show
+        #[arg(long, default_value_t = 100)]
+        tail: i32,
+    },
 }
 
 #[tokio::main]
@@ -55,6 +73,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Get { resource, name, cluster } => get::run(&config, &resource, name.as_deref(), &cluster).await,
         Commands::Delete { resource, name, cluster, namespace } => {
             delete::run(&config, &resource, &name, &cluster, &namespace).await
+        }
+        Commands::Logs { name, cluster, namespace, follow, tail } => {
+            logs::run(&config, &name, &cluster, &namespace, follow, tail).await
         }
     }
 }
