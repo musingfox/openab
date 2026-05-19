@@ -69,12 +69,7 @@ spec:
     image: 123456789.dkr.ecr.us-east-1.amazonaws.com/openab:latest
     cpu: 256                       # override when size=custom
     memory: 512                    # override when size=custom
-    environment:
-      - name: BACKEND_TYPE
-        value: bedrock
-  backend:
-    type: bedrock
-    model: anthropic.claude-sonnet-4-20250514
+  bootstrapFrom: s3://oab-backups/agents/my-agent/latest.tar.gz
   networking:
     subnets: [subnet-abc, subnet-def]
     securityGroups: [sg-123]
@@ -85,8 +80,10 @@ Key fields:
 - `spec.capacityProvider` — `FARGATE` (default, on-demand) or `FARGATE_SPOT` (up to 70% cost savings, with interruption risk)
 - `spec.size` — predefined instance sizes (see table below); use `custom` to set cpu/memory directly
 - `spec.taskDefinition` — maps directly to ECS RegisterTaskDefinition
-- `spec.backend` — OAB-specific config injected as environment/secrets
+- `spec.bootstrapFrom` — S3 path to agent HOME archive (contains config, OAuth, steering, memory)
 - `spec.networking` — ECS awsvpc configuration
+
+The manifest only manages **infrastructure** (container, compute, networking). Agent-level config (backend, model, channels, steering) lives inside the bootstrap archive's `config.toml`.
 
 ### Instance Sizes
 
