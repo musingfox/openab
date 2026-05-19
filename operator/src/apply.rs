@@ -2,7 +2,7 @@ use crate::manifest::OABServiceManifest;
 use anyhow::{Context, Result};
 use aws_sdk_ecs::types::{
     AssignPublicIp, AwsVpcConfiguration, CapacityProviderStrategyItem, ContainerDefinition,
-    DeploymentConfiguration, KeyValuePair, LaunchType, NetworkConfiguration, Secret,
+    KeyValuePair, LaunchType, NetworkConfiguration, Secret,
 };
 use aws_sdk_s3::primitives::ByteStream;
 use std::path::Path;
@@ -121,6 +121,7 @@ async fn apply_one(
                 .name(&s.name)
                 .value_from(&s.value_from)
                 .build()
+                .unwrap()
         })
         .collect();
 
@@ -197,7 +198,7 @@ async fn apply_one(
         let cap_strategy = CapacityProviderStrategyItem::builder()
             .capacity_provider(&m.spec.capacity_provider)
             .weight(1)
-            .build();
+            .build()?;
 
         ecs.create_service()
             .cluster("default")
@@ -206,12 +207,6 @@ async fn apply_one(
             .desired_count(1)
             .capacity_provider_strategy(cap_strategy)
             .network_configuration(network_config)
-            .deployment_configuration(
-                DeploymentConfiguration::builder()
-                    .maximum_percent(200)
-                    .minimum_healthy_percent(100)
-                    .build(),
-            )
             .launch_type(LaunchType::Fargate)
             .send()
             .await
