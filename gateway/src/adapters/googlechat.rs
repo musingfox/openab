@@ -1265,6 +1265,7 @@ pub async fn download_googlechat_image(
         mime_type: mime,
         data,
         size: compressed.len() as u64,
+        path: None,
     })
 }
 
@@ -1317,6 +1318,7 @@ pub async fn download_googlechat_file(
         mime_type: "text/plain".into(),
         data,
         size: bytes.len() as u64,
+        path: None,
     })
 }
 
@@ -1363,6 +1365,7 @@ pub async fn download_googlechat_audio(
         mime_type: content_type.to_string(),
         data,
         size: bytes.len() as u64,
+        path: None,
     })
 }
 

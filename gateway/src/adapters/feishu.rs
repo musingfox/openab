@@ -1458,6 +1458,7 @@ pub async fn download_feishu_image(
         mime_type: mime,
         data,
         size: compressed.len() as u64,
+        path: None,
     })
 }
 
@@ -1520,6 +1521,7 @@ pub async fn download_feishu_file(
         mime_type: "text/plain".into(),
         data,
         size: bytes.len() as u64,
+        path: None,
     })
 }
 
@@ -1577,6 +1579,7 @@ pub async fn download_feishu_audio(
         mime_type: content_type,
         data,
         size: bytes.len() as u64,
+        path: None,
     })
 }
 

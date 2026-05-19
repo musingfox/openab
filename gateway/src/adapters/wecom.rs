@@ -1156,6 +1156,7 @@ async fn download_wecom_image(
         mime_type: mime,
         data,
         size: compressed.len() as u64,
+        path: None,
     })
 }
 
@@ -1283,6 +1284,7 @@ async fn download_wecom_file(
         mime_type: "text/plain".into(),
         data,
         size,
+        path: None,
     })
 }
 

@@ -1,5 +1,7 @@
 mod adapters;
+mod media;
 mod schema;
+pub mod store;
 
 use anyhow::Result;
 use axum::{
@@ -60,6 +62,8 @@ pub struct AppState {
     /// the first client to `remove()` a token wins the free Reply API call;
     /// other clients for the same event naturally fall back to Push API.
     pub reply_token_cache: ReplyTokenCache,
+    /// Shared HTTP client for media downloads and API calls
+    pub client: reqwest::Client,
 }
 
 // --- WebSocket handler (OAB connects here) ---
@@ -344,6 +348,11 @@ async fn main() -> Result<()> {
         warn!("no adapters configured — set TELEGRAM_BOT_TOKEN, LINE_CHANNEL_ACCESS_TOKEN, TEAMS_APP_ID + TEAMS_APP_SECRET, FEISHU_APP_ID + FEISHU_APP_SECRET, GOOGLE_CHAT_ENABLED=true, and/or WECOM_CORP_ID + WECOM_SECRET + WECOM_TOKEN + WECOM_ENCODING_AES_KEY + WECOM_AGENT_ID");
     }
 
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("HTTP client must build");
+
     let state = Arc::new(AppState {
         telegram_bot_token,
         telegram_secret_token,
@@ -357,6 +366,7 @@ async fn main() -> Result<()> {
         ws_token,
         event_tx,
         reply_token_cache,
+        client,
     });
 
     // Background task: sweep expired reply tokens every REPLY_TOKEN_TTL_SECS
@@ -405,6 +415,9 @@ async fn main() -> Result<()> {
     }
 
     let app = app.with_state(state.clone());
+
+    // Background task: evict expired media files (colocate store, TTL 2 min)
+    tokio::spawn(store::eviction_loop());
 
     // Spawn feishu WebSocket long-connection if configured
     // feishu_shutdown_tx must remain alive for the lifetime of main() — dropping

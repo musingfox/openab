@@ -44,11 +44,19 @@ pub struct Content {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Attachment {
     #[serde(rename = "type")]
-    pub attachment_type: String, // "image", "text_file"
+    pub attachment_type: String, // "image", "text_file", "audio"
     pub filename: String,
     pub mime_type: String,
-    pub data: String, // base64 encoded
-    pub size: u64,    // size in bytes (after compression for images)
+    /// Base64-encoded data (deprecated — use `path` for colocate mode).
+    /// Kept for backward compatibility; Core prefers `path` when present.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub data: String,
+    pub size: u64, // size in bytes (after compression for images)
+    /// Local file path for colocate mode (gateway + core share filesystem).
+    /// When set, Core reads bytes directly from this path instead of decoding `data`.
+    /// Path format: ~/.openab/media/inbound/<uuid> (no extension, MIME in mime_type).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 // --- Reply schema (ADR openab.gateway.reply.v1) ---
