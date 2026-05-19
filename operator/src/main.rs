@@ -2,6 +2,7 @@ mod manifest;
 mod apply;
 mod get;
 mod delete;
+mod discord;
 
 use clap::{Parser, Subcommand};
 
@@ -19,6 +20,9 @@ enum Commands {
         /// Path to manifest file or directory
         #[arg(short, long)]
         file: String,
+        /// Auto-register Discord bots (requires DISCORD_DEVELOPER_TOKEN env var or SSM)
+        #[arg(long, default_value_t = false)]
+        auto_register: bool,
     },
     /// List OAB services and their status
     Get {
@@ -51,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
 
     match cli.command {
-        Commands::Apply { file } => apply::run(&config, &file).await,
+        Commands::Apply { file, auto_register } => apply::run(&config, &file, auto_register).await,
         Commands::Get { resource, name, cluster } => get::run(&config, &resource, name.as_deref(), &cluster).await,
         Commands::Delete { resource, name, cluster, namespace } => {
             delete::run(&config, &resource, &name, &cluster, &namespace).await

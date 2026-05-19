@@ -1,4 +1,5 @@
 use crate::manifest::OABServiceManifest;
+use crate::discord;
 use anyhow::{Context, Result};
 use aws_sdk_ecs::types::{
     AssignPublicIp, AwsVpcConfiguration, CapacityProviderStrategyItem, ContainerDefinition,
@@ -7,7 +8,7 @@ use aws_sdk_ecs::types::{
 use aws_sdk_s3::primitives::ByteStream;
 use std::path::Path;
 
-pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str) -> Result<()> {
+pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str, auto_register: bool) -> Result<()> {
     let path = Path::new(file_path);
     let manifests = load_manifests(path)?;
 
@@ -17,15 +18,58 @@ pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str) -> Result<
 
     let ecs = aws_sdk_ecs::Client::new(aws_config);
     let s3 = aws_sdk_s3::Client::new(aws_config);
+    let ssm = aws_sdk_ssm::Client::new(aws_config);
+
+    // Load Discord developer token if auto-register is enabled
+    let discord_token = if auto_register {
+        Some(get_discord_developer_token(&ssm).await?)
+    } else {
+        None
+    };
+
+    let mut invite_urls: Vec<(String, String)> = Vec::new();
 
     for m in &manifests {
         m.validate()?;
         println!("  Applying {}...", m.metadata.name);
-        apply_one(&ecs, &s3, m).await?;
+
+        let invite = apply_one(&ecs, &s3, &ssm, m, discord_token.as_deref()).await?;
+        if let Some(url) = invite {
+            invite_urls.push((m.metadata.name.clone(), url));
+        }
     }
 
     println!("\n{} service(s) applied.", manifests.len());
+
+    if !invite_urls.is_empty() {
+        println!("\n📎 Discord Bot Invite URLs:");
+        for (name, url) in &invite_urls {
+            println!("  {} → {}", name, url);
+        }
+        println!("\nPaste these URLs into your browser to add bots to your Discord server.");
+    }
+
     Ok(())
+}
+
+async fn get_discord_developer_token(ssm: &aws_sdk_ssm::Client) -> Result<String> {
+    // Try env var first, then SSM
+    if let Ok(token) = std::env::var("DISCORD_DEVELOPER_TOKEN") {
+        return Ok(token);
+    }
+
+    let resp = ssm
+        .get_parameter()
+        .name("/oab/discord-developer-token")
+        .with_decryption(true)
+        .send()
+        .await
+        .context("failed to get Discord developer token from SSM (set DISCORD_DEVELOPER_TOKEN env var or store in SSM at /oab/discord-developer-token)")?;
+
+    resp.parameter()
+        .and_then(|p| p.value())
+        .map(|v| v.to_string())
+        .context("Discord developer token parameter has no value")
 }
 
 fn load_manifests(path: &Path) -> Result<Vec<OABServiceManifest>> {
@@ -54,8 +98,10 @@ fn parse_manifest(path: &Path) -> Result<OABServiceManifest> {
 async fn apply_one(
     ecs: &aws_sdk_ecs::Client,
     s3: &aws_sdk_s3::Client,
+    ssm: &aws_sdk_ssm::Client,
     m: &OABServiceManifest,
-) -> Result<()> {
+    discord_token: Option<&str>,
+) -> Result<Option<String>> {
     let service_name = m.ecs_service_name();
     let bucket = "oab-control-plane";
 
@@ -70,6 +116,33 @@ async fn apply_one(
         Err(_) => 0,
     };
     let generation = current_gen + 1;
+
+    // Auto-register Discord bot if --auto-register and no DISCORD_TOKEN secret defined
+    let mut invite_url = None;
+    let has_discord_secret = m.spec.secrets.iter().any(|s| s.name == "DISCORD_TOKEN");
+
+    if let Some(token) = discord_token {
+        if !has_discord_secret {
+            let bot_name = format!("oab-{}", m.metadata.name);
+            println!("    Registering Discord bot '{}'...", bot_name);
+
+            let bot = discord::provision_bot(token, &bot_name).await?;
+
+            // Store token in SSM
+            let ssm_path = format!("/oab/{}/{}/discord-token", m.metadata.namespace, m.metadata.name);
+            ssm.put_parameter()
+                .name(&ssm_path)
+                .value(&bot.bot_token)
+                .r#type(aws_sdk_ssm::types::ParameterType::SecureString)
+                .overwrite(true)
+                .send()
+                .await
+                .context("failed to store Discord bot token in SSM")?;
+
+            println!("    ✓ Bot registered, token stored at {}", ssm_path);
+            invite_url = Some(bot.invite_url);
+        }
+    }
 
     // 1. Render config.toml and upload to S3 (immutable path)
     let config_toml = render_config_toml(&m.spec.config);
@@ -125,7 +198,7 @@ async fn apply_one(
         );
     }
 
-    let secrets: Vec<Secret> = m
+    let mut secrets: Vec<Secret> = m
         .spec
         .secrets
         .iter()
@@ -137,6 +210,18 @@ async fn apply_one(
                 .unwrap()
         })
         .collect();
+
+    // If auto-registered, add the Discord token secret
+    if discord_token.is_some() && !has_discord_secret {
+        let ssm_path = format!("/oab/{}/{}/discord-token", m.metadata.namespace, m.metadata.name);
+        secrets.push(
+            Secret::builder()
+                .name("DISCORD_TOKEN")
+                .value_from(&ssm_path)
+                .build()
+                .unwrap(),
+        );
+    }
 
     let container = ContainerDefinition::builder()
         .name("openab")
@@ -229,7 +314,7 @@ async fn apply_one(
         );
     }
 
-    Ok(())
+    Ok(invite_url)
 }
 
 fn render_config_toml(config: &crate::manifest::AgentConfig) -> String {
