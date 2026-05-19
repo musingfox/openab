@@ -46,14 +46,25 @@ This enables a "GitOps for ECS" workflow where pushing a YAML change triggers th
 
 1. Load all YAML manifests from S3 (desired state)
 2. Describe current ECS services/tasks (observed state)
-3. Compute diff
+3. Compute diff (compare `metadata.generation` vs `status.observedGeneration`)
 4. Apply changes: create, update, or delete ECS resources
-5. Write status back to S3 (separate prefix)
+5. Write status back to S3 (separate prefix), set `status.observedGeneration = metadata.generation`
 6. Sleep / wait for next event
 
 ---
 
 ## 3. Manifest Schema
+
+### API Identity (fixed)
+
+| Field | Value |
+|-------|-------|
+| `apiVersion` | `oab.dev/v1` |
+| `kind` | `OABService` |
+
+All examples in this ADR use this identity. No other combinations (`openab.dev/v1`, `AgentDeployment`) are valid.
+
+### Full Example
 
 ```yaml
 apiVersion: oab.dev/v1
@@ -61,450 +72,160 @@ kind: OABService
 metadata:
   name: my-agent
   namespace: prod
+  generation: 4                    # incremented by oabctl on each apply
 spec:
-  replicas: 2
+  replicas: 1
   capacityProvider: FARGATE        # FARGATE (default) or FARGATE_SPOT
   cpu: 256                         # vCPU units (256 = 0.25 vCPU)
   memory: 512                      # MB
   taskDefinition:
     image: 123456789.dkr.ecr.us-east-1.amazonaws.com/openab:latest
-  bootstrapFrom: s3://oab-backups/agents/my-agent/latest.tar.gz
+  bootstrapFrom: s3://oab-state/agents/my-agent/latest.tar.gz
+  secrets:
+    - name: DISCORD_BOT_TOKEN
+      source: ssm
+      path: /oab/my-agent/discord-token
+    - name: LLM_API_KEY
+      source: secretsmanager
+      arn: arn:aws:secretsmanager:us-east-1:123:secret:oab/my-agent/llm-key
   networking:
     subnets: [subnet-abc, subnet-def]
     securityGroups: [sg-123]
     assignPublicIp: false
   config:
-    channels:
-      - type: discord
-        guild_id: "1490282656913559673"
-    backend:
-      type: bedrock
-      model_id: anthropic.claude-sonnet-4-20250514
-      region: us-east-1
-    steering:
-      system_prompt: "You are 超渡法師(Kiro), an OpenAB agent..."
-    features:
-      stt: true
-      cronjob: true
-```
-
-Key fields:
-- `spec.capacityProvider` — `FARGATE` (default, on-demand) or `FARGATE_SPOT` (up to 70% cost savings, with interruption risk)
-- `spec.cpu` / `spec.memory` — maps directly to ECS task definition (must be a valid Fargate combination)
-- `spec.taskDefinition` — container image and optional overrides
-- `spec.bootstrapFrom` — S3 path to agent HOME archive (contains OAuth tokens, memory, scripts)
-- `spec.networking` — ECS awsvpc configuration
-- `spec.config` — structured agent configuration (channels, backend, steering, features); controller validates and generates `config.toml`
-
-The manifest manages both **infrastructure** and **agent configuration**. On reconcile, the controller generates `config.toml` from `spec.config` and injects it into the running task.
-
-### Config Reconciliation
-
-| Change | Controller Action |
-|--------|-------------------|
-| `spec.config` changed | Generate new config.toml → write to agent's config volume → restart task |
-| `spec.cpu/memory/capacityProvider` changed | New task definition revision → UpdateService (rolling restart) |
-| `spec.bootstrapFrom` changed | Next task start uses new archive |
-| Infra + config changed together | Single rolling restart with both changes applied |
-
-`spec.config` takes precedence over any config.toml in the bootstrap archive. Bootstrap provides the initial HOME state; `spec.config` is the live desired state for configuration.
-
-### Capacity Provider
-
-```yaml
-# Cost-optimized: spot instances, tolerates interruption
-spec:
-  capacityProvider: FARGATE_SPOT
-
-# Production: guaranteed capacity
-spec:
-  capacityProvider: FARGATE
-```
-
-FARGATE_SPOT is suitable for stateless agents that can tolerate interruption (OAB reconnects automatically). For agents with strict SLA requirements, use FARGATE.
-
-### Bootstrap & Agent HOME
-
-Each agent's HOME directory (containing OAuth tokens, config, steering, memory) is restored from an S3 archive on startup via `bootstrapFrom`:
-
-```yaml
-spec:
-  bootstrapFrom: s3://oab-backups/agents/my-agent/latest.tar.gz
-```
-
-**Startup flow:**
-
-```
-ECS Task starts
-  → init: s3:GetObject ${bootstrapFrom}
-  → init: tar xzf → $HOME/
-  → OAB process starts with fully populated HOME
-       ├── config.toml
-       ├── .oauth/discord-token
-       ├── steering/
-       └── memory/
-```
-
-**What's in the bootstrap archive:**
-- OAuth tokens (Discord bot token, Slack OAuth, etc.)
-- `config.toml` (channel bindings, backend config)
-- Steering files (personality, system prompts)
-- Memory / knowledge base snapshots
-- Any agent-specific tooling or scripts
-
-**Lifecycle:**
-
-| Event | Action |
-|-------|--------|
-| First deploy | Operator prepares bootstrap archive manually or via `oabctl snapshot` |
-| Redeploy / scale-out | New tasks restore from same `bootstrapFrom` path |
-| Agent state changes | Periodic `oabctl snapshot my-agent` → uploads new archive to S3 |
-| Disaster recovery | Point `bootstrapFrom` to any previous snapshot |
-
-**Secrets handling:**
-- OAuth tokens live inside the bootstrap archive (encrypted at rest via S3 SSE-KMS)
-- No need for controller to call Discord API or manage Secrets Manager
-- The S3 bucket + KMS key policy controls who can access the tokens
-- Optional: `spec.secrets` still available for additional runtime secrets (API keys not in HOME)
-
-```yaml
-spec:
-  bootstrapFrom: s3://oab-backups/agents/my-agent/latest.tar.gz
-  secrets:                              # optional, for secrets not in bootstrap
-    - name: OPENAI_API_KEY
-      valueFrom: /oab/prod/my-agent/openai-key
-```
-
-### Example: Multi-Agent Fleet (5 Kiro + 3 CC + 2 Codex)
-
-```
-agents/
-├── kiro-01.yaml ... kiro-05.yaml
-├── cc-01.yaml ... cc-03.yaml
-└── codex-01.yaml ... codex-02.yaml
-```
-
-```yaml
-# agents/kiro-01.yaml
-apiVersion: oab.dev/v1
-kind: OABService
-metadata:
-  name: kiro-01
-  namespace: prod
-spec:
-  replicas: 1
-  capacityProvider: FARGATE_SPOT
-  cpu: 256
-  memory: 512
-  taskDefinition:
-    image: 123456789.dkr.ecr.us-east-1.amazonaws.com/openab:latest
-  bootstrapFrom: s3://oab-backups/agents/kiro-01/latest.tar.gz
-  networking:
-    subnets: [subnet-aaa, subnet-bbb]
-    securityGroups: [sg-oab]
-```
-
-```yaml
-# agents/cc-01.yaml
-apiVersion: oab.dev/v1
-kind: OABService
-metadata:
-  name: cc-01
-  namespace: prod
-spec:
-  replicas: 1
-  capacityProvider: FARGATE_SPOT
-  cpu: 512
-  memory: 1024
-  taskDefinition:
-    image: 123456789.dkr.ecr.us-east-1.amazonaws.com/openab:latest
-  bootstrapFrom: s3://oab-backups/agents/cc-01/latest.tar.gz
-  networking:
-    subnets: [subnet-aaa, subnet-bbb]
-    securityGroups: [sg-oab]
-```
-
-```yaml
-# agents/codex-01.yaml
-apiVersion: oab.dev/v1
-kind: OABService
-metadata:
-  name: codex-01
-  namespace: prod
-spec:
-  replicas: 1
-  capacityProvider: FARGATE_SPOT
-  cpu: 1024
-  memory: 2048
-  taskDefinition:
-    image: 123456789.dkr.ecr.us-east-1.amazonaws.com/openab:latest
-  bootstrapFrom: s3://oab-backups/agents/codex-01/latest.tar.gz
-  networking:
-    subnets: [subnet-aaa, subnet-bbb]
-    securityGroups: [sg-oab]
-```
-
-Deploy all 10 agents:
-
-```bash
-$ oabctl apply -f agents/
-
-✓ kiro-01  applied (FARGATE_SPOT, 256cpu/512mem)
-✓ kiro-02  applied (FARGATE_SPOT, 256cpu/512mem)
-✓ kiro-03  applied (FARGATE_SPOT, 256cpu/512mem)
-✓ kiro-04  applied (FARGATE_SPOT, 256cpu/512mem)
-✓ kiro-05  applied (FARGATE_SPOT, 256cpu/512mem)
-✓ cc-01    applied (FARGATE_SPOT, 512cpu/1024mem)
-✓ cc-02    applied (FARGATE_SPOT, 512cpu/1024mem)
-✓ cc-03    applied (FARGATE_SPOT, 512cpu/1024mem)
-✓ codex-01 applied (FARGATE_SPOT, 1024cpu/2048mem)
-✓ codex-02 applied (FARGATE_SPOT, 1024cpu/2048mem)
-
-10 services reconciled.
-```
-
-```bash
-$ oabctl get oabservice
-
-NAME       NAMESPACE  CPU   MEM   CAPACITY      STATUS   AGE
-kiro-01    prod       256   512   FARGATE_SPOT  Running  2m
-kiro-02    prod       256   512   FARGATE_SPOT  Running  2m
-kiro-03    prod       256   512   FARGATE_SPOT  Running  2m
-kiro-04    prod       256   512   FARGATE_SPOT  Running  2m
-kiro-05    prod       256   512   FARGATE_SPOT  Running  2m
-cc-01      prod       512   1024  FARGATE_SPOT  Running  2m
-cc-02      prod       512   1024  FARGATE_SPOT  Running  2m
-cc-03      prod       512   1024  FARGATE_SPOT  Running  2m
-codex-01   prod       1024  2048  FARGATE_SPOT  Running  1m
-codex-02   prod       1024  2048  FARGATE_SPOT  Running  1m
-```
-
-Each agent's identity (bot token, steering, backend config) lives in its own `bootstrapFrom` archive. The manifest only manages infrastructure.
-
-### Structured config.toml
-
-Instead of relying solely on the bootstrap archive for `config.toml`, the spec models it structurally. The controller renders the YAML into a valid `config.toml` and mounts it into the container.
-
-```yaml
-apiVersion: oab.dev/v1
-kind: OABService
-metadata:
-  name: chaodu
-  namespace: prod
-spec:
-  config:
     agent:
-      name: chaodu
-      backend: kiro
-      workingDir: /home/agent
+      name: my-agent
+      backend: bedrock
       model: us.anthropic.claude-sonnet-4-20250514
     discord:
       enabled: true
-      botId: "1490365068863606784"
-      guildId: "1490282656913559672"
-      channelIds:
-        - "1490282656913559673"
-    telegram:
-      enabled: false
+      botId: "123456789"
+      guildId: "987654321"
+      channelIds: ["111111111"]
     steering:
       source: s3
       bucket: oab-steering
-      prefix: agents/chaodu/
+      prefix: agents/my-agent/
     memory:
       backend: s3
       bucket: oab-memory
-      prefix: agents/chaodu/
+      prefix: agents/my-agent/
     tools:
-      github:
-        enabled: true
-      web:
-        enabled: true
+      github: { enabled: true }
+      web: { enabled: true }
+status:
+  phase: Running                   # Pending | Running | Failed | Terminating
+  observedGeneration: 4            # last generation the controller reconciled
+  taskArns:
+    - arn:aws:ecs:us-east-1:123456789012:task/cluster/abc123
+  lastReconciled: "2026-05-18T22:50:00Z"
+  conditions:
+    - type: Available
+      status: "True"
+      lastTransitionTime: "2026-05-18T22:50:00Z"
 ```
 
-**Controller renders to config.toml:**
+### Key Fields
 
-```toml
-[agent]
-name = "chaodu"
-backend = "kiro"
-working_dir = "/home/agent"
-model = "us.anthropic.claude-sonnet-4-20250514"
+| Field | Description |
+|-------|-------------|
+| `metadata.generation` | Monotonically increasing counter, bumped by `oabctl apply` |
+| `spec.capacityProvider` | `FARGATE` (on-demand) or `FARGATE_SPOT` (up to 70% savings, tolerates interruption) |
+| `spec.cpu` / `spec.memory` | Maps to ECS task definition (must be valid Fargate combination) |
+| `spec.taskDefinition.image` | Container image |
+| `spec.bootstrapFrom` | S3 path to mutable state archive (memory, knowledge base — **no secrets**) |
+| `spec.secrets` | Per-agent secret references (SSM / Secrets Manager) |
+| `spec.config` | Structured agent config; controller renders to `config.toml` |
+| `spec.networking` | ECS awsvpc configuration |
+| `status.observedGeneration` | Last generation the controller successfully reconciled |
 
-[discord]
-enabled = true
-bot_id = "1490365068863606784"
-guild_id = "1490282656913559672"
-channel_ids = ["1490282656913559673"]
+### Replicas Semantics
 
-[telegram]
-enabled = false
+WebSocket-based adapters (Discord, Telegram, Slack RTM) are **single-consumer** — only one instance can hold the gateway connection. Running multiple replicas would cause duplicate message processing.
 
-[steering]
-source = "s3"
-bucket = "oab-steering"
-prefix = "agents/chaodu/"
+**Rules:**
+- `replicas: 1` — default and required for WebSocket adapters
+- `replicas > 1` — only valid when all enabled adapters use **webhook mode** (HTTP-based, load-balanceable)
+- Controller **rejects** `replicas > 1` at validation time if any WebSocket adapter is enabled
 
-[memory]
-backend = "s3"
-bucket = "oab-memory"
-prefix = "agents/chaodu/"
+```yaml
+# ✅ Valid: webhook mode, can scale
+spec:
+  replicas: 3
+  config:
+    discord:
+      enabled: true
+      mode: webhook    # HTTP interactions endpoint
 
-[tools.github]
-enabled = true
-
-[tools.web]
-enabled = true
+# ❌ Rejected: websocket mode cannot scale
+spec:
+  replicas: 2
+  config:
+    discord:
+      enabled: true
+      # mode defaults to websocket → validation error
 ```
-
-**Benefits of structured config:**
-- Schema validation at `oabctl apply` time — catch typos before deploy
-- `oabctl diff` shows exactly what config changed
-- Controller can make decisions based on config (e.g., open ports for enabled adapters)
-- GitOps friendly — config changes are reviewable YAML diffs
-
-**Precedence:** `spec.config` takes priority over config.toml in `bootstrapFrom` archive. If both exist, controller merges them (spec.config wins on conflict).
 
 ---
 
-## 4. State Store Design (S3-Only)
+## 4. Config Delivery Model
 
-```
-s3://oab-control-plane/
-  ├── manifests/{namespace}/{name}.yaml   ← desired state (oabctl writes)
-  └── status/{namespace}/{name}.json      ← observed state (controller writes)
-```
+The controller does **not** mount config into containers (ECS/Fargate has no shared volume equivalent to K8s ConfigMap). Instead:
 
-| Concern | Mechanism | Rationale |
-|---------|-----------|-----------|
-| Desired state | `s3://…/manifests/` | Human-readable, git-syncable, versioned via S3 versioning |
-| Status / observed state | `s3://…/status/` | Controller writes after each reconcile cycle |
-| Generation tracking | S3 object VersionId | Each `oabctl apply` creates a new version; controller compares |
-| Change detection | S3 Event Notifications → EventBridge | Triggers controller on manifest PUT/DELETE |
-| Consistency | S3 strong read-after-write | Sufficient for single-controller architecture |
-
-**Why no DynamoDB in Phase 1:**
-- Single controller instance — no leader election needed
-- S3 strong read-after-write consistency (since Dec 2020) is sufficient
-- Fewer moving parts, zero additional infra cost
-- DDB can be added in Phase 2 for multi-replica leader election and fast status queries
-
----
-
-## 5. CLI UX (`oabctl`)
-
-### Core Commands
-
-```bash
-oabctl apply -f agent.yaml          # declare/update desired state
-oabctl get oabservice               # list all services + status
-oabctl get oabservice my-agent      # single service detail
-oabctl delete oabservice my-agent   # mark for deletion
-oabctl diff -f agent.yaml           # show local vs remote diff
-oabctl logs my-agent                # shortcut to ECS task logs
-oabctl wait my-agent --for=Available # block until condition met
-```
-
-### `apply` Semantics
-
-```
-$ oabctl apply -f prod/my-agent.yaml
-
-✓ Schema validated
-✓ Uploaded to s3://oab-control-plane/manifests/prod/my-agent.yaml
-✓ Generation: v3 → v4
-⏳ Waiting for reconciliation...
-✓ Service my-agent reconciled (2/2 tasks running)
-```
-
-Behavior:
-- Object doesn't exist → create (PUT to S3)
-- Object exists → update (PUT overwrites, new S3 version)
-- Immutable fields (namespace) → reject with error
-- `--wait=false` to skip waiting for reconciliation
-
-### `apply` Implementation (Phase 1)
+### Flow
 
 ```
 oabctl apply -f agent.yaml
-  │
-  ├─ 1. Parse & validate YAML against schema (local, fast fail)
-  ├─ 2. s3:PutObject → s3://oab-control-plane/manifests/{ns}/{name}.yaml
-  └─ 3. (if --wait) Poll status/{ns}/{name}.json until phase=Running or timeout
+  → writes manifest to S3 (manifests/{ns}/{name}.yaml)
+
+Controller reconcile:
+  → reads spec.config from manifest
+  → renders config.toml
+  → writes to s3://oab-control-plane/artifacts/{ns}/{name}/config.toml
+  → registers new ECS TaskDefinition (or forces new deployment)
+
+ECS Task startup (entrypoint wrapper):
+  → s3:GetObject artifacts/{ns}/{name}/config.toml → /home/agent/config.toml
+  → s3:GetObject ${bootstrapFrom} → tar xzf → /home/agent/ (mutable state only)
+  → exec openab
 ```
 
-No API server needed — `oabctl` talks directly to S3 via AWS SDK. Auth is standard IAM (role, profile, env vars).
+### Entrypoint Wrapper
+
+```bash
+#!/bin/bash
+set -e
+# Download controller-rendered config
+aws s3 cp "s3://oab-control-plane/artifacts/${NAMESPACE}/${NAME}/config.toml" /home/agent/config.toml
+# Restore mutable state (memory, knowledge base) if bootstrapFrom is set
+if [ -n "$BOOTSTRAP_FROM" ]; then
+  aws s3 cp "$BOOTSTRAP_FROM" /tmp/bootstrap.tar.gz
+  tar xzf /tmp/bootstrap.tar.gz -C /home/agent/
+  rm /tmp/bootstrap.tar.gz
+fi
+exec /usr/local/bin/openab
+```
+
+### What Goes Where
+
+| Content | Location | Managed By |
+|---------|----------|------------|
+| `config.toml` | S3 artifact (controller renders) | `spec.config` in manifest |
+| Secrets (bot tokens, API keys) | SSM / Secrets Manager | `spec.secrets` in manifest |
+| Memory / knowledge base | `bootstrapFrom` archive | `oabctl snapshot` |
+| Steering files | S3 (referenced in config.toml) | Separate steering bucket |
+
+**Secrets never go in the bootstrap archive.** The archive contains only mutable runtime state that the agent accumulates over time.
 
 ---
 
-## 6. Controller Lifecycle
+## 5. Per-Agent Secret Injection
 
-### Reconcile Actions
+Each agent/bot has its **own** credentials — no token sharing between agents.
 
-| Diff | Action |
-|------|--------|
-| Manifest exists, no ECS service | RegisterTaskDefinition → CreateService |
-| Manifest spec changed (new S3 version) | RegisterTaskDefinition (new revision) → UpdateService |
-| Manifest deleted from S3 | UpdateService (desiredCount=0) → DeleteService → DeregisterTaskDefinition |
-| ECS state drifted from spec | UpdateService to re-converge |
+### Design Principles
 
-### Finalizers
-
-Before deleting an ECS service, the controller:
-1. Drains active connections (set desiredCount=0, wait for task stop)
-2. Cleans up CloudMap service discovery entries
-3. Removes the status JSON from S3
-4. Only then acknowledges deletion
-
----
-
-## 7. MVP Scope
-
-### Phase 1 (minimal viable control plane)
-
-1. **S3 bucket** — manifests/ and status/ prefixes, versioning enabled
-2. **Single-instance ECS task** running the controller
-3. **Poll-based** — ListObjects + GetObject every 30s
-4. **`oabctl apply`** — validates and uploads YAML to S3
-5. **`oabctl get`** — reads status/ prefix, displays table
-6. Support `create` and `update` only (delete = manual remove from S3)
-
-### Phase 2
-
-- Event-driven triggers (S3 → EventBridge → controller wakes immediately)
-- `oabctl delete` with finalizer support
-- `oabctl diff` and `oabctl logs`
-- DynamoDB for leader election (multi-replica controller)
-- Rollback via S3 version history (`oabctl rollback my-agent --to-version=v3`)
-
-### Phase 3
-
-- Multi-region (controller per region, shared manifest bucket with replication)
-- Dependency graph (service A depends on service B)
-- Auto-scaling policies in manifest spec
-- GitOps integration (GitHub Actions → `oabctl apply` on push)
-
----
-
-## 8. Alternatives Considered
-
-| Alternative | Why not chosen |
-|-------------|---------------|
-| AWS Proton | Opinionated, limited customization for OAB-specific logic |
-| AWS Copilot | Good for simple apps, no custom reconciliation loop |
-| CDK Pipelines | Deployment tool, not a runtime controller with drift detection |
-| Step Functions orchestrator | Stateless execution model, no continuous reconciliation |
-| Run K8s anyway (EKS) | Valid but adds operational overhead for teams that chose ECS |
-| DynamoDB as primary store | Adds infra; S3 sufficient for single-controller Phase 1 |
-
----
-
-## 9. Per-Agent Secret Injection
-
-Each agent/bot has its **own** bot token and credentials — no token sharing between agents.
-
-### Design Principle
-
-- Each `AgentDeployment` owns its secrets (1:1 mapping)
+- Each `OABService` owns its secrets (1:1 mapping)
 - Controller never touches secret values — it only wires references into ECS Task Definitions
 - ECS native `secrets` field handles injection at runtime
 - IAM scoping ensures each task role can only read its own secret path
@@ -512,14 +233,10 @@ Each agent/bot has its **own** bot token and credentials — no token sharing be
 ### Spec
 
 ```yaml
-apiVersion: openab.dev/v1
-kind: AgentDeployment
-metadata:
-  name: chaodu
 spec:
   secrets:
     - name: DISCORD_BOT_TOKEN
-      source: ssm                      # ssm | secretsmanager
+      source: ssm
       path: /oab/chaodu/discord-token
     - name: LLM_API_KEY
       source: secretsmanager
@@ -537,7 +254,7 @@ spec:
      ]
    }
    ```
-2. **IAM** — controller creates/assigns a task execution role scoped to the agent's secret path:
+2. **IAM** — task execution role scoped to the agent's secret path:
    ```json
    {
      "Effect": "Allow",
@@ -548,19 +265,215 @@ spec:
      ]
    }
    ```
-3. **Rotation** — when a secret is rotated in SSM/Secrets Manager, user runs `oabctl restart <agent>` (or sets `spec.secrets.autoRestart: true`) to force a new task deployment that picks up the new value.
+
+### Secret Rotation Lifecycle
+
+```
+1. Operator rotates secret in SSM/Secrets Manager (manual or auto-rotation)
+2. Controller detects rotation:
+   - Option A: spec.secrets[].autoRestart: true → controller forces new deployment
+   - Option B: operator runs `oabctl restart my-agent`
+3. ECS launches new task → new task fetches fresh secret value at startup
+4. Old task drains and stops (ECS rolling update)
+5. Controller updates status:
+   - conditions[].type: SecretsRefreshed
+   - conditions[].lastTransitionTime: <now>
+```
+
+**Failure handling:**
+- If new task fails to start (bad secret value), ECS circuit breaker stops the rollout
+- Controller sets `status.phase: Failed`, `conditions[].type: SecretInjectionFailed`
+- Old task remains running (ECS deployment circuit breaker preserves last healthy state)
 
 ---
 
-## 10. Open Questions
+## 6. State Store Design (S3-Only)
+
+```
+s3://oab-control-plane/
+  ├── manifests/{namespace}/{name}.yaml     ← desired state (oabctl writes)
+  ├── status/{namespace}/{name}.json        ← observed state (controller writes)
+  └── artifacts/{namespace}/{name}/         ← rendered config.toml (controller writes)
+```
+
+| Concern | Mechanism | Rationale |
+|---------|-----------|-----------|
+| Desired state | `manifests/` prefix | Human-readable, git-syncable, versioned via S3 versioning |
+| Status | `status/` prefix | Controller writes after each reconcile cycle |
+| Config artifacts | `artifacts/` prefix | Controller-rendered config.toml for task startup |
+| Generation tracking | `metadata.generation` in manifest YAML | Explicit counter, not tied to S3 VersionId |
+| Change detection | S3 Event Notifications → EventBridge (Phase 2) | Phase 1 uses polling |
+| Consistency | S3 strong read-after-write | Sufficient for single-controller |
+| Optimistic locking | S3 conditional writes (If-None-Match / ETag) | Prevents concurrent `oabctl apply` conflicts |
+
+### Generation vs S3 VersionId
+
+S3 VersionId is an opaque string — not suitable for comparing "which is newer." Instead:
+- `metadata.generation` is an explicit integer, incremented by `oabctl apply`
+- `status.observedGeneration` records the last generation the controller reconciled
+- Controller skips reconcile if `observedGeneration == generation` (no-op)
+- Stale status writes are detected: if status.observedGeneration < manifest.generation, the status is outdated
+
+### Delete Semantics (Phase 2)
+
+Phase 1: `oabctl delete` removes the manifest from S3; controller detects absence and tears down ECS resources.
+
+Phase 2: Proper deletion with finalizers:
+1. `oabctl delete` sets `metadata.deletionTimestamp` in the manifest (tombstone)
+2. Controller runs finalizers (drain connections, cleanup CloudMap, remove artifacts)
+3. Controller removes manifest and status objects only after all finalizers complete
+
+---
+
+## 7. Controller Upgrade Strategy
+
+The controller runs as a single-replica ECS Service.
+
+### Phase 1 (acceptable brief gap)
+
+```yaml
+# Controller's own ECS Service config
+deploymentConfiguration:
+  minimumHealthyPercent: 0      # allow old to stop before new starts
+  maximumPercent: 100
+```
+
+- ECS rolling update: stop old → start new
+- Brief reconciliation gap (30-60s) during upgrade
+- No in-flight reconcile is lost — next cycle picks up any drift
+- Acceptable for Phase 1 because reconcile is idempotent
+
+### Phase 2 (zero-downtime)
+
+- DynamoDB-based leader election (two controller replicas)
+- Active/standby: standby takes over within seconds if active fails health check
+- Version skew handling: new controller must handle manifests written by old `oabctl` versions (schema backward compatibility)
+
+### Rollback
+
+- Controller image is pinned in its own ECS TaskDefinition
+- Rollback = `aws ecs update-service --task-definition <previous-revision>`
+- Controller state is in S3 (stateless process), so rollback is safe
+
+---
+
+## 8. CLI UX (`oabctl`)
+
+### Core Commands
+
+```bash
+oabctl apply -f agent.yaml          # declare/update desired state
+oabctl get oabservice               # list all services + status
+oabctl get oabservice my-agent      # single service detail
+oabctl delete oabservice my-agent   # remove (Phase 1: immediate; Phase 2: finalizer)
+oabctl diff -f agent.yaml           # show local vs remote diff
+oabctl logs my-agent                # shortcut to ECS task logs (CloudWatch)
+oabctl restart my-agent             # force new deployment (pick up rotated secrets)
+oabctl snapshot my-agent            # capture runtime state → bootstrapFrom archive
+oabctl wait my-agent --for=Available # block until condition met
+```
+
+### `apply` Semantics
+
+```
+$ oabctl apply -f prod/my-agent.yaml
+
+✓ Schema validated (oab.dev/v1 OABService)
+✓ Replicas check passed (replicas=1, websocket adapter)
+✓ Uploaded to s3://oab-control-plane/manifests/prod/my-agent.yaml
+✓ Generation: 3 → 4
+⏳ Waiting for reconciliation...
+✓ Service my-agent reconciled (observedGeneration=4, 1/1 tasks running)
+```
+
+### `diff` Granularity
+
+```bash
+oabctl diff -f agent.yaml              # spec-only: local YAML vs remote manifest
+oabctl diff -f agent.yaml --rendered   # rendered: show generated config.toml diff
+oabctl diff -f agent.yaml --status     # include status comparison
+```
+
+### Implementation
+
+`oabctl` talks directly to S3 via AWS SDK. No API server needed. Auth is standard IAM (role, profile, env vars). Config stored in `~/.oabctl/config`:
+
+```toml
+[default]
+region = "us-east-1"
+bucket = "oab-control-plane"
+cluster = "oab-prod"
+```
+
+---
+
+## 9. Phase Scope
+
+### Phase 1 — MVP (target)
+
+| In Scope | Out of Scope |
+|----------|--------------|
+| S3 manifest store (versioning enabled) | EventBridge triggers |
+| Single-instance controller (poll every 30s) | Multi-replica controller / leader election |
+| `oabctl apply` / `oabctl get` | `oabctl delete` with finalizers |
+| Controller renders config.toml → S3 artifact | DynamoDB state store |
+| ECS service create / update | Rollback (`oabctl rollback`) |
+| Startup wrapper downloads config + bootstrap | EFS / shared volumes |
+| `metadata.generation` / `status.observedGeneration` | Multi-region |
+| Per-agent secrets via SSM/SM | Auto-rotation detection |
+| Replicas validation (reject >1 for WS) | Auto-scaling policies |
+
+### Phase 2
+
+- Event-driven triggers (S3 → EventBridge → controller)
+- `oabctl delete` with tombstone + finalizers
+- `oabctl diff`, `oabctl logs`, `oabctl restart`
+- DynamoDB for leader election (active/standby controller)
+- Secret auto-rotation detection + auto-restart
+- Rollback via generation history
+
+### Phase 3
+
+- Multi-region (controller per region, S3 cross-region replication)
+- Dependency graph (service A depends on service B)
+- Auto-scaling policies in manifest spec
+- GitOps integration (GitHub Actions → `oabctl apply` on push)
+- Schema versioning + migration tooling
+
+---
+
+## 10. Alternatives Considered
+
+| Alternative | Why not chosen |
+|-------------|---------------|
+| AWS Proton | Opinionated, limited customization for OAB-specific logic |
+| AWS Copilot | Good for simple apps, no custom reconciliation loop |
+| CDK Pipelines | Deployment tool, not a runtime controller with drift detection |
+| Step Functions orchestrator | Stateless execution model, no continuous reconciliation |
+| Run K8s anyway (EKS) | Valid but adds operational overhead for teams that chose ECS |
+| DynamoDB as primary store | Adds infra; S3 sufficient for single-controller Phase 1 |
+
+---
+
+## 11. Open Questions
 
 1. **Multi-region** — single controller per region, or global controller with regional reconcilers?
 2. **Observability** — CloudWatch metrics from the controller, or push to a shared OAB dashboard?
-3. **Upgrade strategy** — how does the controller upgrade itself without downtime?
-4. **Networking isolation** — shared VPC or per-service security group rules?
+3. **Networking isolation** — shared VPC with per-service SG rules, or per-namespace VPC?
+4. **Schema versioning** — how to handle `oab.dev/v2` migration when spec evolves?
 
 ---
 
-## 11. Decision
+## 12. Decision
 
-We adopt the CRD + Operator pattern on ECS with an **S3-only state store** and a **`oabctl` CLI** for the operator interface. The controller runs as a single ECS service that reconciles OABService manifests (stored in S3) against actual ECS state. DynamoDB is deferred to Phase 2 when multi-replica HA is needed. This gives ECS-native teams the same declarative, self-healing deployment experience that K8s operators provide — with minimal infrastructure footprint.
+We adopt the CRD + Operator pattern on ECS with an **S3-only state store**, **explicit generation tracking**, and a **`oabctl` CLI** for the operator interface. The controller runs as a single ECS service that reconciles `OABService` manifests against actual ECS state.
+
+Key design choices:
+- **Config delivery**: controller renders `config.toml` to S3 artifact; startup wrapper downloads it
+- **Secrets**: per-agent SSM/Secrets Manager references; never in bootstrap archive
+- **Bootstrap**: mutable runtime state only (memory, knowledge base)
+- **Replicas**: validated at apply time; WebSocket adapters locked to 1
+- **Generation**: explicit `metadata.generation` / `status.observedGeneration` (not S3 VersionId)
+- **Phase 1 scope**: narrow (create/update only, poll-based, single controller)
+
+DynamoDB, EventBridge, finalizers, and multi-region are deferred to Phase 2+.
