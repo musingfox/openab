@@ -252,7 +252,89 @@ The controller does **not** monitor agent health — ECS Service already maintai
 
 ---
 
-## 4. Config Delivery Model
+## 4. Multi-Runtime Support (ECS + K8s)
+
+The same YAML manifest can deploy to **both ECS and Kubernetes**. The spec is platform-agnostic; platform-specific details live in an optional `platform:` overlay.
+
+### Design Principle
+
+```
+┌─────────────────────┐
+│  oab.dev/v1 YAML    │  ← one spec, platform-agnostic core
+└──────────┬──────────┘
+           │
+    ┌──────┴──────┐
+    ▼             ▼
+┌────────┐   ┌────────┐
+│  ECS   │   │  K8s   │
+│Controller│   │Operator│
+└────┬───┘   └────┬───┘
+     ▼             ▼
+  ECS Service   Deployment + ConfigMap + ExternalSecret
+```
+
+Each controller reads the core spec and its own `platform:` overlay, ignoring the other.
+
+### Spec with Platform Overlay
+
+```yaml
+apiVersion: oab.dev/v1
+kind: OABService
+metadata:
+  name: chaodu
+  namespace: prod
+spec:
+  # Core (cross-platform)
+  cpu: 512
+  memory: 1024
+  config:
+    agent: { backend: kiro }
+    discord: { enabled: true, botId: "123" }
+  secrets:
+    - name: DISCORD_BOT_TOKEN
+      source: ssm
+      path: /oab/chaodu/discord-token
+
+  # Platform-specific (each controller reads only its own key)
+  platform:
+    ecs:
+      capacityProvider: FARGATE_SPOT
+      networking:
+        subnets: [subnet-abc, subnet-def]
+        securityGroups: [sg-oab]
+        assignPublicIp: false
+    k8s:
+      nodeSelector: { node.kubernetes.io/capacity-type: spot }
+      serviceAccount: oab-agent
+      storageClass: gp3
+```
+
+### Translation Table
+
+| Core Spec | ECS Controller | K8s Operator |
+|-----------|---------------|--------------|
+| `cpu: 512` | TaskDef `cpu=512` | `resources.requests.cpu: 500m` |
+| `memory: 1024` | TaskDef `memory=1024` | `resources.requests.memory: 1Gi` |
+| `spec.config` | Render → S3 artifact → startup wrapper | Render → ConfigMap → volume mount |
+| `spec.secrets[].source: ssm` | ECS native `secrets` field | ExternalSecret → K8s Secret |
+| `platform.ecs.capacityProvider` | Fargate capacity provider | _(ignored)_ |
+| `platform.k8s.nodeSelector` | _(ignored)_ | Pod nodeSelector |
+
+### Rules
+
+- `platform:` is optional. If omitted, controller uses its own defaults.
+- Controller **ignores** unknown platform keys (ECS controller skips `platform.k8s`, and vice versa).
+- Core spec fields (`cpu`, `memory`, `config`, `secrets`) are mandatory and cross-platform.
+- `OABFleet` also supports `platform:` at both `defaults` and per-agent level.
+
+### Phase Plan
+
+- **Phase 1**: ECS controller only. `platform.ecs` supported, `platform.k8s` ignored.
+- **Phase 3**: K8s operator reads same manifests (from S3 or as native CRD). Shared schema, different runtime.
+
+---
+
+## 5. Config Delivery Model
 
 The controller does **not** mount config into containers (ECS/Fargate has no shared volume equivalent to K8s ConfigMap). Instead:
 
@@ -303,7 +385,7 @@ exec /usr/local/bin/openab
 
 ---
 
-## 5. Per-Agent Secret Injection
+## 6. Per-Agent Secret Injection
 
 Each agent/bot has its **own** credentials — no token sharing between agents.
 
@@ -371,7 +453,7 @@ spec:
 
 ---
 
-## 6. State Store Design (S3-Only)
+## 7. State Store Design (S3-Only)
 
 ```
 s3://oab-control-plane/
@@ -409,7 +491,7 @@ Phase 2: Proper deletion with finalizers:
 
 ---
 
-## 7. Controller Upgrade Strategy
+## 8. Controller Upgrade Strategy
 
 The controller runs as a single-replica ECS Service.
 
@@ -441,7 +523,7 @@ deploymentConfiguration:
 
 ---
 
-## 8. CLI UX (`oabctl`)
+## 9. CLI UX (`oabctl`)
 
 ### Core Commands
 
@@ -491,7 +573,7 @@ cluster = "oab-prod"
 
 ---
 
-## 9. Phase Scope
+## 10. Phase Scope
 
 ### Phase 1 — MVP (target)
 
@@ -518,6 +600,7 @@ cluster = "oab-prod"
 
 ### Phase 3
 
+- **K8s Operator** — same `oab.dev/v1` schema consumed as native CRD; `platform.k8s` overlay
 - Multi-region (controller per region, S3 cross-region replication)
 - Dependency graph (service A depends on service B)
 - Auto-scaling policies in manifest spec
@@ -526,7 +609,7 @@ cluster = "oab-prod"
 
 ---
 
-## 10. Alternatives Considered
+## 11. Alternatives Considered
 
 | Alternative | Why not chosen |
 |-------------|---------------|
@@ -539,7 +622,7 @@ cluster = "oab-prod"
 
 ---
 
-## 11. Open Questions
+## 12. Open Questions
 
 1. **Multi-region** — single controller per region, or global controller with regional reconcilers?
 2. **Observability** — CloudWatch metrics from the controller, or push to a shared OAB dashboard?
@@ -548,7 +631,7 @@ cluster = "oab-prod"
 
 ---
 
-## 12. Decision
+## 13. Decision
 
 We adopt the CRD + Operator pattern on ECS with an **S3-only state store**, **explicit generation tracking**, and a **`oabctl` CLI** for the operator interface. The controller runs as a single ECS service that reconciles `OABService` manifests against actual ECS state.
 
