@@ -114,45 +114,57 @@ spec:
 
 FARGATE_SPOT is suitable for stateless agents that can tolerate interruption (OAB reconnects automatically). For agents with long-running sessions or strict SLA requirements, use FARGATE.
 
-### Secrets & Bot Provisioning
+### Bootstrap & Agent HOME
 
-Each agent owns its own bot token. The controller **provisions** the Discord bot token automatically by calling the Discord API, then stores it in AWS Secrets Manager.
+Each agent's HOME directory (containing OAuth tokens, config, steering, memory) is restored from an S3 archive on startup via `bootstrapFrom`:
 
 ```yaml
 spec:
-  channel:
-    type: discord
-    applicationId: "1234567890"    # Discord Application ID (pre-created)
-  secrets:
+  bootstrapFrom: s3://oab-backups/agents/my-agent/latest.tar.gz
+```
+
+**Startup flow:**
+
+```
+ECS Task starts
+  → init: s3:GetObject ${bootstrapFrom}
+  → init: tar xzf → $HOME/
+  → OAB process starts with fully populated HOME
+       ├── config.toml
+       ├── .oauth/discord-token
+       ├── steering/
+       └── memory/
+```
+
+**What's in the bootstrap archive:**
+- OAuth tokens (Discord bot token, Slack OAuth, etc.)
+- `config.toml` (channel bindings, backend config)
+- Steering files (personality, system prompts)
+- Memory / knowledge base snapshots
+- Any agent-specific tooling or scripts
+
+**Lifecycle:**
+
+| Event | Action |
+|-------|--------|
+| First deploy | Operator prepares bootstrap archive manually or via `oabctl snapshot` |
+| Redeploy / scale-out | New tasks restore from same `bootstrapFrom` path |
+| Agent state changes | Periodic `oabctl snapshot my-agent` → uploads new archive to S3 |
+| Disaster recovery | Point `bootstrapFrom` to any previous snapshot |
+
+**Secrets handling:**
+- OAuth tokens live inside the bootstrap archive (encrypted at rest via S3 SSE-KMS)
+- No need for controller to call Discord API or manage Secrets Manager
+- The S3 bucket + KMS key policy controls who can access the tokens
+- Optional: `spec.secrets` still available for additional runtime secrets (API keys not in HOME)
+
+```yaml
+spec:
+  bootstrapFrom: s3://oab-backups/agents/my-agent/latest.tar.gz
+  secrets:                              # optional, for secrets not in bootstrap
     - name: OPENAI_API_KEY
-      valueFrom: /oab/prod/my-agent/openai-key   # operator-managed
+      valueFrom: /oab/prod/my-agent/openai-key
 ```
-
-**Controller-managed secrets (auto-provisioned):**
-
-On first `oabctl apply`, the controller:
-1. Calls Discord API to generate/reset the bot token for the given `applicationId`
-2. Stores the token in Secrets Manager at `oab/{namespace}/{name}/discord-token`
-3. References it in the ECS task definition `secrets` field
-
-```
-oabctl apply -f my-agent.yaml
-  → Controller detects new OABService
-  → POST https://discord.com/api/v10/applications/{id}/bot/reset
-  → secretsmanager:CreateSecret → oab/prod/my-agent/discord-token
-  → RegisterTaskDefinition (with secret reference)
-  → CreateService
-```
-
-**Operator-managed secrets (manual):**
-
-Non-bot secrets (API keys, model credentials) are managed by the operator via AWS console/CLI and referenced by path in `spec.secrets`.
-
-Design principles:
-- **Bot token = controller-managed** — provisioned via Discord API, stored in Secrets Manager, rotated by controller
-- **API keys = operator-managed** — stored in SSM/Secrets Manager by operator, referenced by path
-- **Naming convention**: `oab/{namespace}/{service-name}/{secret-name}`
-- **No secrets in S3** — manifests never contain secret values, only references or application IDs
 
 ---
 
