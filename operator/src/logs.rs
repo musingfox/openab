@@ -4,14 +4,14 @@ pub async fn run(
     aws_config: &aws_config::SdkConfig,
     name: &str,
     cluster: &str,
-    namespace: &str,
+    _namespace: &str,
     follow: bool,
     tail: i32,
 ) -> Result<()> {
     let ecs = aws_sdk_ecs::Client::new(aws_config);
     let logs_client = aws_sdk_cloudwatchlogs::Client::new(aws_config);
 
-    let service_name = format!("oab-{}-{}", namespace, name);
+    let service_name = format!("openab-{}", name);
 
     // 1. Find the running task for this service
     let tasks = ecs
@@ -20,7 +20,7 @@ pub async fn run(
         .service_name(&service_name)
         .send()
         .await
-        .context("failed to list tasks")?;
+        .context(format!("failed to list tasks for service {}", service_name))?;
 
     let task_arn = tasks
         .task_arns()
@@ -44,10 +44,11 @@ pub async fn run(
     // Extract task ID from ARN (last segment after /)
     let task_id = task_arn.rsplit('/').next().unwrap_or(task_arn);
 
-    // ECS Fargate default log configuration: /ecs/{task-def-family}
-    // Log stream: {container-name}/{task-id}
-    let log_group = format!("/ecs/{}", service_name);
-    let log_stream = format!("openab/{}", task_id);
+    // ECS Fargate log configuration:
+    // Log group: /ecs/openab (shared across all agents)
+    // Log stream: {name}/openab/{task_id}
+    let log_group = "/ecs/openab".to_string();
+    let log_stream = format!("{}/openab/{}", name, task_id);
 
     // Try the default awslogs pattern first, fall back to task def config
     let (final_group, final_stream) = match get_log_config(task) {

@@ -49,7 +49,7 @@ enum Commands {
         /// Agent name
         name: String,
         /// ECS cluster name
-        #[arg(long, default_value = "default")]
+        #[arg(long, default_value = "openab")]
         cluster: String,
         /// Namespace
         #[arg(long, default_value = "prod")]
