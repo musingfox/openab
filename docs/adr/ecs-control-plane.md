@@ -328,7 +328,8 @@ spec:
 ### Rules
 
 - `platform:` is optional. If omitted, controller uses its own defaults.
-- Controller **ignores** unknown platform keys (ECS controller skips `platform.k8s`, and vice versa).
+- Controller **strict-validates** its own platform key (e.g., ECS controller rejects invalid `platform.ecs.*` fields with an error).
+- Controller **ignores** other platform keys entirely (ECS controller skips `platform.k8s`, and vice versa).
 - Core spec fields (`cpu`, `memory`, `config`, `secrets`) are mandatory and cross-platform.
 - `OABFleet` also supports `platform:` at both `defaults` and per-agent level.
 
@@ -347,27 +348,30 @@ The controller does **not** mount config into containers (ECS/Fargate has no sha
 
 ```
 oabctl apply -f agent.yaml
-  → writes manifest to S3 (manifests/{ns}/{name}.yaml)
+  → writes manifest to S3 (manifests/{ns}/{name}.yaml, generation incremented)
 
 Controller reconcile:
   → reads spec.config from manifest
   → renders config.toml
-  → writes to s3://oab-control-plane/artifacts/{ns}/{name}/config.toml
-  → registers new ECS TaskDefinition (or forces new deployment)
+  → writes to s3://oab-control-plane/artifacts/{ns}/{name}/{generation}/config.toml (immutable)
+  → registers new ECS TaskDefinition with env CONFIG_ARTIFACT_PATH pinned to this generation
+  → updates ECS Service (rolling deployment)
 
 ECS Task startup (entrypoint wrapper):
-  → s3:GetObject artifacts/{ns}/{name}/config.toml → /home/agent/config.toml
-  → s3:GetObject ${bootstrapFrom} → tar xzf → /home/agent/ (mutable state only)
+  → s3:GetObject ${CONFIG_ARTIFACT_PATH} → /home/agent/config.toml
+  → s3:GetObject ${BOOTSTRAP_FROM} → tar xzf → /home/agent/ (mutable state only)
   → exec openab
 ```
+
+Config artifacts are **immutable per generation** — once written, never overwritten. During rolling updates, old tasks keep fetching their pinned generation while new tasks use the new one.
 
 ### Entrypoint Wrapper
 
 ```bash
 #!/bin/bash
 set -e
-# Download controller-rendered config
-aws s3 cp "s3://oab-control-plane/artifacts/${NAMESPACE}/${NAME}/config.toml" /home/agent/config.toml
+# Download controller-rendered config (pinned to specific generation)
+aws s3 cp "$CONFIG_ARTIFACT_PATH" /home/agent/config.toml
 # Restore mutable state (memory, knowledge base) if bootstrapFrom is set
 if [ -n "$BOOTSTRAP_FROM" ]; then
   aws s3 cp "$BOOTSTRAP_FROM" /tmp/bootstrap.tar.gz
@@ -481,7 +485,8 @@ spec:
 s3://oab-control-plane/
   ├── manifests/{namespace}/{name}.yaml     ← desired state (oabctl writes)
   ├── status/{namespace}/{name}.json        ← observed state (controller writes)
-  └── artifacts/{namespace}/{name}/         ← rendered config.toml (controller writes)
+  └── artifacts/{namespace}/{name}/{generation}/  ← immutable config per generation
+        └── config.toml
 ```
 
 | Concern | Mechanism | Rationale |
