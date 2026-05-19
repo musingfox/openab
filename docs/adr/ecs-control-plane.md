@@ -246,9 +246,10 @@ The controller does **not** monitor agent health — ECS Service already maintai
 
 ### Prerequisites for Auto-Registration
 
-- Discord Developer Portal credentials stored in SSM: `/oab/discord-developer/token`
+- Discord **user OAuth2 bearer token** (not bot token) stored in SSM: `/oab/discord-developer/user-token` — required to call `POST /applications`
 - Controller IAM role needs `ssm:PutParameter` to store generated bot tokens
 - Discord API rate limit: ~5 app creations per minute (controller handles backoff)
+- **Note:** `OABFleet` + `autoRegister` is **Phase 2**. Phase 1 requires manual Bot creation in Discord Developer Portal.
 
 ---
 
@@ -299,6 +300,8 @@ spec:
   platform:
     ecs:
       capacityProvider: FARGATE_SPOT
+      executionRole: arn:aws:iam::123456789012:role/oab-task-execution
+      taskRole: arn:aws:iam::123456789012:role/oab-chaodu-task
       networking:
         subnets: [subnet-abc, subnet-def]
         securityGroups: [sg-oab]
@@ -318,6 +321,8 @@ spec:
 | `spec.config` | Render → S3 artifact → startup wrapper | Render → ConfigMap → volume mount |
 | `spec.secrets[].source: ssm` | ECS native `secrets` field | ExternalSecret → K8s Secret |
 | `platform.ecs.capacityProvider` | Fargate capacity provider | _(ignored)_ |
+| `platform.ecs.executionRole` | ECS task execution role | _(ignored)_ |
+| `platform.ecs.taskRole` | ECS task role | _(ignored)_ |
 | `platform.k8s.nodeSelector` | _(ignored)_ | Pod nodeSelector |
 
 ### Rules
@@ -382,6 +387,23 @@ exec /usr/local/bin/openab
 | Steering files | S3 (referenced in config.toml) | Separate steering bucket |
 
 **Secrets never go in the bootstrap archive.** The archive contains only mutable runtime state that the agent accumulates over time.
+
+### IAM Requirements (Task Execution Role)
+
+The ECS task execution role (`platform.ecs.executionRole`) must have:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["s3:GetObject"],
+  "Resource": [
+    "arn:aws:s3:::oab-control-plane/artifacts/${namespace}/${name}/*",
+    "arn:aws:s3:::oab-state/agents/${name}/*"
+  ]
+}
+```
+
+This allows the startup wrapper to download the controller-rendered `config.toml` and the bootstrap archive.
 
 ---
 
@@ -591,6 +613,7 @@ cluster = "oab-prod"
 
 ### Phase 2
 
+- `OABFleet` kind + Discord `autoRegister` (batch Bot provisioning)
 - Event-driven triggers (S3 → EventBridge → controller)
 - `oabctl delete` with tombstone + finalizers
 - `oabctl diff`, `oabctl logs`, `oabctl restart`
