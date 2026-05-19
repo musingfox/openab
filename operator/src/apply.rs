@@ -1,5 +1,5 @@
-use crate::manifest::OABServiceManifest;
 use crate::discord;
+use crate::manifest::OABServiceManifest;
 use anyhow::{Context, Result};
 use aws_sdk_ecs::types::{
     AssignPublicIp, AwsVpcConfiguration, CapacityProviderStrategyItem, ContainerDefinition,
@@ -8,7 +8,11 @@ use aws_sdk_ecs::types::{
 use aws_sdk_s3::primitives::ByteStream;
 use std::path::Path;
 
-pub async fn run(aws_config: &aws_config::SdkConfig, file_path: &str, auto_register: bool) -> Result<()> {
+pub async fn run(
+    aws_config: &aws_config::SdkConfig,
+    file_path: &str,
+    auto_register: bool,
+) -> Result<()> {
     let path = Path::new(file_path);
     let manifests = load_manifests(path)?;
 
@@ -91,8 +95,7 @@ fn load_manifests(path: &Path) -> Result<Vec<OABServiceManifest>> {
 fn parse_manifest(path: &Path) -> Result<OABServiceManifest> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    serde_yaml::from_str(&content)
-        .with_context(|| format!("failed to parse {}", path.display()))
+    serde_yaml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 async fn apply_one(
@@ -106,8 +109,17 @@ async fn apply_one(
     let bucket = "oab-control-plane";
 
     // Read current generation from S3 manifest (if exists), increment
-    let manifest_key = format!("manifests/{}/{}.yaml", m.metadata.namespace, m.metadata.name);
-    let current_gen = match s3.get_object().bucket(bucket).key(&manifest_key).send().await {
+    let manifest_key = format!(
+        "manifests/{}/{}.yaml",
+        m.metadata.namespace, m.metadata.name
+    );
+    let current_gen = match s3
+        .get_object()
+        .bucket(bucket)
+        .key(&manifest_key)
+        .send()
+        .await
+    {
         Ok(resp) => {
             let bytes = resp.body.collect().await?.into_bytes();
             let existing: OABServiceManifest = serde_yaml::from_slice(&bytes)?;
@@ -124,18 +136,29 @@ async fn apply_one(
     if let Some(token) = discord_token {
         if !has_discord_secret {
             let bot_name = format!("oab-{}-{}", m.metadata.namespace, m.metadata.name);
-            let ssm_path = format!("/oab/{}/{}/discord-token", m.metadata.namespace, m.metadata.name);
+            let ssm_path = format!(
+                "/oab/{}/{}/discord-token",
+                m.metadata.namespace, m.metadata.name
+            );
 
             // Check if token already exists in SSM (idempotent: skip if already provisioned)
-            let already_provisioned = ssm
-                .get_parameter()
-                .name(&ssm_path)
-                .send()
-                .await
-                .is_ok();
+            let already_provisioned = match ssm.get_parameter().name(&ssm_path).send().await {
+                Ok(_) => true,
+                Err(err) if err.as_service_error().is_some_and(is_parameter_not_found) => false,
+                Err(err) => {
+                    anyhow::bail!(
+                        "failed to check existing Discord token at {}: {}",
+                        ssm_path,
+                        err
+                    );
+                }
+            };
 
             if already_provisioned {
-                println!("    ✓ Bot already provisioned (token exists at {})", ssm_path);
+                println!(
+                    "    ✓ Bot already provisioned (token exists at {})",
+                    ssm_path
+                );
             } else {
                 println!("    Registering Discord bot '{}'...", bot_name);
 
@@ -177,7 +200,10 @@ async fn apply_one(
 
     // Persist auto-registered secret in desired state so future applies without --auto-register keep it
     if discord_token.is_some() && !has_discord_secret {
-        let ssm_path = format!("/oab/{}/{}/discord-token", m.metadata.namespace, m.metadata.name);
+        let ssm_path = format!(
+            "/oab/{}/{}/discord-token",
+            m.metadata.namespace, m.metadata.name
+        );
         let secret_entry = serde_yaml::to_value(&crate::manifest::SecretRef {
             name: "DISCORD_TOKEN".to_string(),
             value_from: ssm_path,
@@ -190,7 +216,10 @@ async fn apply_one(
     }
 
     let manifest_yaml = serde_yaml::to_string(&manifest_to_store)?;
-    let manifest_key = format!("manifests/{}/{}.yaml", m.metadata.namespace, m.metadata.name);
+    let manifest_key = format!(
+        "manifests/{}/{}.yaml",
+        m.metadata.namespace, m.metadata.name
+    );
     s3.put_object()
         .bucket(bucket)
         .key(&manifest_key)
@@ -241,7 +270,10 @@ async fn apply_one(
 
     // If auto-registered, add the Discord token secret to task def
     if discord_token.is_some() && !has_discord_secret {
-        let ssm_path = format!("/oab/{}/{}/discord-token", m.metadata.namespace, m.metadata.name);
+        let ssm_path = format!(
+            "/oab/{}/{}/discord-token",
+            m.metadata.namespace, m.metadata.name
+        );
         secrets.push(
             Secret::builder()
                 .name("DISCORD_TOKEN")
@@ -256,7 +288,11 @@ async fn apply_one(
         .image(&m.spec.task_definition.image)
         .essential(true)
         .set_environment(Some(env_vars))
-        .set_secrets(if secrets.is_empty() { None } else { Some(secrets) })
+        .set_secrets(if secrets.is_empty() {
+            None
+        } else {
+            Some(secrets)
+        })
         .build();
 
     let task_def = ecs
@@ -387,4 +423,28 @@ fn render_config_toml(config: &crate::manifest::AgentConfig) -> String {
     }
 
     out
+}
+
+fn is_parameter_not_found(err: &aws_sdk_ssm::operation::get_parameter::GetParameterError) -> bool {
+    err.is_parameter_not_found()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_ssm::{
+        operation::get_parameter::GetParameterError, types::error::ParameterNotFound,
+    };
+
+    #[test]
+    fn classifies_only_parameter_not_found_as_missing() {
+        let missing = GetParameterError::ParameterNotFound(ParameterNotFound::builder().build());
+        assert!(is_parameter_not_found(&missing));
+
+        let other = GetParameterError::unhandled(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "ssm denied",
+        ));
+        assert!(!is_parameter_not_found(&other));
+    }
 }
