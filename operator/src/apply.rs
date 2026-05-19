@@ -123,24 +123,37 @@ async fn apply_one(
 
     if let Some(token) = discord_token {
         if !has_discord_secret {
-            let bot_name = format!("oab-{}", m.metadata.name);
-            println!("    Registering Discord bot '{}'...", bot_name);
-
-            let bot = discord::provision_bot(token, &bot_name).await?;
-
-            // Store token in SSM
+            let bot_name = format!("oab-{}-{}", m.metadata.namespace, m.metadata.name);
             let ssm_path = format!("/oab/{}/{}/discord-token", m.metadata.namespace, m.metadata.name);
-            ssm.put_parameter()
+
+            // Check if token already exists in SSM (idempotent: skip if already provisioned)
+            let already_provisioned = ssm
+                .get_parameter()
                 .name(&ssm_path)
-                .value(&bot.bot_token)
-                .r#type(aws_sdk_ssm::types::ParameterType::SecureString)
-                .overwrite(true)
                 .send()
                 .await
-                .context("failed to store Discord bot token in SSM")?;
+                .is_ok();
 
-            println!("    ✓ Bot registered, token stored at {}", ssm_path);
-            invite_url = Some(bot.invite_url);
+            if already_provisioned {
+                println!("    ✓ Bot already provisioned (token exists at {})", ssm_path);
+            } else {
+                println!("    Registering Discord bot '{}'...", bot_name);
+
+                let bot = discord::provision_bot(token, &bot_name).await?;
+
+                // Store token in SSM
+                ssm.put_parameter()
+                    .name(&ssm_path)
+                    .value(&bot.bot_token)
+                    .r#type(aws_sdk_ssm::types::ParameterType::SecureString)
+                    .overwrite(true)
+                    .send()
+                    .await
+                    .context("failed to store Discord bot token in SSM")?;
+
+                println!("    ✓ Bot registered, token stored at {}", ssm_path);
+                invite_url = Some(bot.invite_url);
+            }
         }
     }
 
@@ -161,6 +174,21 @@ async fn apply_one(
     // 2. Upload manifest to S3 (record of desired state, with updated generation)
     let mut manifest_to_store = serde_yaml::to_value(m)?;
     manifest_to_store["metadata"]["generation"] = serde_yaml::Value::Number(generation.into());
+
+    // Persist auto-registered secret in desired state so future applies without --auto-register keep it
+    if discord_token.is_some() && !has_discord_secret {
+        let ssm_path = format!("/oab/{}/{}/discord-token", m.metadata.namespace, m.metadata.name);
+        let secret_entry = serde_yaml::to_value(&crate::manifest::SecretRef {
+            name: "DISCORD_TOKEN".to_string(),
+            value_from: ssm_path,
+        })?;
+        if let Some(secrets) = manifest_to_store["spec"]["secrets"].as_sequence_mut() {
+            secrets.push(secret_entry);
+        } else {
+            manifest_to_store["spec"]["secrets"] = serde_yaml::Value::Sequence(vec![secret_entry]);
+        }
+    }
+
     let manifest_yaml = serde_yaml::to_string(&manifest_to_store)?;
     let manifest_key = format!("manifests/{}/{}.yaml", m.metadata.namespace, m.metadata.name);
     s3.put_object()
@@ -211,7 +239,7 @@ async fn apply_one(
         })
         .collect();
 
-    // If auto-registered, add the Discord token secret
+    // If auto-registered, add the Discord token secret to task def
     if discord_token.is_some() && !has_discord_secret {
         let ssm_path = format!("/oab/{}/{}/discord-token", m.metadata.namespace, m.metadata.name);
         secrets.push(
