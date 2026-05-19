@@ -13,6 +13,11 @@ pub fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::Image
     let reader = ImageReader::new(Cursor::new(raw)).with_guessed_format()?;
     let format = reader.format();
     if format == Some(image::ImageFormat::Gif) {
+        if raw.len() > 5_000_000 {
+            return Err(image::ImageError::Limits(
+                image::error::LimitError::from_kind(image::error::LimitErrorKind::DimensionError),
+            ));
+        }
         return Ok((raw.to_vec(), "image/gif".to_string()));
     }
     let img = reader.decode()?;
