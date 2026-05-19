@@ -99,7 +99,7 @@ pub async fn run(
             let cap = svc
                 .capacity_provider_strategy()
                 .first()
-                .and_then(|c| c.capacity_provider())
+                .map(|c| c.capacity_provider())
                 .unwrap_or("FARGATE");
 
             println!(
