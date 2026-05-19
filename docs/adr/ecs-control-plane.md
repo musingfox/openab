@@ -73,16 +73,41 @@ spec:
     subnets: [subnet-abc, subnet-def]
     securityGroups: [sg-123]
     assignPublicIp: false
+  config:
+    channels:
+      - type: discord
+        guild_id: "1490282656913559673"
+    backend:
+      type: bedrock
+      model_id: anthropic.claude-sonnet-4-20250514
+      region: us-east-1
+    steering:
+      system_prompt: "You are 超渡法師(Kiro), an OpenAB agent..."
+    features:
+      stt: true
+      cronjob: true
 ```
 
 Key fields:
 - `spec.capacityProvider` — `FARGATE` (default, on-demand) or `FARGATE_SPOT` (up to 70% cost savings, with interruption risk)
 - `spec.cpu` / `spec.memory` — maps directly to ECS task definition (must be a valid Fargate combination)
 - `spec.taskDefinition` — container image and optional overrides
-- `spec.bootstrapFrom` — S3 path to agent HOME archive (contains config, OAuth, steering, memory)
+- `spec.bootstrapFrom` — S3 path to agent HOME archive (contains OAuth tokens, memory, scripts)
 - `spec.networking` — ECS awsvpc configuration
+- `spec.config` — structured agent configuration (channels, backend, steering, features); controller validates and generates `config.toml`
 
-The manifest only manages **infrastructure** (container, compute, networking). Agent-level config (backend, model, channels, steering) lives inside the bootstrap archive's `config.toml`.
+The manifest manages both **infrastructure** and **agent configuration**. On reconcile, the controller generates `config.toml` from `spec.config` and injects it into the running task.
+
+### Config Reconciliation
+
+| Change | Controller Action |
+|--------|-------------------|
+| `spec.config` changed | Generate new config.toml → write to agent's config volume → restart task |
+| `spec.cpu/memory/capacityProvider` changed | New task definition revision → UpdateService (rolling restart) |
+| `spec.bootstrapFrom` changed | Next task start uses new archive |
+| Infra + config changed together | Single rolling restart with both changes applied |
+
+`spec.config` takes precedence over any config.toml in the bootstrap archive. Bootstrap provides the initial HOME state; `spec.config` is the live desired state for configuration.
 
 ### Capacity Provider
 
