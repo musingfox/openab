@@ -34,7 +34,7 @@ fn load_manifests(path: &Path) -> Result<Vec<OABServiceManifest>> {
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let p = entry.path();
-            if p.extension().map_or(false, |e| e == "yaml" || e == "yml") {
+            if p.extension().is_some_and(|e| e == "yaml" || e == "yml") {
                 manifests.push(parse_manifest(&p)?);
             }
         }
@@ -180,7 +180,7 @@ async fn apply_one(
         .as_ref()
         .ok()
         .and_then(|r| r.services().first())
-        .map_or(false, |s| s.status() == Some("ACTIVE"));
+        .is_some_and(|s| s.status() == Some("ACTIVE"));
 
     if service_active {
         // Update existing service
@@ -236,7 +236,7 @@ fn render_config_toml(config: &crate::manifest::AgentConfig) -> String {
     }
 
     for (i, ch) in config.channels.iter().enumerate() {
-        out.push_str(&format!("[[channels]]\n"));
+        out.push_str("[[channels]]\n");
         out.push_str(&format!("type = \"{}\"\n", ch.channel_type));
         for (k, v) in &ch.extra {
             if let serde_yaml::Value::String(s) = v {

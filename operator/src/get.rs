@@ -78,7 +78,7 @@ pub async fn run(
             let desired = svc.desired_count();
 
             // Get cpu/memory from task definition
-            let (cpu, mem, capacity) = if let Some(td_arn) = svc.task_definition() {
+            let (cpu, mem) = if let Some(td_arn) = svc.task_definition() {
                 let td_resp = ecs
                     .describe_task_definition()
                     .task_definition(td_arn)
@@ -88,12 +88,12 @@ pub async fn run(
                     let td = td.task_definition();
                     let cpu = td.and_then(|t| t.cpu()).unwrap_or("-");
                     let mem = td.and_then(|t| t.memory()).unwrap_or("-");
-                    (cpu.to_string(), mem.to_string(), String::new())
+                    (cpu.to_string(), mem.to_string())
                 } else {
-                    ("-".to_string(), "-".to_string(), String::new())
+                    ("-".to_string(), "-".to_string())
                 }
             } else {
-                ("-".to_string(), "-".to_string(), String::new())
+                ("-".to_string(), "-".to_string())
             };
 
             let cap = svc
