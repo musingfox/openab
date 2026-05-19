@@ -1147,16 +1147,15 @@ async fn download_wecom_image(
             return None;
         }
     };
-    use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD.encode(&compressed);
+    let path = crate::store::store_media(&compressed).await?;
     let ext = if mime == "image/gif" { "gif" } else { "jpg" };
     Some(crate::schema::Attachment {
         attachment_type: "image".into(),
         filename: format!("wecom_{}.{}", chrono::Utc::now().timestamp(), ext),
         mime_type: mime,
-        data,
+        data: String::new(),
         size: compressed.len() as u64,
-        path: None,
+        path: Some(path),
     })
 }
 
@@ -1274,17 +1273,16 @@ async fn download_wecom_file(
         }
     };
 
-    use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD.encode(text_content.as_bytes());
+    let path = crate::store::store_media(text_content.as_bytes()).await?;
     let size = text_content.len() as u64;
 
     Some(crate::schema::Attachment {
         attachment_type: "text_file".into(),
         filename: filename.to_string(),
         mime_type: "text/plain".into(),
-        data,
+        data: String::new(),
         size,
-        path: None,
+        path: Some(path),
     })
 }
 
