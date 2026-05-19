@@ -150,6 +150,112 @@ spec:
       valueFrom: /oab/prod/my-agent/openai-key
 ```
 
+### Example: Multi-Agent Fleet (5 Kiro + 3 CC + 2 Codex)
+
+```
+agents/
+├── kiro-01.yaml ... kiro-05.yaml
+├── cc-01.yaml ... cc-03.yaml
+└── codex-01.yaml ... codex-02.yaml
+```
+
+```yaml
+# agents/kiro-01.yaml
+apiVersion: oab.dev/v1
+kind: OABService
+metadata:
+  name: kiro-01
+  namespace: prod
+spec:
+  replicas: 1
+  capacityProvider: FARGATE_SPOT
+  cpu: 256
+  memory: 512
+  taskDefinition:
+    image: 123456789.dkr.ecr.us-east-1.amazonaws.com/openab:latest
+  bootstrapFrom: s3://oab-backups/agents/kiro-01/latest.tar.gz
+  networking:
+    subnets: [subnet-aaa, subnet-bbb]
+    securityGroups: [sg-oab]
+```
+
+```yaml
+# agents/cc-01.yaml
+apiVersion: oab.dev/v1
+kind: OABService
+metadata:
+  name: cc-01
+  namespace: prod
+spec:
+  replicas: 1
+  capacityProvider: FARGATE_SPOT
+  cpu: 512
+  memory: 1024
+  taskDefinition:
+    image: 123456789.dkr.ecr.us-east-1.amazonaws.com/openab:latest
+  bootstrapFrom: s3://oab-backups/agents/cc-01/latest.tar.gz
+  networking:
+    subnets: [subnet-aaa, subnet-bbb]
+    securityGroups: [sg-oab]
+```
+
+```yaml
+# agents/codex-01.yaml
+apiVersion: oab.dev/v1
+kind: OABService
+metadata:
+  name: codex-01
+  namespace: prod
+spec:
+  replicas: 1
+  capacityProvider: FARGATE_SPOT
+  cpu: 1024
+  memory: 2048
+  taskDefinition:
+    image: 123456789.dkr.ecr.us-east-1.amazonaws.com/openab:latest
+  bootstrapFrom: s3://oab-backups/agents/codex-01/latest.tar.gz
+  networking:
+    subnets: [subnet-aaa, subnet-bbb]
+    securityGroups: [sg-oab]
+```
+
+Deploy all 10 agents:
+
+```bash
+$ oabctl apply -f agents/
+
+✓ kiro-01  applied (FARGATE_SPOT, 256cpu/512mem)
+✓ kiro-02  applied (FARGATE_SPOT, 256cpu/512mem)
+✓ kiro-03  applied (FARGATE_SPOT, 256cpu/512mem)
+✓ kiro-04  applied (FARGATE_SPOT, 256cpu/512mem)
+✓ kiro-05  applied (FARGATE_SPOT, 256cpu/512mem)
+✓ cc-01    applied (FARGATE_SPOT, 512cpu/1024mem)
+✓ cc-02    applied (FARGATE_SPOT, 512cpu/1024mem)
+✓ cc-03    applied (FARGATE_SPOT, 512cpu/1024mem)
+✓ codex-01 applied (FARGATE_SPOT, 1024cpu/2048mem)
+✓ codex-02 applied (FARGATE_SPOT, 1024cpu/2048mem)
+
+10 services reconciled.
+```
+
+```bash
+$ oabctl get oabservice
+
+NAME       NAMESPACE  CPU   MEM   CAPACITY      STATUS   AGE
+kiro-01    prod       256   512   FARGATE_SPOT  Running  2m
+kiro-02    prod       256   512   FARGATE_SPOT  Running  2m
+kiro-03    prod       256   512   FARGATE_SPOT  Running  2m
+kiro-04    prod       256   512   FARGATE_SPOT  Running  2m
+kiro-05    prod       256   512   FARGATE_SPOT  Running  2m
+cc-01      prod       512   1024  FARGATE_SPOT  Running  2m
+cc-02      prod       512   1024  FARGATE_SPOT  Running  2m
+cc-03      prod       512   1024  FARGATE_SPOT  Running  2m
+codex-01   prod       1024  2048  FARGATE_SPOT  Running  1m
+codex-02   prod       1024  2048  FARGATE_SPOT  Running  1m
+```
+
+Each agent's identity (bot token, steering, backend config) lives in its own `bootstrapFrom` archive. The manifest only manages infrastructure.
+
 ---
 
 ## 4. State Store Design (S3-Only)
