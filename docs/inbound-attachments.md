@@ -62,8 +62,8 @@ Binary files (zip, pdf, exe, docx), video, and stickers are **silently skipped**
 | Type | Max Size | Enforced By |
 |------|----------|-------------|
 | Images | 10 MB | Gateway (pre-download Content-Length + post-download bytes) |
-| Audio | 20 MB (gateway) / 25 MB (Feishu) | Gateway |
-| Text files | 512 KB | Gateway |
+| Audio | 20 MB | Gateway |
+| Text files | 20 MB | Gateway (same as store cap) |
 | GIF passthrough | 5 MB | `resize_and_compress()` |
 | Store (defense-in-depth) | 20 MB | `store_media()` |
 

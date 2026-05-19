@@ -175,7 +175,7 @@ The gateway downloads media from Telegram and stores it locally (`~/.openab/medi
 | Type | Handling |
 |------|----------|
 | **Images** | Downloaded, resized (max 1200px), JPEG compressed, stored to filesystem. Agent sees the image. |
-| **Documents** | Text-based files (`.txt`, `.csv`, `.rs`, `.py`, etc.) up to 512KB read as UTF-8 and passed to agent. Binary files silently skipped. |
+| **Documents** | Text-based files (`.txt`, `.csv`, `.rs`, `.py`, etc.) up to 20MB read as UTF-8 and passed to agent. Binary files silently skipped. |
 | **Audio/Voice** | Downloaded and stored. If STT is enabled in Core, automatically transcribed and passed as text. |
 
 **Not supported (inbound):** video, stickers, animations (silently skipped).

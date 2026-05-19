@@ -11,7 +11,7 @@ pub enum MediaKind {
 pub const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
 pub const IMAGE_JPEG_QUALITY: u8 = 75;
 pub const IMAGE_MAX_DOWNLOAD: u64 = 10 * 1024 * 1024; // 10 MB
-pub const FILE_MAX_DOWNLOAD: u64 = 512 * 1024; // 512 KB
+pub const FILE_MAX_DOWNLOAD: u64 = 20 * 1024 * 1024; // 20 MB (same as store cap)
 pub const AUDIO_MAX_DOWNLOAD: u64 = 20 * 1024 * 1024; // 20 MB
 pub const GIF_MAX_SIZE: usize = 5 * 1024 * 1024; // 5 MB — prevents base64 bloat exceeding LLM payload limits
 
