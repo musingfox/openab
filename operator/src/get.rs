@@ -50,8 +50,8 @@ pub async fn run(
 
     // Describe in batches of 10
     println!(
-        "{:<12} {:<10} {:<5} {:<6} {:<14} {:<6} {}",
-        "NAME", "NAMESPACE", "CPU", "MEM", "CAPACITY", "TASKS", "STATUS"
+        "{:<12} {:<10} {:<5} {:<6} {:<14} {:<6} STATUS",
+        "NAME", "NAMESPACE", "CPU", "MEM", "CAPACITY", "TASKS"
     );
 
     for chunk in services.chunks(10) {
