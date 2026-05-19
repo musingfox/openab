@@ -1449,15 +1449,15 @@ pub async fn download_feishu_image(
             return None;
         }
     };
-    use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD.encode(&compressed);
+    let path = crate::store::store_media(&compressed).await?;
     let ext = if mime == "image/gif" { "gif" } else { "jpg" };
     Some(crate::schema::Attachment {
         attachment_type: "image".into(),
         filename: format!("{}.{}", image_key, ext),
         mime_type: mime,
-        data,
+        data: String::new(),
         size: compressed.len() as u64,
+        path: Some(path),
     })
 }
 
@@ -1511,15 +1511,14 @@ pub async fn download_feishu_file(
         tracing::warn!(file_name, size = bytes.len(), "feishu file exceeds 512KB limit");
         return None;
     }
-    let text = String::from_utf8_lossy(&bytes);
-    use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let path = crate::store::store_media(&bytes).await?;
     Some(crate::schema::Attachment {
         attachment_type: "text_file".into(),
         filename: file_name.to_string(),
         mime_type: "text/plain".into(),
-        data,
+        data: String::new(),
         size: bytes.len() as u64,
+        path: Some(path),
     })
 }
 
@@ -1569,14 +1568,14 @@ pub async fn download_feishu_audio(
         return None;
     }
     tracing::debug!(file_key, size = bytes.len(), "feishu audio downloaded");
-    use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let path = crate::store::store_media(&bytes).await?;
     Some(crate::schema::Attachment {
         attachment_type: "audio".into(),
         filename: format!("{}.ogg", file_key),
         mime_type: content_type,
-        data,
+        data: String::new(),
         size: bytes.len() as u64,
+        path: Some(path),
     })
 }
 

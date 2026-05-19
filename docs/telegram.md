@@ -168,6 +168,19 @@ explain VPC peering              ← ignored in groups
 
 DMs and replies within forum topics always trigger the agent (no @mention needed).
 
+### File Attachments (Inbound)
+
+The gateway downloads media from Telegram and stores it locally (`~/.openab/media/inbound/<uuid>`). Core reads directly from disk — no base64 encoding overhead.
+
+| Type | Handling |
+|------|----------|
+| **Images** | Downloaded, resized (max 1200px), JPEG compressed, stored to filesystem. Agent sees the image. |
+| **Documents** | Text-based files (`.txt`, `.csv`, `.rs`, `.py`, etc.) up to 20MB read as UTF-8 and passed to agent. Binary files silently skipped. |
+| **Audio/Voice** | Downloaded and stored. If STT is enabled in Core, automatically transcribed and passed as text. |
+
+**Not supported (inbound):** video, stickers, animations (silently skipped).
+**Not supported (outbound):** bot cannot send images/files back to the user yet.
+
 ### Emoji reactions
 
 The bot shows status reactions on your message as the agent works:

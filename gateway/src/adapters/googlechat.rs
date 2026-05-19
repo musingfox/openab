@@ -1257,14 +1257,14 @@ pub async fn download_googlechat_image(
             return None;
         }
     };
-    use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD.encode(&compressed);
+    let path = crate::store::store_media(&compressed).await?;
     Some(crate::schema::Attachment {
         attachment_type: "image".into(),
         filename: content_name.to_string(),
         mime_type: mime,
-        data,
+        data: String::new(),
         size: compressed.len() as u64,
+        path: Some(path),
     })
 }
 
@@ -1309,18 +1309,18 @@ pub async fn download_googlechat_file(
         warn!(content_name, size = bytes.len(), limit = max_size, "googlechat file exceeds size limit");
         return None;
     }
-    use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let path = crate::store::store_media(&bytes).await?;
     Some(crate::schema::Attachment {
         attachment_type: "text_file".into(),
         filename: content_name.to_string(),
         mime_type: "text/plain".into(),
-        data,
+        data: String::new(),
         size: bytes.len() as u64,
+        path: Some(path),
     })
 }
 
-/// Download an audio attachment as-is (no resize/transcode) → base64.
+/// Download an audio attachment as-is (no resize/transcode) → filesystem store.
 /// Core's STT pipeline (when available) consumes this as `audio` attachment_type.
 pub async fn download_googlechat_audio(
     client: &reqwest::Client,
@@ -1355,14 +1355,14 @@ pub async fn download_googlechat_audio(
         warn!(content_name, size = bytes.len(), "googlechat audio exceeds 25MB limit");
         return None;
     }
-    use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let path = crate::store::store_media(&bytes).await?;
     Some(crate::schema::Attachment {
         attachment_type: "audio".into(),
         filename: content_name.to_string(),
         mime_type: content_type.to_string(),
-        data,
+        data: String::new(),
         size: bytes.len() as u64,
+        path: Some(path),
     })
 }
 
@@ -2315,7 +2315,7 @@ mod tests {
         assert_eq!(att.attachment_type, "image");
         assert_eq!(att.filename, "photo.png");
         assert_eq!(att.mime_type, "image/jpeg"); // resized PNG → JPEG
-        assert!(!att.data.is_empty());
+        assert!(att.path.is_some()); // stored to filesystem
         assert!(att.size > 0);
     }
 

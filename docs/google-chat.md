@@ -143,7 +143,7 @@ working_dir = "/home/agent"
   - Inline code, fenced code blocks: pass through unchanged
   - Tables and other unsupported syntax pass through as-is
 - **Streaming (edit_message)** — when OAB streaming is enabled, the bot edits its initial reply in-place as tokens arrive (typewriter effect)
-- **Inbound attachments** — image, text file, and audio attachments are downloaded via Google Chat Media API and forwarded to the agent as base64 (PR #731 pattern):
+- **Inbound attachments** — image, text file, and audio attachments are downloaded via Google Chat Media API and stored to `~/.openab/media/inbound/<uuid>` (colocate filesystem store):
   - Images: resized to ≤1200px JPEG (q75); GIFs preserved. Max 10 MB.
   - Text files: only known text extensions (`.txt`, `.md`, `.json`, `.py`, `.rs`, etc.). Max 512 KB.
   - Audio: forwarded as-is for STT processing by core. Max 25 MB.

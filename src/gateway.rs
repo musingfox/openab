@@ -64,9 +64,13 @@ struct GwAttachment {
     attachment_type: String,
     filename: String,
     mime_type: String,
+    #[serde(default)]
     data: String,
     #[allow(dead_code)]
     size: u64,
+    /// Colocate mode: local file path (preferred over base64 `data` when present)
+    #[serde(default)]
+    path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -705,16 +709,36 @@ pub async fn run_gateway_adapter(
                                     // Convert gateway attachments to ContentBlocks
                                     let mut extra_blocks = Vec::new();
                                     for att in &event.content.attachments {
+                                        // Read bytes: prefer file path (colocate), fallback to base64
+                                        let bytes_result = if let Some(ref path) = att.path {
+                                            tokio::fs::read(path).await.map_err(|e| e.to_string())
+                                        } else if !att.data.is_empty() {
+                                            use base64::Engine;
+                                            base64::engine::general_purpose::STANDARD
+                                                .decode(&att.data)
+                                                .map_err(|e| e.to_string())
+                                        } else {
+                                            Err("no path or data".into())
+                                        };
+
                                         match att.attachment_type.as_str() {
                                             "image" => {
-                                                extra_blocks.push(ContentBlock::Image {
-                                                    media_type: att.mime_type.clone(),
-                                                    data: att.data.clone(),
-                                                });
+                                                match bytes_result {
+                                                    Ok(bytes) => {
+                                                        use base64::Engine;
+                                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                                        extra_blocks.push(ContentBlock::Image {
+                                                            media_type: att.mime_type.clone(),
+                                                            data: b64,
+                                                        });
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(filename = %att.filename, error = %e, "gateway image read failed");
+                                                    }
+                                                }
                                             }
                                             "text_file" => {
-                                                use base64::Engine;
-                                                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&att.data) {
+                                                if let Ok(bytes) = bytes_result {
                                                     let text = String::from_utf8_lossy(&bytes);
                                                     extra_blocks.push(ContentBlock::Text {
                                                         text: format!("```{}\n{}\n```", att.filename, text),
@@ -722,8 +746,7 @@ pub async fn run_gateway_adapter(
                                                 }
                                             }
                                             "audio" if stt_config.enabled => {
-                                                use base64::Engine;
-                                                match base64::engine::general_purpose::STANDARD.decode(&att.data) {
+                                                match bytes_result {
                                                     Ok(bytes) => {
                                                         match crate::stt::transcribe(
                                                             &crate::media::HTTP_CLIENT,
@@ -749,10 +772,10 @@ pub async fn run_gateway_adapter(
                                                         }
                                                     }
                                                     Err(e) => {
-                                                        tracing::warn!(filename = %att.filename, error = %e, "gateway audio base64 decode failed");
+                                                        tracing::warn!(filename = %att.filename, error = %e, "gateway audio read failed");
                                                         extra_blocks.push(ContentBlock::Text {
                                                             text: format!(
-                                                                "[Voice message — decode failed for {}]",
+                                                                "[Voice message — read failed for {}]",
                                                                 att.filename
                                                             ),
                                                         });
