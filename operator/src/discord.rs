@@ -6,6 +6,7 @@ const BOT_PERMISSIONS: u64 = 274878221312; // Send Messages, Read Messages, etc.
 
 #[derive(Debug)]
 pub struct ProvisionedBot {
+    #[allow(dead_code)]
     pub application_id: String,
     pub bot_token: String,
     pub invite_url: String,
