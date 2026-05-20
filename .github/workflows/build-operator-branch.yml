@@ -1,0 +1,36 @@
+name: Build Operator (Branch)
+
+on:
+  push:
+    branches:
+      - "operator/**"
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: openab-runner-macos
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build (aarch64-apple-darwin)
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/openab dist/
+          cd dist && tar czf ../openab-macos-arm64.tar.gz *
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openab-macos-arm64
+          path: openab-macos-arm64.tar.gz
+          retention-days: 7
