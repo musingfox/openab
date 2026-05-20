@@ -13,11 +13,16 @@
 # Optional:
 #   webhookDomain          -- your tunnel domain (for setWebhook reminder in NOTES.txt)
 
-# -- (required) Telegram bot token
+# -- (required unless existingSecret is set) Telegram bot token
 telegramBotToken: ""
 
-# -- (required) Cloudflare Tunnel token
+# -- (required unless existingSecret is set) Cloudflare Tunnel token
 cloudflareTunnelToken: ""
+
+# -- Use a pre-existing K8s Secret instead of creating one from --set values.
+# The Secret must contain keys: telegram-bot-token, cloudflare-tunnel-token
+# See README.md for credential management options.
+existingSecret: ""
 
 # -- Tunnel domain (shown in post-install notes for setWebhook)
 webhookDomain: ""

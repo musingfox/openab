@@ -30,3 +30,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- define "openab-telegram.gatewayImage" -}}
 {{- printf "%s:%s" .Values.gateway.image .Values.gateway.tag -}}
 {{- end }}
+
+{{- define "openab-telegram.secretName" -}}
+{{- .Values.existingSecret | default (include "openab-telegram.fullname" .) -}}
+{{- end }}

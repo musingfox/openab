@@ -77,7 +77,7 @@ spec:
             - name: TELEGRAM_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "openab-telegram.fullname" . }}
+                  name: {{ include "openab-telegram.secretName" . }}
                   key: telegram-bot-token
           volumeMounts:
             - name: tmp
@@ -103,7 +103,7 @@ spec:
             - name: TUNNEL_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "openab-telegram.fullname" . }}
+                  name: {{ include "openab-telegram.secretName" . }}
                   key: cloudflare-tunnel-token
           volumeMounts:
             - name: tmp
