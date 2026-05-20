@@ -51,7 +51,7 @@ cloudflared:
 
 # -- Agent configuration
 agent:
-  command: openab
+  command: kiro-cli
   args:
     - acp
     - --trust-all-tools
