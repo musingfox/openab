@@ -46,11 +46,11 @@ gateway:
 # -- Cloudflared image
 cloudflared:
   image: cloudflare/cloudflared
-  tag: latest
+  tag: "2026.5.0"
 
 # -- Agent configuration
 agent:
-  command: kiro-cli
+  command: openab
   args:
     - acp
     - --trust-all-tools

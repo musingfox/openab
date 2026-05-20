@@ -6,7 +6,7 @@ Pod: {{ include "openab-telegram.fullname" . }} (3 containers: openab, gateway, 
 
 📡 Set the Telegram webhook:
 
-  curl "https://api.telegram.org/bot$(kubectl get secret {{ include "openab-telegram.fullname" . }} -n {{ .Release.Namespace }} -o jsonpath='{.data.telegram-bot-token}' | base64 -d)/setWebhook" \
+  curl "https://api.telegram.org/bot$(kubectl get secret {{ .Values.existingSecret | default (include "openab-telegram.fullname" .) }} -n {{ .Release.Namespace }} -o jsonpath='{.data.telegram-bot-token}' | base64 -d)/setWebhook" \
     -d "url=https://{{ .Values.webhookDomain }}/webhook/telegram"
 
 {{- else }}
