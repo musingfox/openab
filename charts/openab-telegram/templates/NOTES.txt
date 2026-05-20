@@ -2,6 +2,14 @@
 
 Pod: {{ include "openab-telegram.fullname" . }} (3 containers: openab, gateway, cloudflared)
 
+🌐 Configure Cloudflare Tunnel ingress (required — without this, webhook returns 503):
+
+  https://one.dash.cloudflare.com/ → Networks → Tunnels → your tunnel → Public Hostname → Add:
+
+    Hostname: {{ .Values.webhookDomain | default "bot.example.com" }}
+    Type:     HTTP
+    URL:      localhost:8080
+
 {{- if .Values.webhookDomain }}
 
 📡 Set the Telegram webhook:
