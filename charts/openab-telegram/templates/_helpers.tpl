@@ -18,11 +18,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- define "openab-telegram.agentImage" -}}
 {{- $tag := .Values.image.tag -}}
 {{- if not $tag -}}
-  {{- if eq .Values.channel "beta" -}}
-    {{- $tag = .Chart.AppVersion -}}
-  {{- else -}}
-    {{- $tag = regexReplaceAll "-beta\\..*" .Chart.AppVersion "" -}}
-  {{- end -}}
+  {{- $tag = .Values.channel | default "stable" -}}
 {{- end -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end }}
