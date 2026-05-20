@@ -28,8 +28,9 @@ existingSecret: ""
 webhookDomain: ""
 
 # -- Release channel: "stable" or "beta"
-# beta  = latest beta of core (appVersion as-is), latest stable gateway
-# stable = latest stable of both (strips -beta.* from appVersion)
+# Resolves to the floating image tag of the same name.
+# stable = ghcr.io/openabdev/openab:stable (latest stable release)
+# beta   = ghcr.io/openabdev/openab:beta (latest pre-release)
 channel: stable
 
 # -- OAB agent image

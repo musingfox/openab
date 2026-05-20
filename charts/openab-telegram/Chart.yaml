@@ -3,4 +3,4 @@ name: openab-telegram
 description: OpenAB + Telegram — single-pod deployment with gateway and Cloudflare Tunnel sidecar.
 type: application
 version: 0.1.0
-appVersion: "0.8.3-beta.12"
+appVersion: "0.8.3"
