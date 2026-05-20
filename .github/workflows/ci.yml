@@ -5,9 +5,7 @@ on:
     paths:
       - "src/**"
       - "gateway/**"
-      - "gateway/Cargo.lock"
       - "operator/**"
-      - "operator/Cargo.lock"
       - "Cargo.toml"
       - "Cargo.lock"
       - "Dockerfile*"
@@ -16,75 +14,86 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      core: ${{ steps.filter.outputs.core }}
+      gateway: ${{ steps.filter.outputs.gateway }}
+      operator: ${{ steps.filter.outputs.operator }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            core:
+              - 'src/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            gateway:
+              - 'gateway/**'
+            operator:
+              - 'operator/**'
+
   check:
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-
       - uses: Swatinem/rust-cache@v2
-
       - name: cargo check
         run: cargo check
-
       - name: cargo clippy
         run: cargo clippy -- -D warnings
-
       - name: cargo test
         run: cargo test
 
   gateway:
+    needs: changes
+    if: needs.changes.outputs.gateway == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: gateway
     steps:
       - uses: actions/checkout@v6
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: gateway
-
       - name: cargo check
         run: cargo check
-
       - name: cargo clippy
         run: cargo clippy -- -D warnings
-
       - name: cargo test
         run: cargo test
 
   operator:
+    needs: changes
+    if: needs.changes.outputs.operator == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: operator
     steps:
       - uses: actions/checkout@v6
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: operator
-
       - name: cargo check
         run: cargo check
-
       - name: cargo clippy
         run: cargo clippy -- -D warnings
-
       - name: cargo test
         run: cargo test
-
       - name: cargo build
         run: cargo build --release
