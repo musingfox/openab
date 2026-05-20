@@ -10,17 +10,21 @@ The tunnel is running but has no ingress rules yet — webhook will return 503 u
 
 Option A — Via Cloudflare API (AI-friendly):
 
-  Extract your account ID and tunnel ID from the tunnel token:
-    echo '<tunnel-token>' | base64 -d | jq '{account: .a, tunnel: .t}'
+  Extract credentials from the K8s secret:
+    ACCOUNT_ID=$(kubectl get secret {{ .Values.existingSecret | default (include "openab-telegram.fullname" .) }} -n {{ .Release.Namespace }} -o jsonpath='{.data.cloudflare-tunnel-token}' | base64 -d | base64 -d | jq -r .a)
+    TUNNEL_ID=$(kubectl get secret {{ .Values.existingSecret | default (include "openab-telegram.fullname" .) }} -n {{ .Release.Namespace }} -o jsonpath='{.data.cloudflare-tunnel-token}' | base64 -d | base64 -d | jq -r .t)
+    CF_API_TOKEN=$(kubectl get secret {{ .Values.existingSecret | default (include "openab-telegram.fullname" .) }} -n {{ .Release.Namespace }} -o jsonpath='{.data.cloudflare-api-token}' | base64 -d)
 
   Then configure ingress:
-    curl -X PUT "https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/cfd_tunnel/<TUNNEL_ID>/configurations" \
-      -H "Authorization: Bearer <CLOUDFLARE_API_TOKEN>" \
+    curl -X PUT "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/configurations" \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" \
       -H "Content-Type: application/json" \
       -d '{"config":{"ingress":[{"hostname":"{{ .Values.webhookDomain | default "bot.example.com" }}","service":"http://localhost:8080"},{"service":"http_status:404"}]}}'
 
   After configuring, restart the pod to pick up the new ingress:
     kubectl rollout restart deployment/{{ include "openab-telegram.fullname" . }} -n {{ .Release.Namespace }}
+
+  Note: cloudflare-api-token is optional in the Secret. If not present, use Option B.
 
 Option B — Via Cloudflare Dashboard:
   https://one.dash.cloudflare.com/ → Networks → Tunnels → your tunnel → Public Hostname → Add:

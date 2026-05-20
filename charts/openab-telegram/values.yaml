@@ -19,6 +19,11 @@ telegramBotToken: ""
 # -- (required unless existingSecret is set) Cloudflare Tunnel token
 cloudflareTunnelToken: ""
 
+# -- (optional) Cloudflare API token for automated ingress configuration.
+# Required permissions: Account:Cloudflare Tunnel:Edit
+# If set, post-install NOTES provide a ready-to-run curl command for AI agents.
+cloudflareApiToken: ""
+
 # -- Use a pre-existing K8s Secret instead of creating one from --set values.
 # The Secret must contain keys: telegram-bot-token, cloudflare-tunnel-token
 # See README.md for credential management options.
