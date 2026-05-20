@@ -16,11 +16,21 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{- define "openab-telegram.agentImage" -}}
-{{- $tag := .Values.image.tag | default .Chart.AppVersion -}}
+{{- $tag := .Values.image.tag -}}
+{{- if not $tag -}}
+  {{- if eq .Values.channel "beta" -}}
+    {{- $tag = .Chart.AppVersion -}}
+  {{- else -}}
+    {{- $tag = regexReplaceAll "-beta\\..*" .Chart.AppVersion "" -}}
+  {{- end -}}
+{{- end -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end }}
 
 {{- define "openab-telegram.gatewayImage" -}}
-{{- $tag := .Values.gateway.tag | default .Chart.AppVersion -}}
+{{- $tag := .Values.gateway.tag -}}
+{{- if not $tag -}}
+  {{- $tag = regexReplaceAll "-beta\\..*" .Chart.AppVersion "" -}}
+{{- end -}}
 {{- printf "%s:%s" .Values.gateway.image $tag -}}
 {{- end }}

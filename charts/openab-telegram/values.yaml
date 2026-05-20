@@ -22,6 +22,11 @@ cloudflareTunnelToken: ""
 # -- Tunnel domain (shown in post-install notes for setWebhook)
 webhookDomain: ""
 
+# -- Release channel: "stable" or "beta"
+# beta  = latest beta of core (appVersion as-is), latest stable gateway
+# stable = latest stable of both (strips -beta.* from appVersion)
+channel: stable
+
 # -- OAB agent image
 image:
   repository: ghcr.io/openabdev/openab
