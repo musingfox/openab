@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - "operator/**"
+    paths:
+      - "operator/**"
   workflow_dispatch:
 
 jobs:
@@ -11,26 +13,30 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64]
     permissions:
       contents: read
+    defaults:
+      run:
+        working-directory: operator
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust
+        working-directory: .
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Build (aarch64-apple-darwin)
+      - name: Build oabctl (aarch64-apple-darwin)
         run: cargo build --release
 
       - name: Package
         run: |
           mkdir -p dist
-          cp target/release/openab dist/
-          cd dist && tar czf ../openab-macos-arm64.tar.gz *
+          cp target/release/oabctl dist/
+          cd dist && tar czf ../oabctl-macos-arm64.tar.gz *
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: openab-macos-arm64
-          path: openab-macos-arm64.tar.gz
+          name: oabctl-macos-arm64
+          path: operator/oabctl-macos-arm64.tar.gz
           retention-days: 7
