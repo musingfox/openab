@@ -74,12 +74,18 @@ spec:
               containerPort: 8080
               protocol: TCP
           env:
+            - name: HOME
+              value: {{ .Values.agent.workingDir | default "/home/agent" }}
             - name: TELEGRAM_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "openab-telegram.secretName" . }}
                   key: telegram-bot-token
           volumeMounts:
+            {{- if .Values.persistence.enabled }}
+            - name: data
+              mountPath: {{ .Values.agent.workingDir | default "/home/agent" }}
+            {{- end }}
             - name: tmp
               mountPath: /tmp
 
