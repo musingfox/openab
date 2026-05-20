@@ -3,6 +3,8 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: {{ include "openab-telegram.fullname" . }}
+  annotations:
+    "helm.sh/resource-policy": keep
   labels:
     {{- include "openab-telegram.labels" . | nindent 4 }}
 spec:
