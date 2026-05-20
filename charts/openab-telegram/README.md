@@ -40,12 +40,50 @@ OpenAB + Telegram in a single pod — OAB agent, gateway, and Cloudflare Tunnel 
                  └────────────────────────┘
 ```
 
+## Prerequisites
+
+Run these on your **local machine** (or CI) — one-time setup before `helm install`.
+
+### 1. Create a Telegram bot
+
+Talk to [@BotFather](https://t.me/BotFather) and save the bot token.
+
+### 2. Create a Cloudflare Tunnel (CLI — no dashboard needed)
+
+```bash
+# Install cloudflared: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
+
+# Login to Cloudflare (opens browser once)
+cloudflared tunnel login
+
+# Create the tunnel
+cloudflared tunnel create my-telegram-bot
+
+# Route your domain to the tunnel (creates a DNS CNAME automatically)
+cloudflared tunnel route dns my-telegram-bot bot.example.com
+
+# Get the tunnel token for helm
+cloudflared tunnel token my-telegram-bot
+# → eyJ...  (pass this as cloudflareTunnelToken)
+```
+
+### 3. Configure tunnel ingress (Cloudflare dashboard or API)
+
+In the Cloudflare Zero Trust dashboard → Tunnels → your tunnel → Public Hostname:
+
+| Subdomain | Domain | Service |
+|-----------|--------|---------|
+| bot | example.com | `http://localhost:8080` |
+
+This tells Cloudflare to forward incoming HTTPS traffic to the gateway container inside the pod.
+
 ## Quick Start
 
 ```bash
 helm install my-bot ./charts/openab-telegram \
-  --set telegramBotToken="123:ABC" \
-  --set cloudflareTunnelToken="eyJ..." \
+  --set telegramBotToken="<token-from-botfather>" \
+  --set cloudflareTunnelToken="$(cloudflared tunnel token my-telegram-bot)" \
+  --set webhookDomain=bot.example.com \
   --namespace openab --create-namespace
 ```
 
