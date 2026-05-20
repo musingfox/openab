@@ -167,6 +167,7 @@ jobs:
           tags: |
             type=sha,prefix=
             type=semver,pattern={{version}},value=${{ needs.resolve-tag.outputs.tag }}
+            type=raw,value=beta
 
       - name: Create manifest list
         working-directory: /tmp/digests
@@ -237,11 +238,12 @@ jobs:
           CHART_VERSION="${{ needs.resolve-tag.outputs.chart_version }}"
           MAJOR_MINOR="${CHART_VERSION%.*}"
 
-          echo "Promoting ${IMAGE}:${PRERELEASE_VERSION} → ${CHART_VERSION}, ${MAJOR_MINOR}, latest"
+          echo "Promoting ${IMAGE}:${PRERELEASE_VERSION} → ${CHART_VERSION}, ${MAJOR_MINOR}, latest, stable"
           docker buildx imagetools create \
             -t "${IMAGE}:${CHART_VERSION}" \
             -t "${IMAGE}:${MAJOR_MINOR}" \
             -t "${IMAGE}:latest" \
+            -t "${IMAGE}:stable" \
             "${IMAGE}:${PRERELEASE_VERSION}"
 
   # ── Chart release (runs after either path) ───────────────────
