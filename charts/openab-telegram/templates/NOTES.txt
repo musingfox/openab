@@ -1,0 +1,29 @@
+🎉 OpenAB Telegram bot deployed!
+
+Pod: {{ include "openab-telegram.fullname" . }} (3 containers: openab, gateway, cloudflared)
+
+{{- if .Values.webhookDomain }}
+
+📡 Set the Telegram webhook:
+
+  curl "https://api.telegram.org/bot$(kubectl get secret {{ include "openab-telegram.fullname" . }} -n {{ .Release.Namespace }} -o jsonpath='{.data.telegram-bot-token}' | base64 -d)/setWebhook" \
+    -d "url=https://{{ .Values.webhookDomain }}/webhook/telegram"
+
+{{- else }}
+
+📡 Set the Telegram webhook (replace YOUR_DOMAIN with your Cloudflare Tunnel hostname):
+
+  curl "https://api.telegram.org/bot<TOKEN>/setWebhook" \
+    -d "url=https://YOUR_DOMAIN/webhook/telegram"
+
+  Tip: pass --set webhookDomain=bot.example.com to get a ready-to-run command here.
+
+{{- end }}
+
+🔐 Authenticate the agent:
+
+  kubectl exec -it deployment/{{ include "openab-telegram.fullname" . }} -n {{ .Release.Namespace }} -c openab -- {{ .Values.agent.command }} login --use-device-flow
+
+  Then restart to pick up credentials:
+
+  kubectl rollout restart deployment/{{ include "openab-telegram.fullname" . }} -n {{ .Release.Namespace }}

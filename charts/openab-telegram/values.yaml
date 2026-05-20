@@ -1,0 +1,93 @@
+# openab-telegram values
+#
+# Install:
+#   helm install my-bot ./charts/openab-telegram \
+#     --set telegramBotToken="123:ABC" \
+#     --set cloudflareTunnelToken="eyJ..." \
+#     --namespace openab --create-namespace
+#
+# Required:
+#   telegramBotToken       -- Telegram bot token from @BotFather
+#   cloudflareTunnelToken   -- Cloudflare Tunnel token
+#
+# Optional:
+#   webhookDomain          -- your tunnel domain (for setWebhook reminder in NOTES.txt)
+
+# -- (required) Telegram bot token
+telegramBotToken: ""
+
+# -- (required) Cloudflare Tunnel token
+cloudflareTunnelToken: ""
+
+# -- Tunnel domain (shown in post-install notes for setWebhook)
+webhookDomain: ""
+
+# -- OAB agent image
+image:
+  repository: ghcr.io/openabdev/openab
+  tag: ""  # defaults to appVersion
+  pullPolicy: IfNotPresent
+
+# -- Gateway image
+gateway:
+  image: ghcr.io/openabdev/openab-gateway
+  tag: ""  # defaults to appVersion
+
+# -- Cloudflared image
+cloudflared:
+  image: cloudflare/cloudflared
+  tag: latest
+
+# -- Agent configuration
+agent:
+  command: kiro-cli
+  args:
+    - acp
+    - --trust-all-tools
+  workingDir: /home/agent
+  env: {}
+  secretEnv: []
+  # -- Pool settings
+  pool:
+    maxSessions: 10
+    sessionTtlHours: 24
+  # -- Reaction settings
+  reactions:
+    enabled: true
+    removeAfterReply: false
+
+# -- Gateway platform settings
+platform:
+  # allowAllUsers: true = any Telegram user can talk to the bot
+  allowAllUsers: true
+  allowedUsers: []
+  allowAllChannels: true
+  allowedChannels: []
+
+# -- Persistence for agent working directory
+persistence:
+  enabled: true
+  existingClaim: ""
+  storageClass: ""
+  size: 1Gi
+
+# -- Pod-level settings
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
