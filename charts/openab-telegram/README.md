@@ -42,40 +42,61 @@ OpenAB + Telegram in a single pod — OAB agent, gateway, and Cloudflare Tunnel 
 
 ## Prerequisites
 
-Run these on your **local machine** (or CI) — one-time setup before `helm install`.
+Run these on your **local machine** (or CI) — one-time setup, no browser required.
 
 ### 1. Create a Telegram bot
 
-Talk to [@BotFather](https://t.me/BotFather) and save the bot token.
+```bash
+# Use the Telegram Bot API directly (no app needed):
+curl "https://api.telegram.org/bot<YOUR_MAIN_BOT_TOKEN>/sendMessage" \
+  -d "chat_id=@BotFather" -d "text=/newbot"
 
-### 2. Create a Cloudflare Tunnel (CLI — no dashboard needed)
+# Or message @BotFather in Telegram and save the token it returns.
+# The token looks like: 123456789:ABCdefGHIjklMNOpqrsTUVwxyz
+```
+
+### 2. Create a Cloudflare Tunnel (fully headless)
 
 ```bash
-# Install cloudflared: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
+# Install cloudflared
+# macOS: brew install cloudflared
+# Linux: curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
 
-# Login to Cloudflare (opens browser once)
-cloudflared tunnel login
+# Authenticate with API token (no browser — create token at https://dash.cloudflare.com/profile/api-tokens or via Terraform)
+# Required permissions: Account:Cloudflare Tunnel:Edit, Zone:DNS:Edit
+export CLOUDFLARE_API_TOKEN="your-api-token"
+
+# Or use service token auth:
+cloudflared tunnel login  # only option if no API token; opens browser once
 
 # Create the tunnel
 cloudflared tunnel create my-telegram-bot
 
-# Route your domain to the tunnel (creates a DNS CNAME automatically)
+# Route DNS (creates CNAME: bot.example.com → <tunnel-id>.cfargotunnel.com)
 cloudflared tunnel route dns my-telegram-bot bot.example.com
 
-# Get the tunnel token for helm
+# Configure ingress (what the tunnel serves)
+mkdir -p ~/.cloudflared
+cat > ~/.cloudflared/config.yml <<EOF
+tunnel: $(cloudflared tunnel info my-telegram-bot -o json | jq -r '.id')
+ingress:
+  - hostname: bot.example.com
+    service: http://localhost:8080
+  - service: http_status:404
+EOF
+
+# Get the tunnel token for helm (encapsulates credentials for remote mode)
 cloudflared tunnel token my-telegram-bot
 # → eyJ...  (pass this as cloudflareTunnelToken)
 ```
 
-### 3. Configure tunnel ingress (Cloudflare dashboard or API)
+### 3. Set the Telegram webhook
 
-In the Cloudflare Zero Trust dashboard → Tunnels → your tunnel → Public Hostname:
-
-| Subdomain | Domain | Service |
-|-----------|--------|---------|
-| bot | example.com | `http://localhost:8080` |
-
-This tells Cloudflare to forward incoming HTTPS traffic to the gateway container inside the pod.
+```bash
+export BOT_TOKEN="123456789:ABCdef..."
+curl -s "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
+  -d "url=https://bot.example.com/webhook/telegram"
+```
 
 ## Quick Start
 
@@ -139,17 +160,12 @@ Credentials flow from AWS → K8s Secret without touching local disk or shell va
 
 ## Post-Install
 
-1. Set the Telegram webhook:
-   ```bash
-   curl "https://api.telegram.org/bot<TOKEN>/setWebhook" \
-     -d "url=https://YOUR_TUNNEL_DOMAIN/webhook/telegram"
-   ```
+Authenticate the agent (device flow — outputs a URL and code to paste, no browser on the server needed):
 
-2. Authenticate the agent:
-   ```bash
-   kubectl exec -it deployment/my-bot -n openab -c openab -- kiro-cli login --use-device-flow
-   kubectl rollout restart deployment/my-bot -n openab
-   ```
+```bash
+kubectl exec -it deployment/my-bot -n openab -c openab -- openab login --use-device-flow
+kubectl rollout restart deployment/my-bot -n openab
+```
 
 ## Values
 
