@@ -153,7 +153,7 @@ fn token_path(provider: &ProviderConfig) -> PathBuf {
     let dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".openab-auth-proxy")
-        .join(&provider.name.to_lowercase().replace(' ', "-"));
+        .join(provider.name.to_lowercase().replace(' ', "-"));
     std::fs::create_dir_all(&dir).ok();
     dir.join("tokens.json")
 }
