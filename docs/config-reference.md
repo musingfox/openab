@@ -95,10 +95,10 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `command` | string | *required* | Agent binary (e.g. `kiro-cli`, `claude`, `codex`, `gemini`, `copilot`, `opencode`, `cursor-agent`). |
+| `command` | string | *required* | Agent binary (e.g. `kiro-cli`, `claude-agent-acp`, `codex`, `gemini`, `copilot`, `opencode`, `cursor-agent`). |
 | `args` | string[] | `[]` | CLI arguments passed to the agent. |
 | `working_dir` | string | `"/tmp"` | Working directory for the agent process. |
-| `env` | map | `{}` | Extra environment variables (e.g. `{ ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}" }`). |
+| `env` | map | `{}` | Extra environment variables (e.g. `{ OPENAI_API_KEY = "${OPENAI_API_KEY}" }`). |
 | `inherit_env` | string[] | `[]` | Env var names to inherit from the OAB process (e.g. vars injected via K8s `envFrom`). Keys in `env` take precedence. |
 
 > **Default inherited vars:** After `env_clear()`, the agent always receives `HOME`, `PATH`, and `USER` (on Windows: `USERPROFILE`, `USERNAME`, `PATH`, `SystemRoot`, `SystemDrive`). Use `inherit_env` to pass additional vars beyond this baseline.
@@ -114,10 +114,11 @@ working_dir = "/home/agent"
 
 # Claude Code
 [agent]
-command = "claude"
-args = ["--acp"]
+command = "claude-agent-acp"
+args = []
 working_dir = "/home/node"
-env = { ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}" }
+# Auth: kubectl exec -it deploy/openab-claude -- claude auth login
+# Credentials persist in HOME PVC across restarts. See docs/claude-code.md.
 
 # Codex
 [agent]
