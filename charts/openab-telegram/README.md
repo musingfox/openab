@@ -160,12 +160,64 @@ Credentials flow from AWS → K8s Secret without touching local disk or shell va
 
 ## Post-Install
 
-Authenticate the agent (device flow — outputs a URL and code to paste, no browser on the server needed):
+### Configure tunnel ingress (required for remote mode)
+
+The chart runs cloudflared in **remote mode** (token-based). Ingress rules must be configured via the Cloudflare API or dashboard — local config files are ignored.
+
+**Option A — API (recommended for AI-assisted installs):**
+
+Add `cloudflare-api-token` to your K8s Secret, then the helm NOTES provide a ready-to-run command. The AI can extract all credentials from the secret and configure ingress automatically.
 
 ```bash
-kubectl exec -it deployment/my-bot -n openab -c openab -- openab login --use-device-flow
+# Add API token to secret (required permissions: Account:Cloudflare Tunnel:Edit)
+kubectl create secret generic my-bot-creds -n openab \
+  --from-literal=telegram-bot-token="123:ABC" \
+  --from-literal=cloudflare-tunnel-token="eyJ..." \
+  --from-literal=cloudflare-api-token="cfut_..."
+
+# Extract IDs and configure
+ACCOUNT_ID=$(kubectl get secret my-bot-creds -n openab -o jsonpath='{.data.cloudflare-tunnel-token}' | base64 -d | base64 -d | jq -r .a)
+TUNNEL_ID=$(kubectl get secret my-bot-creds -n openab -o jsonpath='{.data.cloudflare-tunnel-token}' | base64 -d | base64 -d | jq -r .t)
+CF_API_TOKEN=$(kubectl get secret my-bot-creds -n openab -o jsonpath='{.data.cloudflare-api-token}' | base64 -d)
+
+curl -X PUT "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/configurations" \
+  -H "Authorization: Bearer ${CF_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"config":{"ingress":[{"hostname":"bot.example.com","service":"http://localhost:8080"},{"service":"http_status:404"}]}}'
+
+# Restart to pick up ingress
 kubectl rollout restart deployment/my-bot -n openab
 ```
+
+**Option B — Dashboard:**
+
+Go to https://one.dash.cloudflare.com/ → Networks → Tunnels → your tunnel → Public Hostname → Add:
+- Hostname: `bot.example.com`
+- Type: HTTP
+- URL: `localhost:8080`
+
+### Authenticate the agent
+
+Kiro CLI requires a one-time OAuth login. The PVC persists tokens across restarts.
+
+```bash
+kubectl exec -it deployment/my-bot -n openab -c openab -- kiro-cli login --use-device-flow
+kubectl rollout restart deployment/my-bot -n openab
+```
+
+## AI-Assisted Install
+
+To have an AI agent handle the full install, prompt it with:
+
+> Follow the openab-telegram chart README at https://github.com/openabdev/openab/blob/main/charts/openab-telegram/README.md to deploy a Telegram bot on my Kubernetes cluster.
+>
+> I already have:
+> - A Telegram bot token: `<token>`
+> - A Cloudflare account with `cloudflared` authenticated
+> - A domain: `bot.example.com`
+> - kubectl access to my cluster
+>
+> Create the tunnel, install the chart, and complete all post-install steps from the helm NOTES output (including configuring tunnel ingress via the API and setting the webhook). Store the cloudflare-api-token in the K8s secret so ingress can be configured programmatically.
 
 ## Values
 
