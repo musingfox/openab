@@ -102,7 +102,7 @@ curl -s "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
 
 ```bash
 # Find your Telegram user ID by messaging @userinfobot on Telegram.
-helm install my-bot ./charts/openab-telegram \
+helm install my-bot oci://ghcr.io/openabdev/charts/openab-telegram \
   --set telegramBotToken="<token-from-botfather>" \
   --set cloudflareTunnelToken="$(cloudflared tunnel token my-telegram-bot)" \
   --set webhookDomain=bot.example.com \
@@ -117,7 +117,7 @@ Three options, from simplest to most secure:
 ### Option 1: `--set` (simple, least secure)
 
 ```bash
-helm install my-bot ./charts/openab-telegram \
+helm install my-bot oci://ghcr.io/openabdev/charts/openab-telegram \
   --set telegramBotToken="123:ABC" \
   --set cloudflareTunnelToken="eyJ..." \
   --namespace openab --create-namespace
@@ -134,7 +134,7 @@ kubectl create secret generic my-bot-creds -n openab \
   --from-literal=telegram-bot-token="123:ABC" \
   --from-literal=cloudflare-tunnel-token="eyJ..."
 
-helm install my-bot ./charts/openab-telegram \
+helm install my-bot oci://ghcr.io/openabdev/charts/openab-telegram \
   --set existingSecret=my-bot-creds \
   --namespace openab
 ```
@@ -151,7 +151,7 @@ kubectl create secret generic my-bot-creds -n openab \
     --secret-id oab --query SecretString --output text | \
     jq -r '{"telegram-bot-token": .telegramBotToken, "cloudflare-tunnel-token": .cloudflareTunnelToken} | to_entries[] | "\(.key)=\(.value)"')
 
-helm install my-bot ./charts/openab-telegram \
+helm install my-bot oci://ghcr.io/openabdev/charts/openab-telegram \
   --set existingSecret=my-bot-creds \
   --namespace openab
 ```

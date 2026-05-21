@@ -1,7 +1,7 @@
 # openab-telegram values
 #
 # Install:
-#   helm install my-bot ./charts/openab-telegram \
+#   helm install my-bot oci://ghcr.io/openabdev/charts/openab-telegram \
 #     --set telegramBotToken="123:ABC" \
 #     --set cloudflareTunnelToken="eyJ..." \
 #     --set platform.allowedUsers="{YOUR_TG_USER_ID}" \
