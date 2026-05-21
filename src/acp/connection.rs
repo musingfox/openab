@@ -370,7 +370,12 @@ impl AcpConnection {
                         Ok(_) => {
                             let trimmed = line.trim();
                             if !trimmed.is_empty() {
-                                tracing::warn!(agent = %cmd_name, "{trimmed}");
+                                let sanitized: String = trimmed.chars()
+                                    .filter(|c| !c.is_control() || *c == '\t')
+                                    .collect();
+                                if !sanitized.is_empty() {
+                                    tracing::warn!(agent = %cmd_name, "{sanitized}");
+                                }
                             }
                         }
                         Err(_) => break,
