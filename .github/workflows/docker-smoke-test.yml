@@ -43,17 +43,16 @@ jobs:
 
       - name: Verify agent responds
         run: |
-          INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
+          INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
 
-          RAW=$(echo "$INIT" | timeout 30 docker run --rm -i \
-            --entrypoint ${{ matrix.variant.agent }} \
-            openab-test${{ matrix.variant.suffix }} \
-            ${{ matrix.variant.agent_args }} 2>/dev/null || true)
+          # Start agent in background, send init, capture output with timeout
+          CID=$(docker run -d -i --entrypoint sh openab-test${{ matrix.variant.suffix }} -c 'exec ${{ matrix.variant.agent }} ${{ matrix.variant.agent_args }} 2>/dev/null')
+          echo "$INIT" | docker attach --no-stdin=false "$CID" &
+          sleep 5
+          RESPONSE=$(docker logs "$CID" 2>/dev/null | grep -m1 '^{' || true)
+          docker rm -f "$CID" >/dev/null 2>&1
 
-          echo "Raw output:"
-          echo "$RAW"
-
-          RESPONSE=$(echo "$RAW" | grep -m1 '^{' || true)
+          echo "Response: $RESPONSE"
 
           if [ -n "$RESPONSE" ] && echo "$RESPONSE" | jq -e '.result.agentInfo.name' > /dev/null 2>&1; then
             AGENT_NAME=$(echo "$RESPONSE" | jq -r '.result.agentInfo.name')
