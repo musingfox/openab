@@ -183,6 +183,17 @@ entries:
     version: 0.1.1
   openab:
   - apiVersion: v2
+    appVersion: 0.8.4-beta.1
+    created: "2026-05-21T21:49:54.229446156Z"
+    description: A lightweight, secure, cloud-native ACP harness that bridges Discord
+      and any ACP-compatible coding CLI.
+    digest: c99da1a5a49753f06bb9639c7919e5649cf3a4d1dd47c8a2b306ed9266193892
+    name: openab
+    type: application
+    urls:
+    - https://github.com/openabdev/openab/releases/download/openab-0.8.4-beta.1/openab-0.8.4-beta.1.tgz
+    version: 0.8.4-beta.1
+  - apiVersion: v2
     appVersion: 0.8.3
     created: "2026-05-20T23:21:31.475570183Z"
     description: A lightweight, secure, cloud-native ACP harness that bridges Discord
@@ -1113,4 +1124,16 @@ entries:
     urls:
     - https://github.com/openabdev/openab/releases/download/openab-0.3.3/openab-0.3.3.tgz
     version: 0.3.3
-generated: "2026-05-20T23:21:31.475962737Z"
+  openab-telegram:
+  - apiVersion: v2
+    appVersion: 0.8.3
+    created: "2026-05-21T21:49:54.400016129Z"
+    description: OpenAB + Telegram — single-pod deployment with gateway and Cloudflare
+      Tunnel sidecar.
+    digest: fee13ff917304f4f5b1b214d58bbdbf0db7296846c9722849c61d712d44efc02
+    name: openab-telegram
+    type: application
+    urls:
+    - https://github.com/openabdev/openab/releases/download/openab-telegram-0.1.0/openab-telegram-0.1.0.tgz
+    version: 0.1.0
+generated: "2026-05-21T21:49:54.40034813Z"
