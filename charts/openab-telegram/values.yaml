@@ -4,11 +4,15 @@
 #   helm install my-bot ./charts/openab-telegram \
 #     --set telegramBotToken="123:ABC" \
 #     --set cloudflareTunnelToken="eyJ..." \
+#     --set platform.allowedUsers="{YOUR_TG_USER_ID}" \
 #     --namespace openab --create-namespace
 #
 # Required:
 #   telegramBotToken       -- Telegram bot token from @BotFather
 #   cloudflareTunnelToken   -- Cloudflare Tunnel token
+#
+# Recommended:
+#   platform.allowedUsers  -- Your Telegram user ID (message @userinfobot to find it)
 #
 # Optional:
 #   webhookDomain          -- your tunnel domain (for setWebhook reminder in NOTES.txt)
@@ -74,8 +78,11 @@ agent:
 
 # -- Gateway platform settings
 platform:
-  # allowAllUsers: true = any Telegram user can talk to the bot
-  allowAllUsers: true
+  # allowAllUsers: false = only users listed in allowedUsers can talk to the bot
+  # Set to true to allow any Telegram user (not recommended for production)
+  allowAllUsers: false
+  # Telegram user IDs allowed to interact with the bot.
+  # Find your ID by messaging @userinfobot on Telegram.
   allowedUsers: []
   allowAllChannels: true
   allowedChannels: []

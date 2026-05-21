@@ -101,10 +101,12 @@ curl -s "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
 ## Quick Start
 
 ```bash
+# Find your Telegram user ID by messaging @userinfobot on Telegram.
 helm install my-bot ./charts/openab-telegram \
   --set telegramBotToken="<token-from-botfather>" \
   --set cloudflareTunnelToken="$(cloudflared tunnel token my-telegram-bot)" \
   --set webhookDomain=bot.example.com \
+  --set platform.allowedUsers="{<your-telegram-user-id>}" \
   --namespace openab --create-namespace
 ```
 
@@ -231,8 +233,8 @@ To have an AI agent handle the full install, prompt it with:
 | `image.tag` | No | `appVersion` | Agent image tag |
 | `gateway.tag` | No | `v0.5.0` | Gateway image tag |
 | `agent.command` | No | `kiro-cli` | Agent command |
-| `platform.allowAllUsers` | No | `true` | Allow any Telegram user |
-| `platform.allowedUsers` | No | `[]` | Allowed Telegram user IDs |
+| `platform.allowAllUsers` | No | `false` | Allow any Telegram user (opt-in) |
+| `platform.allowedUsers` | No | `[]` | Allowed Telegram user IDs (get yours from [@userinfobot](https://t.me/userinfobot)) |
 | `persistence.enabled` | No | `true` | Enable PVC for agent state |
 | `persistence.size` | No | `1Gi` | PVC size |
 
