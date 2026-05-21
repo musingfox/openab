@@ -283,6 +283,17 @@ Execution flow:
 
 `disable_on_success` is supported only in usercron `[[jobs]]`, not baseline `[[cron.jobs]]`. This keeps scheduler writeback limited to the user-managed cron file.
 
+### Re-enabling a Disabled Job
+
+Once a goal is achieved and the job is disabled, re-enable it by editing `$HOME/.openab/cronjob.toml`:
+
+```toml
+# Flip back to true to restart the job
+enabled = true
+```
+
+This can be done manually, or by asking the AI agent (e.g. "re-enable the fix-unit-tests cron job").
+
 ### Kubernetes Deployment
 
 Mount `cronjob.toml` on a PVC so it persists across pod restarts, and set `usercron_path` in your config.toml:
