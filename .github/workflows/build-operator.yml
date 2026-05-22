@@ -74,6 +74,7 @@ jobs:
           - { suffix: "-cursor", dockerfile: "Dockerfile.cursor", artifact: "cursor" }
           - { suffix: "-hermes", dockerfile: "Dockerfile.hermes", artifact: "hermes" }
           - { suffix: "-grok", dockerfile: "Dockerfile.grok", artifact: "grok" }
+          - { suffix: "-antigravity", dockerfile: "Dockerfile.antigravity", artifact: "antigravity" }
         platform:
           - { os: linux/amd64, runner: ubuntu-latest }
           - { os: linux/arm64, runner: ubuntu-24.04-arm }
@@ -139,6 +140,7 @@ jobs:
           - { suffix: "-cursor", artifact: "cursor" }
           - { suffix: "-hermes", artifact: "hermes" }
           - { suffix: "-grok", artifact: "grok" }
+          - { suffix: "-antigravity", artifact: "antigravity" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -192,6 +194,7 @@ jobs:
           - { suffix: "-cursor" }
           - { suffix: "-hermes" }
           - { suffix: "-grok" }
+          - { suffix: "-antigravity" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
