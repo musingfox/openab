@@ -5,13 +5,14 @@ OpenAB supports [Google Antigravity CLI](https://antigravity.google/) via the `a
 ## How It Works
 
 ```
-openab ──ACP JSON-RPC──► agy-acp ──spawns──► agy --dangerously-skip-permissions -p "prompt"
-                                              agy --continue -p "follow-up"
+openab ──ACP JSON-RPC──► agy-acp ──spawns──► agy --add-dir /home/agent -p "prompt"
+                                              agy --add-dir /home/agent --conversation <ID> -p "follow-up"
 ```
 
-- First prompt in a session: `agy -p "text"`
-- Subsequent prompts: `agy --continue -p "text"` (resumes most recent conversation)
-- Tool permissions are auto-approved via `--dangerously-skip-permissions`
+- First prompt in a session: `agy -p "text"`, then discovers the conversation ID
+- Subsequent prompts: `agy --conversation <ID> -p "text"` (resumes specific conversation)
+- Only the **delta** (new response) is sent back — previous turns are not repeated
+- Full `<sender_context>` metadata is passed through to agy
 
 ## Configuration
 
@@ -22,20 +23,22 @@ args = []
 working_dir = "/home/agent"
 ```
 
-Or with the Docker image:
-
-```toml
-[agent]
-command = "/usr/local/bin/agy-acp"
-args = []
-working_dir = "/home/agent"
-```
-
 ### Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `AGY_WORKING_DIR` | Working directory for agy invocations | `/tmp` |
+| `AGY_EXTRA_ARGS` | Extra arguments prepended to every `agy` invocation (optional) | (none) |
+
+## Steering Files
+
+agy reads `AGENTS.md` and `GEMINI.md` when it considers a directory a workspace:
+
+1. `AGENTS.md` and `GEMINI.md` are loaded first and injected into the system prompt
+2. agy does not disclose how it determines HOME as a workspace, but `--add-dir` explicitly adds a directory
+3. agy-acp **automatically** passes `--add-dir <working_dir>` on every invocation — no configuration needed
+
+Place your steering instructions in `/home/agent/AGENTS.md` or `/home/agent/GEMINI.md` — they will be read on every prompt as long as `working_dir` points to that directory.
 
 ## Docker
 
@@ -48,7 +51,7 @@ docker build -f Dockerfile.antigravity -t openab-antigravity .
 Antigravity CLI uses Google Sign-In (OAuth). Authenticate inside the container:
 
 ```bash
-kubectl exec -it deployment/openab-antigravity -- agy auth
+kubectl exec -it deployment/openab-antigravity -- /lib64/ld-linux-x86-64.so.2 /usr/local/bin/agy auth
 ```
 
 Complete the device flow in your browser. Auth tokens persist in the PVC at `~/.gemini/`.
@@ -65,8 +68,6 @@ agents:
       command: "agy-acp"
       args: []
       workingDir: "/home/agent"
-      env:
-        AGY_WORKING_DIR: "/home/agent"
     image:
       repository: ghcr.io/openabdev/openab-antigravity
       tag: "latest"
@@ -76,4 +77,3 @@ agents:
 
 - **No streaming**: `agy -p` returns the full response at once; the adapter sends it as a single `agent_message_chunk` notification.
 - **Cancel is a no-op**: `agy -p` runs to completion; `session/cancel` acknowledges but cannot interrupt.
-- **Session continuity uses `--continue`**: This resumes the *most recent* agy conversation, which works for single-user-per-pod deployments but may conflict if multiple sessions run concurrently in the same container.

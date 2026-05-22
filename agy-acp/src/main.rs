@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -31,21 +32,39 @@ struct JsonRpcNotification {
 }
 
 struct Session {
-    has_history: bool,
+    /// agy conversation ID (from conversations directory)
+    conversation_id: Option<String>,
+    /// cumulative stdout length from previous turns
+    prev_output_len: usize,
 }
 
 struct Adapter {
     sessions: HashMap<String, Session>,
     working_dir: String,
+    conversations_dir: PathBuf,
 }
 
 impl Adapter {
     fn new() -> Self {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         Self {
             sessions: HashMap::new(),
-            working_dir: std::env::var("AGY_WORKING_DIR")
+            working_dir: std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "/tmp".to_string()),
+            conversations_dir: PathBuf::from(&home)
+                .join(".gemini/antigravity-cli/conversations"),
         }
+    }
+
+    /// Find the most recently modified conversation ID from agy's data dir.
+    fn latest_conversation_id(&self) -> Option<String> {
+        let entries = std::fs::read_dir(&self.conversations_dir).ok()?;
+        entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "pb").unwrap_or(false))
+            .max_by_key(|e| e.metadata().ok().and_then(|m| m.modified().ok()))
+            .and_then(|e| e.path().file_stem().map(|s| s.to_string_lossy().to_string()))
     }
 
     fn handle_initialize(&self, id: u64) -> JsonRpcResponse {
@@ -63,7 +82,10 @@ impl Adapter {
 
     fn handle_session_new(&mut self, id: u64) -> JsonRpcResponse {
         let session_id = Uuid::new_v4().to_string();
-        self.sessions.insert(session_id.clone(), Session { has_history: false });
+        self.sessions.insert(session_id.clone(), Session {
+            conversation_id: None,
+            prev_output_len: 0,
+        });
         JsonRpcResponse {
             jsonrpc: "2.0",
             id,
@@ -80,17 +102,25 @@ impl Adapter {
             .map(|arr| {
                 arr.iter()
                     .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                    .filter(|t| !t.starts_with("<sender_context>"))
                     .collect::<Vec<_>>()
                     .join("\n")
             })
             .unwrap_or_default();
         let clean_prompt = prompt_text.trim();
 
+        // Build args: use --conversation <ID> for subsequent turns
         let mut args: Vec<String> = Vec::new();
+        // Always add working dir as workspace so agy reads AGENTS.md/GEMINI.md
+        args.push("--add-dir".to_string());
+        args.push(self.working_dir.clone());
+        // Add extra args from AGY_EXTRA_ARGS env var if set
+        if let Ok(extra) = std::env::var("AGY_EXTRA_ARGS") {
+            args.extend(extra.split_whitespace().map(String::from));
+        }
         if let Some(session) = self.sessions.get(session_id) {
-            if session.has_history {
-                args.push("--continue".to_string());
+            if let Some(conv_id) = &session.conversation_id {
+                args.push("--conversation".to_string());
+                args.push(conv_id.clone());
             }
         }
         args.push("-p".to_string());
@@ -109,10 +139,35 @@ impl Adapter {
 
         match result {
             Ok(output) => {
-                let text = String::from_utf8_lossy(&output.stdout).to_string();
+                let full_text = String::from_utf8_lossy(&output.stdout).to_string();
+
+                // Extract only the new content (delta)
+                let prev_len = self.sessions.get(session_id)
+                    .map(|s| s.prev_output_len)
+                    .unwrap_or(0);
+                let new_text = if prev_len < full_text.len() {
+                    full_text[prev_len..].trim_start().to_string()
+                } else {
+                    full_text.clone()
+                };
+
+                // Update session state
+                let conv_id = if self.sessions.get(session_id)
+                    .map(|s| s.conversation_id.is_none())
+                    .unwrap_or(false)
+                {
+                    self.latest_conversation_id()
+                } else {
+                    None
+                };
+
                 if let Some(session) = self.sessions.get_mut(session_id) {
-                    session.has_history = true;
+                    session.prev_output_len = full_text.len();
+                    if session.conversation_id.is_none() {
+                        session.conversation_id = conv_id;
+                    }
                 }
+
                 let notification = serde_json::to_string(&JsonRpcNotification {
                     jsonrpc: "2.0",
                     method: "session/update".to_string(),
@@ -120,7 +175,7 @@ impl Adapter {
                         "sessionId": session_id,
                         "update": {
                             "sessionUpdate": "agent_message_chunk",
-                            "content": { "type": "text", "text": text },
+                            "content": { "type": "text", "text": new_text },
                         },
                     }),
                 }).unwrap();
@@ -141,7 +196,6 @@ impl Adapter {
 async fn main() {
     let mut adapter = Adapter::new();
 
-    // Read stdin lines in a blocking thread, send to async handler
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     std::thread::spawn(move || {
         let stdin = io::stdin();
