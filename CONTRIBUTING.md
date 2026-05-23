@@ -129,3 +129,4 @@ Every PR follows a label-driven lifecycle that keeps the review loop moving.
 - **`pending-contributor`** — the ball is on the contributor; maintainers are waiting for updates.
 - **`closing-soon`** — warning that the PR will be auto-closed if no response within 3 days.
 - **Author comment resets the clock** — any comment by the PR author removes `pending-contributor` and `closing-soon`, flipping the PR back to `pending-maintainer`.
+- **Immediate `closing-soon`** — in some cases (e.g., missing Discord Discussion URL), `closing-soon` is applied immediately without waiting for the stale period.
