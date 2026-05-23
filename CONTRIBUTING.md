@@ -91,28 +91,44 @@ Every PR follows a label-driven lifecycle that keeps the review loop moving.
 └──────┬───────┘
        │
        ▼
-┌──────────────────────┐   author comments   ┌──────────────────────┐
-│ pending-maintainer   │◄────────────────────│ pending-contributor  │
-└──────────────────────┘                     └──────────┬───────────┘
-       │                                                 │
-       │  review done,                                   │ stale 2 days
-       │  ball to contributor                            │ (no author activity)
-       │                                                 ▼
-       └────────────────────────────────────────►┌───────────────┐
-                                                 │ closing-soon  │
-                                                 └───────┬───────┘
-                                                         │
-                                            ┌────────────┴────────────┐
-                                            │                         │
-                                            ▼                         ▼
-                                  author comments              3 more days
-                                  within 3 days                no activity
-                                            │                         │
-                                            ▼                         ▼
-                                  ┌────────────────────┐    ┌────────────┐
-                                  │ pending-maintainer  │    │  PR Closed │
-                                  │ (labels removed)    │    └────────────┘
-                                  └────────────────────┘
+┌──────────────────────┐
+│  Automated Checks    │
+│  (CI, rebase, etc.)  │
+└──────┬───────────────┘
+       │
+       ├── all pass ──────────────────────►┌──────────────────────┐
+       │                                   │ pending-maintainer   │
+       │                                   └──────────┬───────────┘
+       │                                              │
+       │                                              │ review done,
+       │                                              │ ball to contributor
+       │                                              ▼
+       └── any fail ──────────────────────►┌──────────────────────┐
+                                           │ pending-contributor  │◄─────────┐
+                                           └──────────┬───────────┘          │
+                                                      │                      │
+                                                      │ stale 2 days         │
+                                                      │ (no author activity) │
+                                                      ▼                      │
+                                           ┌───────────────────┐             │
+                                           │   closing-soon    │             │
+                                           │ (or immediate if  │             │
+                                           │  blocker detected)│             │
+                                           └────────┬──────────┘             │
+                                                    │                        │
+                                       ┌────────────┴──────────┐             │
+                                       │                       │             │
+                                       ▼                       ▼             │
+                             author comments            3 more days          │
+                             within 3 days             no activity           │
+                                       │                       │             │
+                                       ▼                       ▼             │
+                             ┌────────────────────┐  ┌────────────┐          │
+                             │ pending-maintainer  │  │  PR Closed │          │
+                             │ (labels removed)    │  └────────────┘          │
+                             └────────┬───────────┘                          │
+                                      │                                      │
+                                      └── re-check fails ────────────────────┘
 ```
 
 ### Label Transitions
