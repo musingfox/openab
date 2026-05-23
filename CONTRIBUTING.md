@@ -80,3 +80,51 @@ cargo check
 - Run `cargo fmt` before committing
 - Run `cargo clippy` and address warnings
 - Keep PRs focused — one feature or fix per PR
+
+## PR Lifecycle
+
+Every PR follows a label-driven lifecycle that keeps the review loop moving.
+
+```
+┌──────────────┐
+│  PR Created  │
+└──────┬───────┘
+       │
+       ▼
+┌──────────────────────┐   author comments   ┌───────────────────────┐
+│ pending-maintainer   │◄────────────────────│  pending-contributor   │
+└──────────────────────┘                     └───────────┬─────────────┘
+       │                                                 │
+       │  review done,                                   │ stale 3 days
+       │  ball to contributor                            │ (no author activity)
+       │                                                 ▼
+       └────────────────────────────────────────►┌───────────────┐
+                                                 │ closing-soon  │
+                                                 └───────┬───────┘
+                                                         │
+                                            ┌────────────┴────────────┐
+                                            │                         │
+                                            ▼                         ▼
+                                  author comments              3 more days
+                                  within 3 days                no activity
+                                            │                         │
+                                            ▼                         ▼
+                                  ┌────────────────────┐    ┌────────────┐
+                                  │ pending-maintainer  │    │  PR Closed │
+                                  │ (labels removed)    │    └────────────┘
+                                  └────────────────────┘
+```
+
+### Label Transitions
+
+| Current State | Trigger | Action |
+|---------------|---------|--------|
+| `pending-contributor` | No author activity for 3 days | Add `closing-soon` |
+| `closing-soon` | No author activity for 3 more days | Auto-close PR |
+| `pending-contributor` / `closing-soon` | Author adds a comment | Remove both labels, add `pending-maintainer` |
+
+### Key Rules
+
+- **`pending-contributor`** — the ball is on the contributor; maintainers are waiting for updates.
+- **`closing-soon`** — warning that the PR will be auto-closed if no response within 3 days.
+- **Author comment resets the clock** — any comment by the PR author removes `pending-contributor` and `closing-soon`, flipping the PR back to `pending-maintainer`.
