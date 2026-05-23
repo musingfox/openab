@@ -100,10 +100,13 @@ Every PR follows a label-driven lifecycle that keeps the review loop moving.
        │                                   │ pending-maintainer   │
        │                                   └──────────┬───────────┘
        │                                              │
-       │                                              │ review done,
-       │                                              │ pending actions
-       │                                              │ for contributor
-       │                                              ▼
+       │                                              ├── LGTM → approve & merge (or request
+       │                                              │          another maintainer review)
+       │                                              │          stays pending-maintainer
+       │                                              │
+       │                                              └── pending actions for contributor
+       │                                                         │
+       │                                                         ▼
        └── any fail ──────────────────────►┌──────────────────────┐
                                            │ pending-contributor  │◄─────────┐
                                            └──────────┬───────────┘          │
