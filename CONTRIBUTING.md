@@ -101,7 +101,8 @@ Every PR follows a label-driven lifecycle that keeps the review loop moving.
        │                                   └──────────┬───────────┘
        │                                              │
        │                                              │ review done,
-       │                                              │ ball to contributor
+       │                                              │ pending actions
+       │                                              │ for contributor
        │                                              ▼
        └── any fail ──────────────────────►┌──────────────────────┐
                                            │ pending-contributor  │◄─────────┐
