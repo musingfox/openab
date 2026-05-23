@@ -91,9 +91,9 @@ Every PR follows a label-driven lifecycle that keeps the review loop moving.
 └──────┬───────┘
        │
        ▼
-┌──────────────────────┐   author comments   ┌───────────────────────┐
-│ pending-maintainer   │◄────────────────────│  pending-contributor   │
-└──────────────────────┘                     └───────────┬─────────────┘
+┌──────────────────────┐   author comments   ┌──────────────────────┐
+│ pending-maintainer   │◄────────────────────│ pending-contributor  │
+└──────────────────────┘                     └──────────┬───────────┘
        │                                                 │
        │  review done,                                   │ stale 3 days
        │  ball to contributor                            │ (no author activity)
@@ -121,7 +121,8 @@ Every PR follows a label-driven lifecycle that keeps the review loop moving.
 |---------------|---------|--------|
 | `pending-contributor` | No author activity for 3 days | Add `closing-soon` |
 | `closing-soon` | No author activity for 3 more days | Auto-close PR |
-| `pending-contributor` / `closing-soon` | Author adds a comment | Remove both labels, add `pending-maintainer` |
+| `pending-contributor` | Author adds a comment | Remove `pending-contributor`, add `pending-maintainer` |
+| `closing-soon` | Author adds a comment | Remove `closing-soon` and `pending-contributor`, add `pending-maintainer` |
 
 ### Key Rules
 
