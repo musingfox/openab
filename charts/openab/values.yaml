@@ -11,6 +11,15 @@ nameOverride: ""
 # Override the full release name used in generated resource names.
 fullnameOverride: ""
 
+# Chart-global ServiceAccount name for agent pods, used when an agent doesn't
+# set its own `serviceAccountName`. Empty string = use cluster default SA.
+# Per-agent values (agents.<name>.serviceAccountName) take precedence — when
+# set, they fully override this. The chart only references an existing SA; it
+# does NOT create one or manage IRSA annotations (provision out-of-band).
+# Example:
+# serviceAccountName: "openab"
+serviceAccountName: ""
+
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000
@@ -349,6 +358,11 @@ agents:
     nodeSelector: {}
     tolerations: []
     affinity: {}
+    # Per-agent ServiceAccount name. When set (non-empty), overrides the
+    # chart-global `serviceAccountName` for this agent only. Useful in
+    # multi-agent deployments where only some agents need an IRSA-bound SA.
+    # serviceAccountName: "openab"
+    serviceAccountName: ""
     # extraInitContainers adds init containers to the pod (runs before the main container)
     extraInitContainers: []
     # extraContainers adds sidecar containers to the pod

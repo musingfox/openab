@@ -12,6 +12,7 @@ This page highlights commonly used values and deployment patterns. For the compl
 |-------|-------------|---------|
 | `nameOverride` | Override the chart name portion used in generated resource names. For per-agent resource names, use `agents.<name>.nameOverride`. | `""` |
 | `fullnameOverride` | Override the full generated release name for chart resources. Useful when deploying multiple instances with predictable names. | `""` |
+| `serviceAccountName` | Chart-global ServiceAccount name attached to every agent pod that doesn't define its own. Empty = cluster `default` SA. Per-agent `agents.<name>.serviceAccountName` fully overrides this. Chart references an existing SA only — does not create one. Required to activate IRSA on EKS. | `""` |
 
 ### Agent values
 
@@ -50,6 +51,7 @@ Each agent lives under `agents.<name>`.
 | `persistence.enabled` | Enable persistent storage for auth and settings. | `true` |
 | `persistence.existingClaim` | Reuse an existing PVC instead of creating one. | `""` |
 | `agentsMd` | Contents of `AGENTS.md` mounted into the working directory. | `""` |
+| `serviceAccountName` | Per-agent ServiceAccount name. When set (non-empty), fully overrides chart-global `serviceAccountName`. Useful when only some agents need an IRSA-bound SA. | `""` |
 | `extraInitContainers` | Additional init containers for the agent pod. | `[]` |
 | `extraContainers` | Additional sidecar containers for the agent pod. | `[]` |
 | `extraVolumeMounts` | Additional volume mounts for the main agent container. | `[]` |

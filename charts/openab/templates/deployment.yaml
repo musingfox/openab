@@ -29,6 +29,10 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- $svcAcct := default $.Values.serviceAccountName $cfg.serviceAccountName }}
+      {{- if $svcAcct }}
+      serviceAccountName: {{ $svcAcct }}
+      {{- end }}
       {{- with $cfg.extraInitContainers }}
       initContainers:
         {{- toYaml . | nindent 8 }}
