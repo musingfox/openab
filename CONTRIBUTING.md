@@ -95,7 +95,7 @@ Every PR follows a label-driven lifecycle that keeps the review loop moving.
 │ pending-maintainer   │◄────────────────────│ pending-contributor  │
 └──────────────────────┘                     └──────────┬───────────┘
        │                                                 │
-       │  review done,                                   │ stale 3 days
+       │  review done,                                   │ stale 2 days
        │  ball to contributor                            │ (no author activity)
        │                                                 ▼
        └────────────────────────────────────────►┌───────────────┐
@@ -119,7 +119,7 @@ Every PR follows a label-driven lifecycle that keeps the review loop moving.
 
 | Current State | Trigger | Action |
 |---------------|---------|--------|
-| `pending-contributor` | No author activity for 3 days | Add `closing-soon` |
+| `pending-contributor` | No author activity for 2 days | Add `closing-soon` |
 | `closing-soon` | No author activity for 3 more days | Auto-close PR |
 | `pending-contributor` | Author adds a comment | Remove `pending-contributor`, add `pending-maintainer` |
 | `closing-soon` | Author adds a comment | Remove `closing-soon` and `pending-contributor`, add `pending-maintainer` |
@@ -128,5 +128,6 @@ Every PR follows a label-driven lifecycle that keeps the review loop moving.
 
 - **`pending-contributor`** — the ball is on the contributor; maintainers are waiting for updates.
 - **`closing-soon`** — warning that the PR will be auto-closed if no response within 3 days.
-- **Author comment resets the clock** — any comment by the PR author removes `pending-contributor` and `closing-soon`, flipping the PR back to `pending-maintainer`.
+- **Author comment always resets** — any comment by the PR author removes `pending-contributor` and `closing-soon`, flipping the PR back to `pending-maintainer`.
+- **Re-check may re-apply `closing-soon`** — after the flip, automated checks still run. If blockers remain (e.g., missing Discord URL, CI failure, `needs-rebase`), `closing-soon` will be re-applied immediately, keeping the ball on the contributor.
 - **Immediate `closing-soon`** — in some cases (e.g., missing Discord Discussion URL), `closing-soon` is applied immediately without waiting for the stale period.
