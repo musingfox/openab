@@ -261,14 +261,7 @@ This commonly happens in OpenAB deployments where Codex already runs inside an
 isolated container or VM — the outer runtime provides the desired isolation, so
 the inner sandbox is redundant.
 
-**Option 1 — Install bubblewrap in the image** (keeps inner sandbox active):
-
-```dockerfile
-# Dockerfile.codex
-RUN apt-get update && apt-get install -y bubblewrap && rm -rf /var/lib/apt/lists/*
-```
-
-**Option 2 — Disable Codex's inner sandbox** (recommended when the outer OpenAB
+**Solution — Disable Codex's inner sandbox** (recommended when the outer OpenAB
 runtime already provides isolation):
 
 ```toml
