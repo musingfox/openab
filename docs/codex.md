@@ -293,7 +293,9 @@ helm install openab openab/openab \
 
 > **Important:** `danger-full-access` disables only Codex's *inner* sandbox. It
 > does **not** remove the outer OpenAB container/VM isolation. The agent remains
-> confined by the runtime's own security boundary.
+> confined by the runtime's own security boundary. Ensure the outer runtime is a
+> non-privileged container (no `--privileged` flag or excessive capabilities) for
+> this security model to hold.
 
 ### Imagegen appears to hang
 
