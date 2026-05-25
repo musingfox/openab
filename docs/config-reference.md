@@ -150,7 +150,6 @@ working_dir = "/home/node"
 [agent]
 command = "pi-acp"
 working_dir = "/home/node"
-env = { ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}" }
 
 # Cursor Agent
 [agent]
