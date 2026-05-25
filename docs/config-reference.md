@@ -95,7 +95,7 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `command` | string | *required* | Agent binary (e.g. `kiro-cli`, `claude-agent-acp`, `codex`, `gemini`, `copilot`, `opencode`, `cursor-agent`). |
+| `command` | string | *required* | Agent binary (e.g. `kiro-cli`, `claude-agent-acp`, `codex`, `gemini`, `copilot`, `opencode`, `pi-acp`, `cursor-agent`). |
 | `args` | string[] | `[]` | CLI arguments passed to the agent. |
 | `working_dir` | string | `"/tmp"` | Working directory for the agent process. |
 | `env` | map | `{}` | Extra environment variables (e.g. `{ OPENAI_API_KEY = "${OPENAI_API_KEY}" }`). |
@@ -145,6 +145,12 @@ working_dir = "/home/node"
 command = "opencode"
 args = ["acp"]
 working_dir = "/home/node"
+
+# Pi Agent
+[agent]
+command = "pi-acp"
+working_dir = "/home/node"
+env = { ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}" }
 
 # Cursor Agent
 [agent]
