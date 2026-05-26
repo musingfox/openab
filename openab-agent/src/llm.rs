@@ -286,15 +286,28 @@ impl LlmProvider for OpenAiProvider {
             for m in messages {
                 if m.role == "user" {
                     // User text messages
-                    let texts: Vec<&str> = m.content.iter().filter_map(|b| {
-                        if let ContentBlock::Text { text } = b { Some(text.as_str()) } else { None }
-                    }).collect();
+                    let texts: Vec<&str> = m
+                        .content
+                        .iter()
+                        .filter_map(|b| {
+                            if let ContentBlock::Text { text } = b {
+                                Some(text.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     if !texts.is_empty() {
                         oai_messages.push(json!({"role": "user", "content": [{"type": "input_text", "text": texts.join("")}]}));
                     }
                     // Tool results as function_call_output
                     for b in &m.content {
-                        if let ContentBlock::ToolResult { tool_use_id, content, .. } = b {
+                        if let ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } = b
+                        {
                             oai_messages.push(json!({"type": "function_call_output", "call_id": tool_use_id, "output": content}));
                         }
                     }
@@ -378,13 +391,19 @@ impl LlmProvider for OpenAiProvider {
                 }
 
                 // Parse SSE stream - collect output items from response.output_item.done events
-                let text = resp.text().await.map_err(|e| anyhow!("Failed to read response: {e}"))?;
+                let text = resp
+                    .text()
+                    .await
+                    .map_err(|e| anyhow!("Failed to read response: {e}"))?;
                 let mut output_items: Vec<Value> = Vec::new();
                 for line in text.lines() {
                     if let Some(data) = line.strip_prefix("data: ") {
-                        if data == "[DONE]" { break; }
+                        if data == "[DONE]" {
+                            break;
+                        }
                         if let Ok(event) = serde_json::from_str::<Value>(data) {
-                            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            let event_type =
+                                event.get("type").and_then(|t| t.as_str()).unwrap_or("");
                             if event_type == "response.output_item.done" {
                                 if let Some(item) = event.get("item") {
                                     output_items.push(item.clone());
@@ -394,7 +413,10 @@ impl LlmProvider for OpenAiProvider {
                     }
                 }
                 if output_items.is_empty() {
-                    return Err(anyhow!("No output items in SSE stream. Raw: {}", &text[..text.len().min(500)]));
+                    return Err(anyhow!(
+                        "No output items in SSE stream. Raw: {}",
+                        &text[..text.len().min(500)]
+                    ));
                 }
                 let response = json!({"output": output_items});
                 return parse_openai_response(&response);
@@ -406,13 +428,25 @@ impl LlmProvider for OpenAiProvider {
 
 fn extract_account_id_from_jwt(token: &str) -> Option<String> {
     let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 { return None; }
+    if parts.len() != 3 {
+        return None;
+    }
     let mut payload = parts[1].to_string();
-    while payload.len() % 4 != 0 { payload.push('='); }
-    let decoded = base64::engine::general_purpose::URL_SAFE.decode(&payload).ok()
-        .or_else(|| base64::engine::general_purpose::STANDARD.decode(&payload).ok())?;
+    while payload.len() % 4 != 0 {
+        payload.push('=');
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE
+        .decode(&payload)
+        .ok()
+        .or_else(|| {
+            base64::engine::general_purpose::STANDARD
+                .decode(&payload)
+                .ok()
+        })?;
     let claims: Value = serde_json::from_slice(&decoded).ok()?;
-    claims["https://api.openai.com/auth"]["chatgpt_account_id"].as_str().map(|s| s.to_string())
+    claims["https://api.openai.com/auth"]["chatgpt_account_id"]
+        .as_str()
+        .map(|s| s.to_string())
 }
 
 fn parse_openai_response(response: &Value) -> Result<Vec<LlmEvent>> {
@@ -434,9 +468,20 @@ fn parse_openai_response(response: &Value) -> Result<Vec<LlmEvent>> {
                     }
                 }
                 Some("function_call") => {
-                    let id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let args_str = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                    let id = item
+                        .get("call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let args_str = item
+                        .get("arguments")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("{}");
                     let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
                     events.push(LlmEvent::ToolUse { id, name, input });
                 }
