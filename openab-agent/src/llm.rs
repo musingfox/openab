@@ -281,71 +281,35 @@ impl LlmProvider for OpenAiProvider {
         tools: &'a [ToolDef],
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>> {
         Box::pin(async move {
-            // Build OpenAI-format messages
-            let mut oai_messages: Vec<Value> = vec![json!({"role": "system", "content": system})];
+            // Build Responses API input format
+            let mut oai_messages: Vec<Value> = vec![];
             for m in messages {
-                // OpenAI uses different message format for tool results
-                if m.role == "user"
-                    && m.content
-                        .iter()
-                        .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
-                {
+                if m.role == "user" {
+                    // User text messages
+                    let texts: Vec<&str> = m.content.iter().filter_map(|b| {
+                        if let ContentBlock::Text { text } = b { Some(text.as_str()) } else { None }
+                    }).collect();
+                    if !texts.is_empty() {
+                        oai_messages.push(json!({"role": "user", "content": [{"type": "input_text", "text": texts.join("")}]}));
+                    }
+                    // Tool results as function_call_output
                     for b in &m.content {
-                        if let ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            ..
-                        } = b
-                        {
-                            oai_messages.push(json!({
-                                "role": "tool",
-                                "tool_call_id": tool_use_id,
-                                "content": content
-                            }));
+                        if let ContentBlock::ToolResult { tool_use_id, content, .. } = b {
+                            oai_messages.push(json!({"type": "function_call_output", "call_id": tool_use_id, "output": content}));
                         }
                     }
-                } else if m.role == "assistant"
-                    && m.content
-                        .iter()
-                        .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
-                {
-                    let mut tool_calls = Vec::new();
-                    let mut text_content = String::new();
+                } else if m.role == "assistant" {
                     for b in &m.content {
                         match b {
-                            ContentBlock::ToolUse { id, name, input } => {
-                                tool_calls.push(json!({
-                                    "id": id,
-                                    "type": "function",
-                                    "function": {"name": name, "arguments": input.to_string()}
-                                }));
+                            ContentBlock::Text { text } => {
+                                oai_messages.push(json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text, "annotations": []}]}));
                             }
-                            ContentBlock::Text { text } => text_content.push_str(text),
+                            ContentBlock::ToolUse { id, name, input } => {
+                                oai_messages.push(json!({"type": "function_call", "call_id": id, "name": name, "arguments": input.to_string()}));
+                            }
                             _ => {}
                         }
                     }
-                    let mut msg = json!({"role": "assistant"});
-                    if !text_content.is_empty() {
-                        msg["content"] = json!(text_content);
-                    }
-                    if !tool_calls.is_empty() {
-                        msg["tool_calls"] = json!(tool_calls);
-                    }
-                    oai_messages.push(msg);
-                } else {
-                    let text: String = m
-                        .content
-                        .iter()
-                        .filter_map(|b| {
-                            if let ContentBlock::Text { text } = b {
-                                Some(text.as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("");
-                    oai_messages.push(json!({"role": &m.role, "content": text}));
                 }
             }
 
