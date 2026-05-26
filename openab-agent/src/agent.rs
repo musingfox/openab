@@ -60,11 +60,15 @@ impl Agent {
         if custom.is_empty() {
             SYSTEM_PROMPT.to_string()
         } else {
-            format!("{}
+            format!(
+                "{}
 
 ---
 
-{}", custom.trim(), SYSTEM_PROMPT)
+{}",
+                custom.trim(),
+                SYSTEM_PROMPT
+            )
         }
     }
 
