@@ -1,6 +1,5 @@
 use crate::agent::Agent;
 use crate::llm::AnthropicProvider;
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -55,13 +54,9 @@ impl AcpServer {
             let stdin = io::stdin();
             for line in stdin.lock().lines() {
                 match line {
-                    Ok(l) if !l.trim().is_empty() => {
-                        if tx.send(l).is_err() {
-                            break;
-                        }
-                    }
+                    Ok(l) if !l.trim().is_empty() && tx.send(l).is_err() => break,
+                    Ok(_) => {}
                     Err(_) => break,
-                    _ => {}
                 }
             }
         });

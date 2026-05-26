@@ -1,6 +1,5 @@
 use anyhow::Result;
-use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::{debug, info};
 
 use crate::llm::{ContentBlock, LlmEvent, LlmProvider, Message, ToolDef};
@@ -29,6 +28,7 @@ pub struct Agent {
 }
 
 impl Agent {
+    #[cfg(test)]
     pub fn new(provider: impl LlmProvider + 'static, working_dir: String) -> Self {
         Self {
             provider: Box::new(provider),

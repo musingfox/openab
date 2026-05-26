@@ -49,6 +49,7 @@ pub enum LlmEvent {
         input: Value,
     },
     Stop,
+    #[allow(dead_code)]
     Error(String),
 }
 
