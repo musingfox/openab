@@ -271,6 +271,9 @@ mod tests {
 
     #[test]
     fn test_session_new_missing_key() {
+        // Ensure no OAuth token exists either
+        let auth_path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())).join(".openab/agent/auth.json");
+        let _ = std::fs::remove_file(&auth_path);
         unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
         let mut server = AcpServer::new();
         let resp_str = server.handle_session_new(3);
