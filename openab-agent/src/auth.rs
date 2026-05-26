@@ -2,8 +2,6 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use sha2::{Sha256, Digest};
 
 const REFRESH_SKEW_SECONDS: u64 = 120;
 
@@ -144,16 +142,6 @@ async fn refresh_token(store: &TokenStore) -> Result<TokenStore> {
         token_endpoint: store.token_endpoint.clone(),
         provider: store.provider.clone(),
     })
-}
-
-
-/// Generate PKCE code_verifier and code_challenge (S256).
-fn generate_pkce() -> (String, String) {
-    let mut buf = [0u8; 32];
-    getrandom::fill(&mut buf).expect("getrandom failed");
-    let verifier = URL_SAFE_NO_PAD.encode(buf);
-    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    (verifier, challenge)
 }
 
 /// Run the OpenAI/Codex device flow login.
