@@ -245,6 +245,7 @@ fn parse_anthropic_response(response: &Value) -> Result<Vec<LlmEvent>> {
 // === OpenAI-compatible Provider (for Codex subscription via OAuth) ===
 
 pub struct OpenAiProvider {
+    base_url: String,
     model: String,
     max_tokens: u32,
     client: reqwest::Client,
@@ -256,7 +257,11 @@ impl OpenAiProvider {
         // Just verify tokens exist; actual token is fetched at call time
         crate::auth::load_tokens().map_err(|e| e.to_string())?;
         Ok(Self {
-            model: std::env::var("OPENAB_AGENT_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()),
+            base_url: std::env::var("OPENAB_AGENT_OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com".to_string()),
+            model: std::env::var("OPENAB_AGENT_OPENAI_MODEL")
+                .or_else(|_| std::env::var("OPENAB_AGENT_MODEL"))
+                .unwrap_or_else(|_| "gpt-4o".to_string()),
             max_tokens: std::env::var("OPENAB_AGENT_MAX_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -274,8 +279,6 @@ impl LlmProvider for OpenAiProvider {
         tools: &'a [ToolDef],
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>> {
         Box::pin(async move {
-            let token = crate::auth::get_valid_token().await?;
-
             // Build OpenAI-format messages
             let mut oai_messages: Vec<Value> = vec![json!({"role": "system", "content": system})];
             for m in messages {
@@ -383,9 +386,10 @@ impl LlmProvider for OpenAiProvider {
 
             let max_retries = 3u32;
             for attempt in 0..=max_retries {
+                let token = crate::auth::get_valid_token().await?;
                 let resp = self
                     .client
-                    .post("https://api.openai.com/v1/chat/completions")
+                    .post(format!("{}/v1/chat/completions", self.base_url))
                     .header("Authorization", format!("Bearer {token}"))
                     .header("Content-Type", "application/json")
                     .json(&body)
@@ -397,6 +401,12 @@ impl LlmProvider for OpenAiProvider {
                 if (status.as_u16() == 429 || status.as_u16() == 529) && attempt < max_retries {
                     let delay = std::time::Duration::from_millis(1000 * 2u64.pow(attempt));
                     tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                // 401: token may have expired mid-request, refresh and retry once
+                if status.as_u16() == 401 && attempt < max_retries {
+                    let _ = crate::auth::get_valid_token().await; // force refresh
                     continue;
                 }
 

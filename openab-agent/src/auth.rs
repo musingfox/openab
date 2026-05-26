@@ -158,15 +158,24 @@ pub async fn login_codex_device_flow() -> Result<()> {
         .as_str()
         .or_else(|| device_resp["verification_url"].as_str())
         .unwrap_or("https://auth.openai.com/activate");
-    let interval = device_resp["interval"].as_u64().unwrap_or(5);
+    let interval = device_resp["interval"].as_u64().unwrap_or(5).max(5); // F5: minimum 5s
 
     println!("  Go to:      {}", verification_uri);
     println!("  Enter code: {}\n", user_code);
     println!("Waiting for authorization...");
 
-    // Step 2: Poll for token
+    // Step 2: Poll for token (F4: 10 minute wall-clock timeout)
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(600);
+    let mut poll_interval = interval;
+
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "Device flow timed out after 10 minutes. Please try again."
+            ));
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(poll_interval)).await;
 
         let resp = client
             .post(CODEX_TOKEN_URL)
@@ -204,7 +213,11 @@ pub async fn login_codex_device_flow() -> Result<()> {
         }
 
         match payload["error"].as_str().unwrap_or_default() {
-            "authorization_pending" | "slow_down" => continue,
+            "authorization_pending" => continue,
+            "slow_down" => {
+                poll_interval += 5; // RFC 8628 Section 3.5
+                continue;
+            }
             "expired_token" => return Err(anyhow!("Device code expired. Please try again.")),
             "access_denied" => return Err(anyhow!("Authorization denied by user.")),
             e => return Err(anyhow!("Device-code error: {e} — {payload}")),
