@@ -76,6 +76,7 @@ jobs:
           - { suffix: "-grok", dockerfile: "Dockerfile.grok", artifact: "grok" }
           - { suffix: "-antigravity", dockerfile: "Dockerfile.antigravity", artifact: "antigravity" }
           - { suffix: "-pi", dockerfile: "Dockerfile.pi", artifact: "pi" }
+          - { suffix: "-native", dockerfile: "Dockerfile.native", artifact: "native" }
         platform:
           - { os: linux/amd64, runner: ubuntu-latest }
           - { os: linux/arm64, runner: ubuntu-24.04-arm }
