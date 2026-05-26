@@ -24,31 +24,50 @@ pub struct Agent {
     provider: Box<dyn LlmProvider>,
     messages: Vec<Message>,
     working_dir: PathBuf,
+    system_prompt: String,
     tools: Vec<ToolDef>,
 }
 
 impl Agent {
     #[cfg(test)]
     pub fn new(provider: impl LlmProvider + 'static, working_dir: String) -> Self {
+        let system_prompt = Self::build_system_prompt(&working_dir);
         Self {
             provider: Box::new(provider),
             messages: Vec::new(),
             working_dir: PathBuf::from(working_dir),
+            system_prompt,
             tools: tools::tool_definitions(),
         }
     }
 
     pub fn new_boxed(provider: Box<dyn LlmProvider>, working_dir: String) -> Self {
+        let system_prompt = Self::build_system_prompt(&working_dir);
         Self {
             provider,
             messages: Vec::new(),
             working_dir: PathBuf::from(working_dir),
+            system_prompt,
             tools: tools::tool_definitions(),
         }
     }
 
     /// Run the agent with a user prompt, executing tool calls until completion.
     /// Returns the final text response.
+    fn build_system_prompt(working_dir: &str) -> String {
+        let agents_md = std::path::Path::new(working_dir).join("AGENTS.md");
+        let custom = std::fs::read_to_string(&agents_md).unwrap_or_default();
+        if custom.is_empty() {
+            SYSTEM_PROMPT.to_string()
+        } else {
+            format!("{}
+
+---
+
+{}", custom.trim(), SYSTEM_PROMPT)
+        }
+    }
+
     pub async fn run(&mut self, prompt: &str) -> Result<String> {
         // Add user message
         self.messages.push(Message {
@@ -160,7 +179,7 @@ impl Agent {
 
     async fn call_llm(&self) -> Result<Vec<LlmEvent>> {
         self.provider
-            .chat(SYSTEM_PROMPT, &self.messages, &self.tools)
+            .chat(&self.system_prompt, &self.messages, &self.tools)
             .await
     }
 }
