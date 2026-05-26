@@ -81,6 +81,21 @@ Meanwhile, the actual work an agent does is simple:
 | Dependencies | npm ecosystem | Minimal crates |
 | Supply-chain risk | High (node_modules) | Low (cargo audit) |
 
+### Required Crates
+
+Only four crates are needed beyond what openab core already uses:
+
+- `reqwest` — HTTP client (LLM API calls)
+- `serde` / `serde_json` — JSON serialization
+- `tokio` — async runtime (already used in openab)
+- `tokio-process` — bash tool execution
+
+Nothing else. Can share code with openab core (ACP types, session pool logic).
+
+### Key Advantage: Deep Integration
+
+Because we own the agent and it shares the same language as openab core, deep integration is possible — a future library mode can bypass stdio entirely, using in-process function calls to eliminate all IPC overhead.
+
 ### Design Principles (inspired by Pi)
 
 1. **Minimal tool surface** — 4 tools only (read, write, edit, bash). Maximizes context window for actual code.
