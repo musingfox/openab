@@ -68,6 +68,7 @@ pub trait LlmProvider: Send + Sync {
 pub struct AnthropicProvider {
     api_key: String,
     model: String,
+    #[allow(dead_code)]
     max_tokens: u32,
     client: reqwest::Client,
 }
@@ -249,6 +250,7 @@ fn parse_anthropic_response(response: &Value) -> Result<Vec<LlmEvent>> {
 pub struct OpenAiProvider {
     base_url: String,
     model: String,
+    #[allow(dead_code)]
     max_tokens: u32,
     client: reqwest::Client,
 }
@@ -432,7 +434,7 @@ fn extract_account_id_from_jwt(token: &str) -> Option<String> {
         return None;
     }
     let mut payload = parts[1].to_string();
-    while payload.len() % 4 != 0 {
+    while !payload.len().is_multiple_of(4) {
         payload.push('=');
     }
     let decoded = base64::engine::general_purpose::URL_SAFE
