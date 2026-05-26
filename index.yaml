@@ -183,6 +183,17 @@ entries:
     version: 0.1.1
   openab:
   - apiVersion: v2
+    appVersion: 0.8.4-beta.4
+    created: "2026-05-26T01:51:03.944022606Z"
+    description: A lightweight, secure, cloud-native ACP harness that bridges Discord
+      and any ACP-compatible coding CLI.
+    digest: 328a211b0ac43ae54b0ad89752273b6aabcfe633ae0fd64b1742f1f4f28f6008
+    name: openab
+    type: application
+    urls:
+    - https://github.com/openabdev/openab/releases/download/openab-0.8.4-beta.4/openab-0.8.4-beta.4.tgz
+    version: 0.8.4-beta.4
+  - apiVersion: v2
     appVersion: 0.8.4-beta.3
     created: "2026-05-22T23:11:58.215711908Z"
     description: A lightweight, secure, cloud-native ACP harness that bridges Discord
@@ -1146,6 +1157,18 @@ entries:
     urls:
     - https://github.com/openabdev/openab/releases/download/openab-0.3.3/openab-0.3.3.tgz
     version: 0.3.3
+  openab-feishu:
+  - apiVersion: v2
+    appVersion: 0.8.3
+    created: "2026-05-26T01:51:04.098821601Z"
+    description: OpenAB + Feishu/Lark — single-pod deployment with gateway (WebSocket
+      by default, optional Cloudflare Tunnel for webhook mode).
+    digest: a8c3f13c46749b90cb9bf06c2e5060e4ff76808e290eb2eb9d2147cf9cbd2881
+    name: openab-feishu
+    type: application
+    urls:
+    - https://github.com/openabdev/openab/releases/download/openab-feishu-0.1.0/openab-feishu-0.1.0.tgz
+    version: 0.1.0
   openab-telegram:
   - apiVersion: v2
     appVersion: 0.8.3
@@ -1158,4 +1181,4 @@ entries:
     urls:
     - https://github.com/openabdev/openab/releases/download/openab-telegram-0.1.0/openab-telegram-0.1.0.tgz
     version: 0.1.0
-generated: "2026-05-22T23:11:58.216138326Z"
+generated: "2026-05-26T01:51:04.099764099Z"
