@@ -139,7 +139,11 @@ pub async fn login_browser_flow(no_browser: bool) -> Result<()> {
     if no_browser {
         println!("Open this URL in your browser:\n");
         println!("  {auth_url}\n");
-        println!("Waiting for callback on http://localhost:{REDIRECT_PORT}/auth/callback ...");
+        println!("After approving, your browser will redirect to http://localhost:{REDIRECT_PORT}/...");
+        println!("If it fails to connect (headless server), copy the full URL from the browser");
+        println!("address bar and run:\n");
+        println!("  curl \"http://localhost:{REDIRECT_PORT}/auth/callback?code=...&state=...\"\n");
+        println!("Waiting for callback...");
     } else {
         println!("Opening browser for authentication...\n");
         if open::that(&auth_url).is_err() {
