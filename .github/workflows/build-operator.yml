@@ -144,6 +144,7 @@ jobs:
           - { suffix: "-grok", artifact: "grok" }
           - { suffix: "-antigravity", artifact: "antigravity" }
           - { suffix: "-pi", artifact: "pi" }
+          - { suffix: "-native", artifact: "native" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
