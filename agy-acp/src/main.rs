@@ -217,8 +217,8 @@ impl Adapter {
                 self.sessions.remove(&key);
             }
         }
-        // Try to restore from persisted state
-        let conversation_id = self.restore_session(&session_id);
+        // Try to restore from persisted state (relevant if client reuses session IDs)
+        let conversation_id = None;
         self.sessions.insert(
             session_id.clone(),
             Session {
@@ -351,13 +351,16 @@ impl Adapter {
                     .and_then(|before| self.new_conversation_id(before));
 
                 if let Some(session) = self.sessions.get_mut(session_id) {
+                    let newly_bound = session.conversation_id.is_none() && conv_id.is_some();
                     if session.conversation_id.is_none() {
                         session.conversation_id = conv_id.clone();
                     }
                     if session.conversation_id.is_some() {
                         session.prev_output = full_text;
-                        // Persist binding to state file
-                        self.persist_session(session_id, session.conversation_id.as_deref());
+                        // Persist binding only on first successful bind
+                        if newly_bound {
+                            self.persist_session(session_id, session.conversation_id.as_deref());
+                        }
                     } else {
                         session.prev_output.clear();
                         eprintln!(
