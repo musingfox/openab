@@ -71,9 +71,14 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub fn from_env() -> Self {
-        Self {
-            api_key: std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
+    pub fn from_env() -> Result<Self, String> {
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .map_err(|_| "ANTHROPIC_API_KEY not set".to_string())?;
+        if api_key.is_empty() {
+            return Err("ANTHROPIC_API_KEY is empty".to_string());
+        }
+        Ok(Self {
+            api_key,
             model: std::env::var("OPENAB_AGENT_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string()),
             max_tokens: std::env::var("OPENAB_AGENT_MAX_TOKENS")
@@ -81,7 +86,7 @@ impl AnthropicProvider {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8192),
             client: reqwest::Client::new(),
-        }
+        })
     }
 
     fn build_request_body(&self, system: &str, messages: &[Message], tools: &[ToolDef]) -> Value {
@@ -151,30 +156,43 @@ impl LlmProvider for AnthropicProvider {
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>> {
         Box::pin(async move {
             let body = self.build_request_body(system, messages, tools);
+            let max_retries = 3u32;
 
-            let resp = self
-                .client
-                .post("https://api.anthropic.com/v1/messages")
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| anyhow!("HTTP request failed: {e}"))?;
+            for attempt in 0..=max_retries {
+                let resp = self
+                    .client
+                    .post("https://api.anthropic.com/v1/messages")
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("HTTP request failed: {e}"))?;
 
-            if !resp.status().is_success() {
                 let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(anyhow!("Anthropic API error {status}: {text}"));
+
+                // Retry on 429 (rate limit) or 529 (overloaded)
+                if (status.as_u16() == 429 || status.as_u16() == 529) && attempt < max_retries {
+                    let delay = std::time::Duration::from_millis(1000 * 2u64.pow(attempt));
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                if !status.is_success() {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("Anthropic API error {status}: {text}"));
+                }
+
+                let response: Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| anyhow!("Failed to parse response: {e}"))?;
+
+                return parse_anthropic_response(&response);
             }
 
-            let response: Value = resp
-                .json()
-                .await
-                .map_err(|e| anyhow!("Failed to parse response: {e}"))?;
-
-            parse_anthropic_response(&response)
+            Err(anyhow!("Anthropic API: max retries exceeded"))
         })
     }
 }

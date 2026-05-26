@@ -33,6 +33,7 @@ pub struct JsonRpcNotification {
 }
 
 pub struct AcpServer {
+    // TODO(v0.2): add session TTL and periodic cleanup to prevent OOM
     sessions: HashMap<String, Agent>,
     working_dir: String,
 }
@@ -85,6 +86,7 @@ impl AcpServer {
                     self.handle_session_prompt(id, &params).await
                 }
                 Some("session/cancel") => {
+                    // TODO(v0.2): implement cancellation token to abort in-progress agent.run()
                     vec![self.ok_response(id, json!({}))]
                 }
                 Some(method) => {
@@ -122,7 +124,10 @@ impl AcpServer {
 
     fn handle_session_new(&mut self, id: u64) -> String {
         let session_id = Uuid::new_v4().to_string();
-        let provider = AnthropicProvider::from_env();
+        let provider = match AnthropicProvider::from_env() {
+            Ok(p) => p,
+            Err(e) => return self.error_response(id, -32000, &e),
+        };
         let agent = Agent::new(provider, self.working_dir.clone());
         self.sessions.insert(session_id.clone(), agent);
         let resp = JsonRpcResponse {
@@ -150,6 +155,10 @@ impl AcpServer {
                     .join("\n")
             })
             .unwrap_or_default();
+
+        if prompt_text.trim().is_empty() {
+            return vec![self.error_response(id, -32602, "prompt is empty")];
+        }
 
         let agent = match self.sessions.get_mut(session_id) {
             Some(a) => a,

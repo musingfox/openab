@@ -17,6 +17,9 @@ You have 4 tools available:
 Be direct and concise. Execute tasks immediately rather than explaining what you would do. When you need to understand code, read the relevant files first."#;
 
 const MAX_TOOL_LOOPS: usize = 50;
+/// Maximum number of messages to keep in context. When exceeded, oldest
+/// messages (excluding the first user message) are dropped.
+const MAX_CONTEXT_MESSAGES: usize = 100;
 
 pub struct Agent {
     provider: Box<dyn LlmProvider>,
@@ -50,6 +53,9 @@ impl Agent {
 
         for iteration in 0..MAX_TOOL_LOOPS {
             debug!("agent loop iteration {iteration}");
+
+            // Truncate context to prevent unbounded growth / token limit
+            self.truncate_context();
 
             let events = self.call_llm().await?;
 
@@ -124,7 +130,23 @@ impl Agent {
             });
         }
 
+        if final_text.is_empty() {
+            return Err(anyhow::anyhow!(
+                "agent exceeded maximum tool loop iterations ({MAX_TOOL_LOOPS})"
+            ));
+        }
+
         Ok(final_text)
+    }
+
+    /// Drop oldest messages when context exceeds limit, preserving the first
+    /// user message for continuity.
+    fn truncate_context(&mut self) {
+        if self.messages.len() > MAX_CONTEXT_MESSAGES {
+            let excess = self.messages.len() - MAX_CONTEXT_MESSAGES;
+            // Keep first message (original user prompt), drop from index 1
+            self.messages.drain(1..1 + excess);
+        }
     }
 
     async fn call_llm(&self) -> Result<Vec<LlmEvent>> {
