@@ -154,7 +154,8 @@ pub async fn login_codex_device_flow() -> Result<()> {
     let client_id = codex_client_id();
     let resp = client
         .post(CODEX_DEVICE_AUTH_URL)
-        .header("Content-Type", "application/json").json(&serde_json::json!({
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
             "client_id": client_id
         }))
         .send()
@@ -173,7 +174,12 @@ pub async fn login_codex_device_flow() -> Result<()> {
         .as_str()
         .ok_or_else(|| anyhow!("No user_code in response"))?;
     let verification_uri = "https://auth.openai.com/codex/device";
-    let interval = device_resp["interval"].as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| device_resp["interval"].as_u64()).unwrap_or(5).max(5);
+    let interval = device_resp["interval"]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| device_resp["interval"].as_u64())
+        .unwrap_or(5)
+        .max(5);
 
     println!("  Go to:      {}", verification_uri);
     println!("  Enter code: {}\n", user_code);
@@ -207,9 +213,9 @@ pub async fn login_codex_device_flow() -> Result<()> {
 
         if status.is_success() {
             // Device auth returns authorization_code + code_verifier
-            let auth_code = payload["authorization_code"]
-                .as_str()
-                .ok_or_else(|| anyhow!("No authorization_code in device auth response: {payload}"))?;
+            let auth_code = payload["authorization_code"].as_str().ok_or_else(|| {
+                anyhow!("No authorization_code in device auth response: {payload}")
+            })?;
             let code_verifier = payload["code_verifier"]
                 .as_str()
                 .ok_or_else(|| anyhow!("No code_verifier in device auth response: {payload}"))?;
@@ -222,7 +228,10 @@ pub async fn login_codex_device_flow() -> Result<()> {
                     ("client_id", client_id.as_str()),
                     ("code", auth_code),
                     ("code_verifier", code_verifier),
-                    ("redirect_uri", "https://auth.openai.com/deviceauth/callback"),
+                    (
+                        "redirect_uri",
+                        "https://auth.openai.com/deviceauth/callback",
+                    ),
                 ])
                 .send()
                 .await?;
@@ -255,19 +264,22 @@ pub async fn login_codex_device_flow() -> Result<()> {
         }
 
         // OpenAI returns nested error: {"error": {"code": "...", "message": "..."}}
-            let error_code = payload["error"]["code"].as_str()
-                .or_else(|| payload["error"].as_str())
-                .unwrap_or_default();
-            match error_code {
-                "authorization_pending" | "deviceauth_authorization_pending" => continue,
-                "slow_down" => {
-                    poll_interval += 5;
-                    continue;
-                }
-                "expired_token" | "deviceauth_expired" => return Err(anyhow!("Device code expired. Please try again.")),
-                "access_denied" => return Err(anyhow!("Authorization denied by user.")),
-                e => return Err(anyhow!("Device-code error: {e} — {payload}")),
+        let error_code = payload["error"]["code"]
+            .as_str()
+            .or_else(|| payload["error"].as_str())
+            .unwrap_or_default();
+        match error_code {
+            "authorization_pending" | "deviceauth_authorization_pending" => continue,
+            "slow_down" => {
+                poll_interval += 5;
+                continue;
             }
+            "expired_token" | "deviceauth_expired" => {
+                return Err(anyhow!("Device code expired. Please try again."))
+            }
+            "access_denied" => return Err(anyhow!("Authorization denied by user.")),
+            e => return Err(anyhow!("Device-code error: {e} — {payload}")),
+        }
     }
 }
 
