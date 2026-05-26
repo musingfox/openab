@@ -131,7 +131,7 @@ pub async fn login_browser_flow(no_browser: bool) -> Result<()> {
     let state = URL_SAFE_NO_PAD.encode(state_buf);
     let redir_str = redirect_uri();
     let redir = urlencoding::encode(&redir_str);
-    let auth_url = format!("{CODEX_AUTHORIZE_URL}?client_id={client_id}&redirect_uri={redir}&response_type=code&scope=openid+profile+email+offline_access&code_challenge={code_challenge}&code_challenge_method=S256&state={state}");
+    let auth_url = format!("{CODEX_AUTHORIZE_URL}?client_id={client_id}&redirect_uri={redir}&response_type=code&scope=openid+profile+email+offline_access&code_challenge={code_challenge}&code_challenge_method=S256&state={state}&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=openab-agent");
 
     let listener = TcpListener::bind(format!("127.0.0.1:{REDIRECT_PORT}"))
         .map_err(|e| anyhow!("Failed to bind port {REDIRECT_PORT}: {e}. Is another instance running?"))?;
@@ -139,11 +139,46 @@ pub async fn login_browser_flow(no_browser: bool) -> Result<()> {
     if no_browser {
         println!("Open this URL in your browser:\n");
         println!("  {auth_url}\n");
-        println!("After approving, your browser will redirect to http://localhost:{REDIRECT_PORT}/...");
-        println!("If it fails to connect (headless server), copy the full URL from the browser");
-        println!("address bar and run:\n");
-        println!("  curl \"http://localhost:{REDIRECT_PORT}/auth/callback?code=...&state=...\"\n");
-        println!("Waiting for callback...");
+        println!("After approving, your browser will redirect to a localhost URL.");
+        println!("Copy the full URL from the browser address bar and paste it here:\n");
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).map_err(|e| anyhow!("Failed to read input: {e}"))?;
+        let input = input.trim();
+        if input.is_empty() {
+            return Err(anyhow!("No URL provided"));
+        }
+        let url = url::Url::parse(input).map_err(|_| anyhow!("Invalid URL: {input}"))?;
+
+        // Skip TCP listener for paste flow
+        let code = url.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.to_string())
+            .ok_or_else(|| {
+                let error = url.query_pairs().find(|(k, _)| k == "error").map(|(_, v)| v.to_string());
+                anyhow!("No code in URL. Error: {}", error.unwrap_or_else(|| "unknown".into()))
+            })?;
+        let cb_state = url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.to_string());
+        if cb_state.as_deref() != Some(&state) {
+            return Err(anyhow!("State mismatch"));
+        }
+
+        // Exchange code for tokens
+        let client = reqwest::Client::new();
+        let resp = client.post(CODEX_TOKEN_URL)
+            .form(&[("grant_type", "authorization_code"), ("client_id", client_id.as_str()), ("code", code.as_str()), ("code_verifier", code_verifier.as_str()), ("redirect_uri", redirect_uri().as_str())])
+            .send().await?;
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("Token exchange failed: {body}"));
+        }
+        let payload: serde_json::Value = resp.json().await?;
+        let access_token = payload["access_token"].as_str().ok_or_else(|| anyhow!("No access_token"))?;
+        let refresh_token_val = payload["refresh_token"].as_str().ok_or_else(|| anyhow!("No refresh_token"))?;
+        let expires_in = payload["expires_in"].as_u64().unwrap_or(3600);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let store = TokenStore { access_token: access_token.to_string(), refresh_token: refresh_token_val.to_string(), expires_at: now + expires_in, token_endpoint: CODEX_TOKEN_URL.to_string(), provider: "codex".to_string() };
+        save_tokens(&store)?;
+        println!("\n\u{2705} Login successful! Token saved to {:?}", auth_path());
+        return Ok(());
     } else {
         println!("Opening browser for authentication...\n");
         if open::that(&auth_url).is_err() {
