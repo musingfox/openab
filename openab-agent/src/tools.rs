@@ -7,9 +7,6 @@ use tracing::debug;
 
 use crate::llm::ToolDef;
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-
 /// Validate that a path is within the allowed working directory.
 /// This function has NO side-effects — it never creates directories or files.
 fn validate_path(path: &str, working_dir: &Path) -> Result<PathBuf> {
@@ -232,6 +229,8 @@ async fn tool_bash(input: &Value, working_dir: &Path) -> Result<String> {
     // Create new process group on Unix for clean cleanup
     #[cfg(unix)]
     unsafe {
+        #[allow(unused_imports)]
+        use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());

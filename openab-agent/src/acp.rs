@@ -53,10 +53,15 @@ impl AcpServer {
         std::thread::spawn(move || {
             let stdin = io::stdin();
             for line in stdin.lock().lines() {
+                #[allow(clippy::collapsible_match)]
                 match line {
-                    Ok(l) if !l.trim().is_empty() && tx.send(l).is_err() => break,
-                    Ok(_) => {}
+                    Ok(l) if !l.trim().is_empty() => {
+                        if tx.send(l).is_err() {
+                            break;
+                        }
+                    }
                     Err(_) => break,
+                    _ => {}
                 }
             }
         });
