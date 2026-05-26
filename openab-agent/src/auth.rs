@@ -9,8 +9,6 @@ const REFRESH_SKEW_SECONDS: u64 = 120;
 // Configurable via env var if user has their own OAuth app registration
 const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
 const CODEX_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
-const CODEX_SCOPES: &str = "openid offline_access";
-const CODEX_AUDIENCE: &str = "https://api.openai.com/v1";
 
 fn codex_client_id() -> String {
     std::env::var("OPENAB_AGENT_OAUTH_CLIENT_ID")
