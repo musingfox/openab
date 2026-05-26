@@ -78,7 +78,18 @@ No login needed — set the env var and the agent auto-detects it.
 
 ## Custom System Prompt
 
-Place an `AGENTS.md` file in the working directory. It will be prepended to the default system prompt at session creation.
+Place an `AGENTS.md` file in the working directory (`cwd`). It will be prepended to the default system prompt at session creation.
+
+```
+/home/agent/
+├── AGENTS.md        ← read at session start
+├── .openab/
+│   └── agent/
+│       └── auth.json
+└── (your project files)
+```
+
+> **Note:** Skills (`.openab/skills/`, dynamic tool registration) are NOT supported yet. Only `AGENTS.md` at `cwd` is read. Skills support is planned for v0.2.
 
 ## Docker
 
