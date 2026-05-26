@@ -404,9 +404,9 @@ impl LlmProvider for OpenAiProvider {
                     continue;
                 }
 
-                // 401: token may have expired mid-request, refresh and retry once
+                // 401: token may have expired mid-request, force refresh and retry
                 if status.as_u16() == 401 && attempt < max_retries {
-                    let _ = crate::auth::get_valid_token().await; // force refresh
+                    let _ = crate::auth::force_refresh().await;
                     continue;
                 }
 
@@ -538,5 +538,42 @@ mod tests {
         assert_eq!(body["max_tokens"], 4096);
         assert_eq!(body["system"], "system prompt");
         assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn test_parse_openai_text_response() {
+        let resp = json!({
+            "choices": [{"message": {"content": "Hello"}, "finish_reason": "stop"}]
+        });
+        let events = parse_openai_response(&resp).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], LlmEvent::Text(t) if t == "Hello"));
+        assert!(matches!(events[1], LlmEvent::Stop));
+    }
+
+    #[test]
+    fn test_parse_openai_tool_call_response() {
+        let resp = json!({
+            "choices": [{"message": {
+                "content": null,
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "read", "arguments": "{\"path\":\"x.txt\"}"}}]
+            }, "finish_reason": "tool_calls"}]
+        });
+        let events = parse_openai_response(&resp).unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            LlmEvent::ToolUse { id, name, input } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "read");
+                assert_eq!(input["path"], "x.txt");
+            }
+            _ => panic!("expected ToolUse"),
+        }
+    }
+
+    #[test]
+    fn test_parse_openai_empty_choices() {
+        let resp = json!({"choices": []});
+        assert!(parse_openai_response(&resp).is_err());
     }
 }

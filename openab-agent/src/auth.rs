@@ -94,6 +94,14 @@ pub async fn get_valid_token() -> Result<String> {
     Ok(store.access_token)
 }
 
+/// Force-refresh the token regardless of expiry (for 401 recovery).
+pub async fn force_refresh() -> Result<String> {
+    let store = load_tokens()?;
+    let new_store = refresh_token(&store).await?;
+    save_tokens(&new_store)?;
+    Ok(new_store.access_token)
+}
+
 /// Refresh the access token using the refresh_token grant.
 async fn refresh_token(store: &TokenStore) -> Result<TokenStore> {
     let client_id = codex_client_id();
@@ -267,5 +275,67 @@ pub fn show_status() {
             println!("Not authenticated: {e}");
             println!("\nRun: openab-agent auth codex-oauth");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_store(expires_at: u64) -> TokenStore {
+        TokenStore {
+            access_token: "test_access_token_value".to_string(),
+            refresh_token: "test_refresh".to_string(),
+            expires_at,
+            token_endpoint: "https://example.com/token".to_string(),
+            provider: "codex".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_is_expired_future_token() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let store = make_store(now + 3600);
+        assert!(!is_expired(&store));
+    }
+
+    #[test]
+    fn test_is_expired_past_token() {
+        let store = make_store(0);
+        assert!(is_expired(&store));
+    }
+
+    #[test]
+    fn test_is_expired_within_skew() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Token expires in 60s, but skew is 120s → should be considered expired
+        let store = make_store(now + 60);
+        assert!(is_expired(&store));
+    }
+
+    #[test]
+    fn test_auth_path() {
+        let path = auth_path();
+        assert!(path.to_string_lossy().contains(".openab/agent/auth.json"));
+    }
+
+    #[test]
+    fn test_codex_client_id_default() {
+        // When env var is not set, should return default
+        unsafe { std::env::remove_var("OPENAB_AGENT_OAUTH_CLIENT_ID") };
+        assert_eq!(codex_client_id(), "app_scp_codex_prod_001");
+    }
+
+    #[test]
+    fn test_codex_client_id_override() {
+        unsafe { std::env::set_var("OPENAB_AGENT_OAUTH_CLIENT_ID", "custom_id") };
+        assert_eq!(codex_client_id(), "custom_id");
+        unsafe { std::env::remove_var("OPENAB_AGENT_OAUTH_CLIENT_ID") };
     }
 }
