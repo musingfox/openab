@@ -1,0 +1,30 @@
+name: CI openab-agent
+
+on:
+  push:
+    paths:
+      - 'openab-agent/**'
+  pull_request:
+    paths:
+      - 'openab-agent/**'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: openab-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: openab-agent
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+      - run: cargo test
+      - run: cargo test -- --ignored
+        env:
+          ANTHROPIC_API_KEY: "fake-key-for-ci"

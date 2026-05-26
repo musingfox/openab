@@ -1,0 +1,13 @@
+# --- Build stage ---
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+COPY openab-agent/Cargo.toml openab-agent/Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY openab-agent/src/ src/
+RUN touch src/main.rs && cargo build --release
+
+# --- Runtime stage ---
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=builder /build/target/release/openab-agent /usr/local/bin/openab-agent
+USER nonroot
+ENTRYPOINT ["openab-agent"]
