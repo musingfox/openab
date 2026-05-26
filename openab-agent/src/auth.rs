@@ -6,10 +6,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const REFRESH_SKEW_SECONDS: u64 = 120;
 
 // OpenAI/Codex OAuth constants (public client, same as official Codex CLI)
-const CODEX_CLIENT_ID: &str = "app_scp_codex_prod_001";
+// Configurable via env var if user has their own OAuth app registration
 const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/oauth/device/code";
 const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_SCOPES: &str = "openid profile email offline_access";
+
+fn codex_client_id() -> String {
+    std::env::var("OPENAB_AGENT_OAUTH_CLIENT_ID")
+        .unwrap_or_else(|_| "app_scp_codex_prod_001".to_string())
+}
 
 /// Stored OAuth credentials.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,13 +96,14 @@ pub async fn get_valid_token() -> Result<String> {
 
 /// Refresh the access token using the refresh_token grant.
 async fn refresh_token(store: &TokenStore) -> Result<TokenStore> {
+    let client_id = codex_client_id();
     let client = reqwest::Client::new();
     let resp = client
         .post(&store.token_endpoint)
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", store.refresh_token.as_str()),
-            ("client_id", CODEX_CLIENT_ID),
+            ("client_id", client_id.as_str()),
         ])
         .send()
         .await?;
@@ -136,9 +142,10 @@ pub async fn login_codex_device_flow() -> Result<()> {
     let client = reqwest::Client::new();
 
     // Step 1: Request device code
+    let client_id = codex_client_id();
     let resp = client
         .post(CODEX_DEVICE_AUTH_URL)
-        .form(&[("client_id", CODEX_CLIENT_ID), ("scope", CODEX_SCOPES)])
+        .form(&[("client_id", client_id.as_str()), ("scope", CODEX_SCOPES)])
         .send()
         .await?;
 
@@ -181,7 +188,7 @@ pub async fn login_codex_device_flow() -> Result<()> {
             .post(CODEX_TOKEN_URL)
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("client_id", CODEX_CLIENT_ID),
+                ("client_id", client_id.as_str()),
                 ("device_code", device_code),
             ])
             .send()
