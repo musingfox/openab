@@ -89,7 +89,7 @@ Place an `AGENTS.md` file in the working directory (`cwd`). It will be prepended
 └── (your project files)
 ```
 
-> **Note:** Skills (`.openab/skills/`, dynamic tool registration) are NOT supported yet. Only `AGENTS.md` at `cwd` is read. Skills support is planned for v0.2.
+> **Note:** Skills and MCP servers are NOT supported yet. Only `AGENTS.md` at `cwd` is read. Skills and MCP support are planned for v0.2.
 
 ## Docker
 
