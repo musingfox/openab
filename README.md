@@ -172,6 +172,7 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 | Grok Build | `grok agent stdio` | Native | [docs/grok.md](docs/grok.md) |
 | Antigravity | `agy-acp` | [agy-acp](agy-acp/) | [docs/antigravity.md](docs/antigravity.md) |
 | Pi | `pi-acp` | [pi-acp](https://www.npmjs.com/package/pi-acp) | [docs/pi.md](docs/pi.md) |
+| **Native Agent** | `openab-agent` | Built-in (Rust) | [docs/native-agent.md](docs/native-agent.md) |
 
 > 🔧 Running multiple agents? See [docs/multi-agent.md](docs/multi-agent.md)
 
