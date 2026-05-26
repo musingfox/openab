@@ -124,11 +124,26 @@ impl AcpServer {
 
     fn handle_session_new(&mut self, id: u64) -> String {
         let session_id = Uuid::new_v4().to_string();
-        let provider = match AnthropicProvider::from_env() {
-            Ok(p) => p,
-            Err(e) => return self.error_response(id, -32000, &e),
+
+        // Try API key first, then fall back to stored OAuth token
+        let provider: Box<dyn crate::llm::LlmProvider> = match AnthropicProvider::from_env() {
+            Ok(p) => Box::new(p),
+            Err(_) => {
+                // Try OAuth token from ~/.openab/agent/auth.json
+                match crate::llm::OpenAiProvider::from_auth_store() {
+                        Ok(p) => Box::new(p),
+                        Err(e) => {
+                            return self.error_response(
+                                id,
+                                -32000,
+                                &format!("No credentials: set ANTHROPIC_API_KEY or run `openab-agent auth codex-oauth`. {e}"),
+                            )
+                        }
+                    }
+            }
         };
-        let agent = Agent::new(provider, self.working_dir.clone());
+
+        let agent = Agent::new_boxed(provider, self.working_dir.clone());
         self.sessions.insert(session_id.clone(), agent);
         let resp = JsonRpcResponse {
             jsonrpc: "2.0",

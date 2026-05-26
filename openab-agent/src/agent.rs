@@ -38,6 +38,15 @@ impl Agent {
         }
     }
 
+    pub fn new_boxed(provider: Box<dyn LlmProvider>, working_dir: String) -> Self {
+        Self {
+            provider,
+            messages: Vec::new(),
+            working_dir: PathBuf::from(working_dir),
+            tools: tools::tool_definitions(),
+        }
+    }
+
     /// Run the agent with a user prompt, executing tool calls until completion.
     /// Returns the final text response.
     pub async fn run(&mut self, prompt: &str) -> Result<String> {

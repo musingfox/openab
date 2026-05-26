@@ -242,6 +242,234 @@ fn parse_anthropic_response(response: &Value) -> Result<Vec<LlmEvent>> {
     Ok(events)
 }
 
+// === OpenAI-compatible Provider (for Codex subscription via OAuth) ===
+
+pub struct OpenAiProvider {
+    model: String,
+    max_tokens: u32,
+    client: reqwest::Client,
+}
+
+impl OpenAiProvider {
+    /// Create provider using stored OAuth token from ~/.openab/agent/auth.json
+    pub fn from_auth_store() -> Result<Self, String> {
+        // Just verify tokens exist; actual token is fetched at call time
+        crate::auth::load_tokens().map_err(|e| e.to_string())?;
+        Ok(Self {
+            model: std::env::var("OPENAB_AGENT_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()),
+            max_tokens: std::env::var("OPENAB_AGENT_MAX_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8192),
+            client: reqwest::Client::new(),
+        })
+    }
+}
+
+impl LlmProvider for OpenAiProvider {
+    fn chat<'a>(
+        &'a self,
+        system: &'a str,
+        messages: &'a [Message],
+        tools: &'a [ToolDef],
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>> {
+        Box::pin(async move {
+            let token = crate::auth::get_valid_token().await?;
+
+            // Build OpenAI-format messages
+            let mut oai_messages: Vec<Value> = vec![json!({"role": "system", "content": system})];
+            for m in messages {
+                let content: Vec<Value> = m
+                    .content
+                    .iter()
+                    .map(|b| match b {
+                        ContentBlock::Text { text } => json!({"type": "text", "text": text}),
+                        ContentBlock::ToolUse { id, name, input } => {
+                            json!({"type": "function", "id": id, "name": name, "arguments": input.to_string()})
+                        }
+                        ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                            json!({"type": "text", "text": content, "tool_call_id": tool_use_id})
+                        }
+                    })
+                    .collect();
+
+                // OpenAI uses different message format for tool results
+                if m.role == "user"
+                    && m.content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                {
+                    for b in &m.content {
+                        if let ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } = b
+                        {
+                            oai_messages.push(json!({
+                                "role": "tool",
+                                "tool_call_id": tool_use_id,
+                                "content": content
+                            }));
+                        }
+                    }
+                } else if m.role == "assistant"
+                    && m.content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+                {
+                    let mut tool_calls = Vec::new();
+                    let mut text_content = String::new();
+                    for b in &m.content {
+                        match b {
+                            ContentBlock::ToolUse { id, name, input } => {
+                                tool_calls.push(json!({
+                                    "id": id,
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": input.to_string()}
+                                }));
+                            }
+                            ContentBlock::Text { text } => text_content.push_str(text),
+                            _ => {}
+                        }
+                    }
+                    let mut msg = json!({"role": "assistant"});
+                    if !text_content.is_empty() {
+                        msg["content"] = json!(text_content);
+                    }
+                    if !tool_calls.is_empty() {
+                        msg["tool_calls"] = json!(tool_calls);
+                    }
+                    oai_messages.push(msg);
+                } else {
+                    let text: String = m
+                        .content
+                        .iter()
+                        .filter_map(|b| {
+                            if let ContentBlock::Text { text } = b {
+                                Some(text.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    oai_messages.push(json!({"role": &m.role, "content": text}));
+                }
+            }
+
+            let mut body = json!({
+                "model": &self.model,
+                "max_tokens": self.max_tokens,
+                "messages": oai_messages,
+            });
+
+            if !tools.is_empty() {
+                let oai_tools: Vec<Value> = tools
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "type": "function",
+                            "function": {
+                                "name": &t.name,
+                                "description": &t.description,
+                                "parameters": &t.input_schema
+                            }
+                        })
+                    })
+                    .collect();
+                body["tools"] = json!(oai_tools);
+            }
+
+            let max_retries = 3u32;
+            for attempt in 0..=max_retries {
+                let resp = self
+                    .client
+                    .post("https://api.openai.com/v1/chat/completions")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("HTTP request failed: {e}"))?;
+
+                let status = resp.status();
+                if (status.as_u16() == 429 || status.as_u16() == 529) && attempt < max_retries {
+                    let delay = std::time::Duration::from_millis(1000 * 2u64.pow(attempt));
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                if !status.is_success() {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("OpenAI API error {status}: {text}"));
+                }
+
+                let response: Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| anyhow!("Failed to parse response: {e}"))?;
+
+                return parse_openai_response(&response);
+            }
+            Err(anyhow!("OpenAI API: max retries exceeded"))
+        })
+    }
+}
+
+fn parse_openai_response(response: &Value) -> Result<Vec<LlmEvent>> {
+    let mut events = Vec::new();
+
+    let choice = response
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .ok_or_else(|| anyhow!("No choices in response"))?;
+
+    let message = choice.get("message").ok_or_else(|| anyhow!("No message"))?;
+
+    // Text content
+    if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
+        if !content.is_empty() {
+            events.push(LlmEvent::Text(content.to_string()));
+        }
+    }
+
+    // Tool calls
+    if let Some(tool_calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
+        for tc in tool_calls {
+            let id = tc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            let args_str = tc
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|a| a.as_str())
+                .unwrap_or("{}");
+            let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+            events.push(LlmEvent::ToolUse { id, name, input });
+        }
+    }
+
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(|f| f.as_str())
+        .unwrap_or("stop");
+    if finish_reason != "tool_calls" {
+        events.push(LlmEvent::Stop);
+    }
+
+    Ok(events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
