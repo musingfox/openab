@@ -228,21 +228,23 @@ async fn tool_bash(input: &Value, working_dir: &Path) -> Result<String> {
 
     // Create new process group on Unix for clean cleanup
     #[cfg(unix)]
-    {
+    unsafe {
         use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
 
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow!("bash: spawn failed: {e}"))?;
+
+    // Capture pid before wait_with_output takes ownership
+    #[cfg(unix)]
+    let child_pid = child.id();
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
@@ -276,14 +278,11 @@ async fn tool_bash(input: &Value, working_dir: &Path) -> Result<String> {
         Err(_) => {
             // Timeout — kill the process group
             #[cfg(unix)]
-            if let Some(pid) = child.id() {
+            if let Some(pid) = child_pid {
                 unsafe {
                     libc::kill(-(pid as i32), libc::SIGKILL);
                 }
             }
-            // Await child to reap zombie process
-            let _ = child.kill().await;
-            let _ = child.wait().await;
             Err(anyhow!("bash: command timed out after {timeout_secs}s"))
         }
     }

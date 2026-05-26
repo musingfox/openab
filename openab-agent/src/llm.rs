@@ -282,20 +282,6 @@ impl LlmProvider for OpenAiProvider {
             // Build OpenAI-format messages
             let mut oai_messages: Vec<Value> = vec![json!({"role": "system", "content": system})];
             for m in messages {
-                let content: Vec<Value> = m
-                    .content
-                    .iter()
-                    .map(|b| match b {
-                        ContentBlock::Text { text } => json!({"type": "text", "text": text}),
-                        ContentBlock::ToolUse { id, name, input } => {
-                            json!({"type": "function", "id": id, "name": name, "arguments": input.to_string()})
-                        }
-                        ContentBlock::ToolResult { tool_use_id, content, .. } => {
-                            json!({"type": "text", "text": content, "tool_call_id": tool_use_id})
-                        }
-                    })
-                    .collect();
-
                 // OpenAI uses different message format for tool results
                 if m.role == "user"
                     && m.content
