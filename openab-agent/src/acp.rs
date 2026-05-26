@@ -233,11 +233,26 @@ mod tests {
 
     #[test]
     fn test_session_new() {
+        // Set a fake key so from_env() succeeds in CI
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
         let mut server = AcpServer::new();
         let resp_str = server.handle_session_new(2);
         let resp: Value = serde_json::from_str(&resp_str).unwrap();
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 2);
         assert!(resp["result"]["sessionId"].as_str().unwrap().len() > 0);
+    }
+
+    #[test]
+    fn test_session_new_missing_key() {
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+        let mut server = AcpServer::new();
+        let resp_str = server.handle_session_new(3);
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+        assert!(resp["error"].is_object());
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("ANTHROPIC_API_KEY"));
     }
 }

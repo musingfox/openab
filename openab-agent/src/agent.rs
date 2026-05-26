@@ -139,13 +139,13 @@ impl Agent {
         Ok(final_text)
     }
 
-    /// Drop oldest messages when context exceeds limit, preserving the first
-    /// user message for continuity.
+    /// Drop oldest message pairs when context exceeds limit, preserving the
+    /// first user message and maintaining strict user/assistant alternation.
     fn truncate_context(&mut self) {
-        if self.messages.len() > MAX_CONTEXT_MESSAGES {
-            let excess = self.messages.len() - MAX_CONTEXT_MESSAGES;
-            // Keep first message (original user prompt), drop from index 1
-            self.messages.drain(1..1 + excess);
+        while self.messages.len() > MAX_CONTEXT_MESSAGES {
+            // Drain in pairs (assistant + user) from index 1 to maintain alternation
+            let end = (1 + 2).min(self.messages.len());
+            self.messages.drain(1..end);
         }
     }
 
