@@ -16,7 +16,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Authenticate with an LLM provider via OAuth device flow
+    /// Authenticate with an LLM provider
     Auth {
         #[command(subcommand)]
         provider: AuthProvider,
@@ -25,8 +25,14 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum AuthProvider {
-    /// OpenAI Codex (ChatGPT Plus/Pro subscription)
-    CodexOauth,
+    /// OpenAI Codex via browser PKCE flow (recommended, full scopes)
+    CodexOauth {
+        /// Print URL instead of opening browser
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// OpenAI Codex via device code (headless servers)
+    CodexDevice,
     /// Show stored credentials
     Status,
 }
@@ -47,7 +53,13 @@ async fn main() {
             server.run().await;
         }
         Some(Commands::Auth { provider }) => match provider {
-            AuthProvider::CodexOauth => {
+            AuthProvider::CodexOauth { no_browser } => {
+                if let Err(e) = auth::login_browser_flow(no_browser).await {
+                    eprintln!("❌ Authentication failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+            AuthProvider::CodexDevice => {
                 if let Err(e) = auth::login_codex_device_flow().await {
                     eprintln!("❌ Authentication failed: {e}");
                     std::process::exit(1);
