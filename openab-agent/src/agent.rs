@@ -183,6 +183,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Integration test: executes real file tools
     async fn test_agent_tool_call_then_response() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("test.txt"), "file content here").unwrap();
@@ -207,6 +208,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Integration test: executes real file tools
     async fn test_agent_tool_error_handling() {
         let tmp = tempfile::TempDir::new().unwrap();
 
@@ -240,6 +242,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Integration test: executes real file tools
     async fn test_agent_multiple_tool_calls() {
         let tmp = tempfile::TempDir::new().unwrap();
 

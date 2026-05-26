@@ -111,7 +111,7 @@ impl AcpServer {
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "agentCapabilities": {
-                    "streaming": true,
+                    "streaming": false,
                     "loadSession": false
                 }
             })),
@@ -219,7 +219,7 @@ mod tests {
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 1);
         assert_eq!(resp["result"]["agentInfo"]["name"], "openab-agent");
-        assert_eq!(resp["result"]["agentCapabilities"]["streaming"], true);
+        assert_eq!(resp["result"]["agentCapabilities"]["streaming"], false);
     }
 
     #[test]
