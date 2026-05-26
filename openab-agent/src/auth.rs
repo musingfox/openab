@@ -2,18 +2,21 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use sha2::{Sha256, Digest};
 
 const REFRESH_SKEW_SECONDS: u64 = 120;
 
 // OpenAI/Codex OAuth constants (public client, same as official Codex CLI)
 // Configurable via env var if user has their own OAuth app registration
-const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/oauth/device/code";
-const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-const CODEX_SCOPES: &str = "openid profile email offline_access";
+const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+const CODEX_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+const CODEX_SCOPES: &str = "openid offline_access";
+const CODEX_AUDIENCE: &str = "https://api.openai.com/v1";
 
 fn codex_client_id() -> String {
     std::env::var("OPENAB_AGENT_OAUTH_CLIENT_ID")
-        .unwrap_or_else(|_| "app_scp_codex_prod_001".to_string())
+        .unwrap_or_else(|_| "app_EMoamEEZ73f0CkXaXp7hrann".to_string())
 }
 
 /// Stored OAuth credentials.
@@ -143,6 +146,16 @@ async fn refresh_token(store: &TokenStore) -> Result<TokenStore> {
     })
 }
 
+
+/// Generate PKCE code_verifier and code_challenge (S256).
+fn generate_pkce() -> (String, String) {
+    let mut buf = [0u8; 32];
+    getrandom::fill(&mut buf).expect("getrandom failed");
+    let verifier = URL_SAFE_NO_PAD.encode(buf);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
 /// Run the OpenAI/Codex device flow login.
 pub async fn login_codex_device_flow() -> Result<()> {
     println!("Starting OpenAI Codex device-code login...\n");
@@ -153,7 +166,9 @@ pub async fn login_codex_device_flow() -> Result<()> {
     let client_id = codex_client_id();
     let resp = client
         .post(CODEX_DEVICE_AUTH_URL)
-        .form(&[("client_id", client_id.as_str()), ("scope", CODEX_SCOPES)])
+        .header("Content-Type", "application/json").json(&serde_json::json!({
+            "client_id": client_id
+        }))
         .send()
         .await?;
 
@@ -163,17 +178,14 @@ pub async fn login_codex_device_flow() -> Result<()> {
     }
 
     let device_resp: serde_json::Value = resp.json().await?;
-    let device_code = device_resp["device_code"]
+    let device_code = device_resp["device_auth_id"]
         .as_str()
-        .ok_or_else(|| anyhow!("No device_code in response"))?;
+        .ok_or_else(|| anyhow!("No device_auth_id in response"))?;
     let user_code = device_resp["user_code"]
         .as_str()
         .ok_or_else(|| anyhow!("No user_code in response"))?;
-    let verification_uri = device_resp["verification_uri"]
-        .as_str()
-        .or_else(|| device_resp["verification_url"].as_str())
-        .unwrap_or("https://auth.openai.com/activate");
-    let interval = device_resp["interval"].as_u64().unwrap_or(5).max(5); // F5: minimum 5s
+    let verification_uri = "https://auth.openai.com/codex/device";
+    let interval = device_resp["interval"].as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| device_resp["interval"].as_u64()).unwrap_or(5).max(5);
 
     println!("  Go to:      {}", verification_uri);
     println!("  Enter code: {}\n", user_code);
@@ -194,11 +206,11 @@ pub async fn login_codex_device_flow() -> Result<()> {
 
         let resp = client
             .post(CODEX_TOKEN_URL)
-            .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("client_id", client_id.as_str()),
-                ("device_code", device_code),
-            ])
+            .json(&serde_json::json!({
+                "client_id": client_id,
+                "device_auth_id": device_code,
+                "user_code": user_code
+            }))
             .send()
             .await?;
 
@@ -206,20 +218,47 @@ pub async fn login_codex_device_flow() -> Result<()> {
         let payload: serde_json::Value = resp.json().await?;
 
         if status.is_success() {
-            let access_token = payload["access_token"]
+            // Device auth returns authorization_code + code_verifier
+            let auth_code = payload["authorization_code"]
                 .as_str()
-                .ok_or_else(|| anyhow!("No access_token"))?;
-            let refresh_token = payload["refresh_token"]
+                .ok_or_else(|| anyhow!("No authorization_code in device auth response: {payload}"))?;
+            let code_verifier = payload["code_verifier"]
                 .as_str()
-                .ok_or_else(|| anyhow!("No refresh_token"))?;
-            let expires_in = payload["expires_in"].as_u64().unwrap_or(3600);
+                .ok_or_else(|| anyhow!("No code_verifier in device auth response: {payload}"))?;
+
+            // Step 3: Exchange authorization_code for tokens at /oauth/token
+            let token_resp = client
+                .post("https://auth.openai.com/oauth/token")
+                .form(&[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", client_id.as_str()),
+                    ("code", auth_code),
+                    ("code_verifier", code_verifier),
+                    ("redirect_uri", "https://auth.openai.com/deviceauth/callback"),
+                ])
+                .send()
+                .await?;
+
+            if !token_resp.status().is_success() {
+                let body = token_resp.text().await.unwrap_or_default();
+                return Err(anyhow!("Token exchange failed: {body}"));
+            }
+
+            let token_payload: serde_json::Value = token_resp.json().await?;
+            let access_token = token_payload["access_token"]
+                .as_str()
+                .ok_or_else(|| anyhow!("No access_token in token response: {token_payload}"))?;
+            let refresh_token = token_payload["refresh_token"]
+                .as_str()
+                .ok_or_else(|| anyhow!("No refresh_token in token response"))?;
+            let expires_in = token_payload["expires_in"].as_u64().unwrap_or(3600);
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
             let store = TokenStore {
                 access_token: access_token.to_string(),
                 refresh_token: refresh_token.to_string(),
                 expires_at: now + expires_in,
-                token_endpoint: CODEX_TOKEN_URL.to_string(),
+                token_endpoint: "https://auth.openai.com/oauth/token".to_string(),
                 provider: "codex".to_string(),
             };
             save_tokens(&store)?;
@@ -227,16 +266,20 @@ pub async fn login_codex_device_flow() -> Result<()> {
             return Ok(());
         }
 
-        match payload["error"].as_str().unwrap_or_default() {
-            "authorization_pending" => continue,
-            "slow_down" => {
-                poll_interval += 5; // RFC 8628 Section 3.5
-                continue;
+        // OpenAI returns nested error: {"error": {"code": "...", "message": "..."}}
+            let error_code = payload["error"]["code"].as_str()
+                .or_else(|| payload["error"].as_str())
+                .unwrap_or_default();
+            match error_code {
+                "authorization_pending" | "deviceauth_authorization_pending" => continue,
+                "slow_down" => {
+                    poll_interval += 5;
+                    continue;
+                }
+                "expired_token" | "deviceauth_expired" => return Err(anyhow!("Device code expired. Please try again.")),
+                "access_denied" => return Err(anyhow!("Authorization denied by user.")),
+                e => return Err(anyhow!("Device-code error: {e} — {payload}")),
             }
-            "expired_token" => return Err(anyhow!("Device code expired. Please try again.")),
-            "access_denied" => return Err(anyhow!("Authorization denied by user.")),
-            e => return Err(anyhow!("Device-code error: {e} — {payload}")),
-        }
     }
 }
 
@@ -329,7 +372,7 @@ mod tests {
     fn test_codex_client_id_default() {
         // When env var is not set, should return default
         unsafe { std::env::remove_var("OPENAB_AGENT_OAUTH_CLIENT_ID") };
-        assert_eq!(codex_client_id(), "app_scp_codex_prod_001");
+        assert_eq!(codex_client_id(), "app_EMoamEEZ73f0CkXaXp7hrann");
     }
 
     #[test]
