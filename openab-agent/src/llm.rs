@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::pin::Pin;
@@ -259,10 +260,10 @@ impl OpenAiProvider {
         crate::auth::load_tokens().map_err(|e| e.to_string())?;
         Ok(Self {
             base_url: std::env::var("OPENAB_AGENT_OPENAI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com".to_string()),
+                .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string()),
             model: std::env::var("OPENAB_AGENT_OPENAI_MODEL")
                 .or_else(|_| std::env::var("OPENAB_AGENT_MODEL"))
-                .unwrap_or_else(|_| "gpt-4o".to_string()),
+                .unwrap_or_else(|_| "gpt-4.1-nano".to_string()),
             max_tokens: std::env::var("OPENAB_AGENT_MAX_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -348,37 +349,47 @@ impl LlmProvider for OpenAiProvider {
                 }
             }
 
+            // Build Responses API body
             let mut body = json!({
                 "model": &self.model,
-                "max_tokens": self.max_tokens,
-                "messages": oai_messages,
+                "store": false,
+                "stream": true,
+                "instructions": system,
+                "input": oai_messages,
+                "tool_choice": "auto",
+                "parallel_tool_calls": true,
             });
 
             if !tools.is_empty() {
-                let oai_tools: Vec<Value> = tools
+                let resp_tools: Vec<Value> = tools
                     .iter()
                     .map(|t| {
                         json!({
                             "type": "function",
-                            "function": {
-                                "name": &t.name,
-                                "description": &t.description,
-                                "parameters": &t.input_schema
-                            }
+                            "name": &t.name,
+                            "description": &t.description,
+                            "parameters": &t.input_schema
                         })
                     })
                     .collect();
-                body["tools"] = json!(oai_tools);
+                body["tools"] = json!(resp_tools);
             }
 
             let max_retries = 3u32;
             for attempt in 0..=max_retries {
                 let token = crate::auth::get_valid_token().await?;
-                let resp = self
+                // Extract account ID from JWT for chatgpt backend API
+                let account_id = extract_account_id_from_jwt(&token);
+                let mut req = self
                     .client
-                    .post(format!("{}/v1/chat/completions", self.base_url))
+                    .post(format!("{}/codex/responses", self.base_url))
                     .header("Authorization", format!("Bearer {token}"))
                     .header("Content-Type", "application/json")
+                    .header("originator", "openab-agent");
+                if let Some(ref aid) = account_id {
+                    req = req.header("chatgpt-account-id", aid);
+                }
+                let resp = req
                     .json(&body)
                     .send()
                     .await
@@ -402,11 +413,26 @@ impl LlmProvider for OpenAiProvider {
                     return Err(anyhow!("OpenAI API error {status}: {text}"));
                 }
 
-                let response: Value = resp
-                    .json()
-                    .await
-                    .map_err(|e| anyhow!("Failed to parse response: {e}"))?;
-
+                // Parse SSE stream - collect output items from response.output_item.done events
+                let text = resp.text().await.map_err(|e| anyhow!("Failed to read response: {e}"))?;
+                let mut output_items: Vec<Value> = Vec::new();
+                for line in text.lines() {
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        if data == "[DONE]" { break; }
+                        if let Ok(event) = serde_json::from_str::<Value>(data) {
+                            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            if event_type == "response.output_item.done" {
+                                if let Some(item) = event.get("item") {
+                                    output_items.push(item.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                if output_items.is_empty() {
+                    return Err(anyhow!("No output items in SSE stream. Raw: {}", &text[..text.len().min(500)]));
+                }
+                let response = json!({"output": output_items});
                 return parse_openai_response(&response);
             }
             Err(anyhow!("OpenAI API: max retries exceeded"))
@@ -414,9 +440,50 @@ impl LlmProvider for OpenAiProvider {
     }
 }
 
+fn extract_account_id_from_jwt(token: &str) -> Option<String> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 { return None; }
+    let mut payload = parts[1].to_string();
+    while payload.len() % 4 != 0 { payload.push('='); }
+    let decoded = base64::engine::general_purpose::URL_SAFE.decode(&payload).ok()
+        .or_else(|| base64::engine::general_purpose::STANDARD.decode(&payload).ok())?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    claims["https://api.openai.com/auth"]["chatgpt_account_id"].as_str().map(|s| s.to_string())
+}
+
 fn parse_openai_response(response: &Value) -> Result<Vec<LlmEvent>> {
     let mut events = Vec::new();
 
+    // Handle Responses API format (output array)
+    if let Some(output) = response.get("output").and_then(|o| o.as_array()) {
+        for item in output {
+            match item.get("type").and_then(|t| t.as_str()) {
+                Some("message") => {
+                    if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+                        for block in content {
+                            if block.get("type").and_then(|t| t.as_str()) == Some("output_text") {
+                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                    events.push(LlmEvent::Text(text.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => {
+                    let id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let args_str = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                    let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                    events.push(LlmEvent::ToolUse { id, name, input });
+                }
+                _ => {}
+            }
+        }
+        events.push(LlmEvent::Stop);
+        return Ok(events);
+    }
+
+    // Fallback: Chat Completions format
     let choice = response
         .get("choices")
         .and_then(|c| c.as_array())
