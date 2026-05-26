@@ -125,12 +125,22 @@ impl AcpServer {
     fn handle_session_new(&mut self, id: u64) -> String {
         let session_id = Uuid::new_v4().to_string();
 
-        // Try API key first, then fall back to stored OAuth token
-        let provider: Box<dyn crate::llm::LlmProvider> = match AnthropicProvider::from_env() {
-            Ok(p) => Box::new(p),
-            Err(_) => {
-                // Try OAuth token from ~/.openab/agent/auth.json
-                match crate::llm::OpenAiProvider::from_auth_store() {
+        // Respect OPENAB_AGENT_PROVIDER if set, otherwise auto-detect
+        let provider_choice = std::env::var("OPENAB_AGENT_PROVIDER").unwrap_or_default();
+        let provider: Box<dyn crate::llm::LlmProvider> = match provider_choice.as_str() {
+            "anthropic" => match AnthropicProvider::from_env() {
+                Ok(p) => Box::new(p),
+                Err(e) => return self.error_response(id, -32000, &e),
+            },
+            "openai" | "codex" => match crate::llm::OpenAiProvider::from_auth_store() {
+                Ok(p) => Box::new(p),
+                Err(e) => return self.error_response(id, -32000, &e),
+            },
+            _ => {
+                // Auto-detect: try API key first, then OAuth token
+                match AnthropicProvider::from_env() {
+                    Ok(p) => Box::new(p),
+                    Err(_) => match crate::llm::OpenAiProvider::from_auth_store() {
                         Ok(p) => Box::new(p),
                         Err(e) => {
                             return self.error_response(
@@ -139,7 +149,8 @@ impl AcpServer {
                                 &format!("No credentials: set ANTHROPIC_API_KEY or run `openab-agent auth codex-oauth`. {e}"),
                             )
                         }
-                    }
+                    },
+                }
             }
         };
 

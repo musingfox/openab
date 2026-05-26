@@ -42,18 +42,30 @@ pub fn load_tokens() -> Result<TokenStore> {
     serde_json::from_str(&data).map_err(|e| anyhow!("Invalid auth.json: {e}"))
 }
 
-/// Save tokens to disk with 0600 permissions.
+/// Save tokens to disk atomically with 0600 permissions.
 fn save_tokens(store: &TokenStore) -> Result<()> {
     let path = auth_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let data = serde_json::to_string_pretty(store)?;
-    std::fs::write(&path, &data)?;
+
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(data.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, &data)?;
     }
     Ok(())
 }
@@ -209,12 +221,17 @@ pub fn show_status() {
                 .unwrap_or_default()
                 .as_secs();
             let expired = now + REFRESH_SKEW_SECONDS >= store.expires_at;
+            let masked = if store.access_token.len() > 12 {
+                format!(
+                    "{}...{}",
+                    &store.access_token[..8],
+                    &store.access_token[store.access_token.len() - 4..]
+                )
+            } else {
+                "****".to_string()
+            };
             println!("Provider:  {}", store.provider);
-            println!(
-                "Token:     {}...{}",
-                &store.access_token[..8.min(store.access_token.len())],
-                &store.access_token[store.access_token.len().saturating_sub(4)..]
-            );
+            println!("Token:     {}", masked);
             println!(
                 "Expires:   {} ({})",
                 store.expires_at,
