@@ -1,9 +1,10 @@
 use crate::agent::Agent;
-use crate::llm::AnthropicProvider;
+use crate::llm::{AnthropicProvider, TextCallback};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -113,7 +114,7 @@ impl AcpServer {
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "agentCapabilities": {
-                    "streaming": false,
+                    "streaming": true,
                     "loadSession": false
                 }
             })),
@@ -125,7 +126,6 @@ impl AcpServer {
     fn handle_session_new(&mut self, id: u64) -> String {
         let session_id = Uuid::new_v4().to_string();
 
-        // Respect OPENAB_AGENT_PROVIDER if set, otherwise auto-detect
         let provider_choice = std::env::var("OPENAB_AGENT_PROVIDER").unwrap_or_default();
         let provider: Box<dyn crate::llm::LlmProvider> = match provider_choice.as_str() {
             "anthropic" => match AnthropicProvider::from_env() {
@@ -137,7 +137,6 @@ impl AcpServer {
                 Err(e) => return self.error_response(id, -32000, &e),
             },
             _ => {
-                // Auto-detect: try API key first, then OAuth token
                 match AnthropicProvider::from_env() {
                     Ok(p) => Box::new(p),
                     Err(_) => match crate::llm::OpenAiProvider::from_auth_store() {
@@ -193,24 +192,37 @@ impl AcpServer {
             }
         };
 
-        let mut output_lines = Vec::new();
+        // Collect streaming notifications in a buffer. The callback writes
+        // session/update notifications as text chunks arrive from the LLM.
         let session_id_owned = session_id.to_string();
+        let notifications: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let notif_clone = notifications.clone();
+        let sid = session_id_owned.clone();
 
-        match agent.run(&prompt_text).await {
-            Ok(response_text) => {
-                let notification = serde_json::to_string(&JsonRpcNotification {
-                    jsonrpc: "2.0",
-                    method: "session/update".to_string(),
-                    params: json!({
-                        "sessionId": session_id_owned,
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": { "type": "text", "text": response_text }
-                        }
-                    }),
-                })
-                .unwrap();
-                output_lines.push(notification);
+        let cb: TextCallback = Box::new(move |text: &str| {
+            let notification = serde_json::to_string(&JsonRpcNotification {
+                jsonrpc: "2.0",
+                method: "session/update".to_string(),
+                params: json!({
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": text }
+                    }
+                }),
+            })
+            .unwrap();
+            notif_clone.lock().unwrap().push(notification);
+        });
+
+        let result = agent.run(&prompt_text, Some(&cb)).await;
+
+        let mut output_lines: Vec<String> = notifications.lock().unwrap().drain(..).collect();
+
+        match result {
+            Ok(_response_text) => {
+                // Text was already streamed via notifications above.
+                // Send final response to signal completion.
                 output_lines.push(self.ok_response(id, json!({ "stopReason": "end_turn" })));
             }
             Err(e) => {
@@ -254,12 +266,11 @@ mod tests {
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 1);
         assert_eq!(resp["result"]["agentInfo"]["name"], "openab-agent");
-        assert_eq!(resp["result"]["agentCapabilities"]["streaming"], false);
+        assert_eq!(resp["result"]["agentCapabilities"]["streaming"], true);
     }
 
     #[test]
     fn test_session_new() {
-        // Set a fake key so from_env() succeeds in CI
         unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
         let mut server = AcpServer::new();
         let resp_str = server.handle_session_new(2);
@@ -271,7 +282,6 @@ mod tests {
 
     #[test]
     fn test_session_new_missing_key() {
-        // Ensure no OAuth token exists either
         let auth_path =
             std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
                 .join(".openab/agent/auth.json");

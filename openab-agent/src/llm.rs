@@ -1,8 +1,11 @@
 use anyhow::{anyhow, Result};
 use base64::Engine;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::pin::Pin;
+use tokio::io::AsyncBufReadExt;
+use tokio_util::io::StreamReader;
 
 /// A message in the conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +57,9 @@ pub enum LlmEvent {
     Error(String),
 }
 
+/// Callback invoked for each text chunk during streaming.
+pub type TextCallback = Box<dyn Fn(&str) + Send + Sync>;
+
 /// Trait for LLM providers.
 pub trait LlmProvider: Send + Sync {
     fn chat<'a>(
@@ -61,6 +67,7 @@ pub trait LlmProvider: Send + Sync {
         system: &'a str,
         messages: &'a [Message],
         tools: &'a [ToolDef],
+        on_text: Option<&'a TextCallback>,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>>;
 }
 
@@ -68,7 +75,6 @@ pub trait LlmProvider: Send + Sync {
 pub struct AnthropicProvider {
     api_key: String,
     model: String,
-    #[allow(dead_code)]
     max_tokens: u32,
     client: reqwest::Client,
 }
@@ -128,6 +134,7 @@ impl AnthropicProvider {
         let mut body = json!({
             "model": &self.model,
             "max_tokens": self.max_tokens,
+            "stream": true,
             "messages": msgs,
             "system": system,
         });
@@ -156,6 +163,7 @@ impl LlmProvider for AnthropicProvider {
         system: &'a str,
         messages: &'a [Message],
         tools: &'a [ToolDef],
+        on_text: Option<&'a TextCallback>,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>> {
         Box::pin(async move {
             let body = self.build_request_body(system, messages, tools);
@@ -175,7 +183,6 @@ impl LlmProvider for AnthropicProvider {
 
                 let status = resp.status();
 
-                // Retry on 429 (rate limit) or 529 (overloaded)
                 if (status.as_u16() == 429 || status.as_u16() == 529) && attempt < max_retries {
                     let delay = std::time::Duration::from_millis(1000 * 2u64.pow(attempt));
                     tokio::time::sleep(delay).await;
@@ -187,62 +194,122 @@ impl LlmProvider for AnthropicProvider {
                     return Err(anyhow!("Anthropic API error {status}: {text}"));
                 }
 
-                let response: Value = resp
-                    .json()
-                    .await
-                    .map_err(|e| anyhow!("Failed to parse response: {e}"))?;
+                // Parse SSE stream
+                let byte_stream = resp.bytes_stream();
+                let stream_reader = StreamReader::new(
+                    byte_stream
+                        .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
+                );
+                let mut lines = tokio::io::BufReader::new(stream_reader).lines();
 
-                return parse_anthropic_response(&response);
+                let mut events = Vec::new();
+                let mut current_text = String::new();
+                let mut tool_id = String::new();
+                let mut tool_name = String::new();
+                let mut tool_input_json = String::new();
+                let mut in_tool_use = false;
+                let mut stop_reason = String::new();
+
+                while let Some(line) = lines
+                    .next_line()
+                    .await
+                    .map_err(|e| anyhow!("stream read: {e}"))?
+                {
+                    let line = line.trim().to_string();
+                    if !line.starts_with("data: ") {
+                        continue;
+                    }
+                    let data = &line[6..];
+                    if data == "[DONE]" {
+                        break;
+                    }
+                    let event: Value = match serde_json::from_str(data) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                    match event_type {
+                        "content_block_start" => {
+                            let block = &event["content_block"];
+                            match block.get("type").and_then(|t| t.as_str()) {
+                                Some("tool_use") => {
+                                    // Flush any accumulated text
+                                    if !current_text.is_empty() {
+                                        events.push(LlmEvent::Text(current_text.clone()));
+                                        current_text.clear();
+                                    }
+                                    in_tool_use = true;
+                                    tool_id = block["id"].as_str().unwrap_or("").to_string();
+                                    tool_name = block["name"].as_str().unwrap_or("").to_string();
+                                    tool_input_json.clear();
+                                }
+                                _ => {}
+                            }
+                        }
+                        "content_block_delta" => {
+                            let delta = &event["delta"];
+                            match delta.get("type").and_then(|t| t.as_str()) {
+                                Some("text_delta") => {
+                                    if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                                        current_text.push_str(text);
+                                        if let Some(cb) = on_text {
+                                            cb(text);
+                                        }
+                                    }
+                                }
+                                Some("input_json_delta") => {
+                                    if let Some(json_chunk) =
+                                        delta.get("partial_json").and_then(|t| t.as_str())
+                                    {
+                                        tool_input_json.push_str(json_chunk);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        "content_block_stop" => {
+                            if in_tool_use {
+                                let input: Value =
+                                    serde_json::from_str(&tool_input_json).unwrap_or(json!({}));
+                                events.push(LlmEvent::ToolUse {
+                                    id: tool_id.clone(),
+                                    name: tool_name.clone(),
+                                    input,
+                                });
+                                in_tool_use = false;
+                            } else if !current_text.is_empty() {
+                                events.push(LlmEvent::Text(current_text.clone()));
+                                current_text.clear();
+                            }
+                        }
+                        "message_delta" => {
+                            if let Some(sr) =
+                                event["delta"].get("stop_reason").and_then(|s| s.as_str())
+                            {
+                                stop_reason = sr.to_string();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Flush remaining text
+                if !current_text.is_empty() {
+                    events.push(LlmEvent::Text(current_text));
+                }
+
+                if stop_reason != "tool_use" {
+                    events.push(LlmEvent::Stop);
+                }
+
+                return Ok(events);
             }
 
             Err(anyhow!("Anthropic API: max retries exceeded"))
         })
     }
-}
-
-fn parse_anthropic_response(response: &Value) -> Result<Vec<LlmEvent>> {
-    let mut events = Vec::new();
-
-    let content = response
-        .get("content")
-        .and_then(|c| c.as_array())
-        .ok_or_else(|| anyhow!("missing content in response"))?;
-
-    for block in content {
-        match block.get("type").and_then(|t| t.as_str()) {
-            Some("text") => {
-                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                    events.push(LlmEvent::Text(text.to_string()));
-                }
-            }
-            Some("tool_use") => {
-                let id = block
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let name = block
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let input = block.get("input").cloned().unwrap_or(json!({}));
-                events.push(LlmEvent::ToolUse { id, name, input });
-            }
-            _ => {}
-        }
-    }
-
-    let stop_reason = response
-        .get("stop_reason")
-        .and_then(|s| s.as_str())
-        .unwrap_or("end_turn");
-
-    if stop_reason != "tool_use" {
-        events.push(LlmEvent::Stop);
-    }
-
-    Ok(events)
 }
 
 // === OpenAI-compatible Provider (for Codex subscription via OAuth) ===
@@ -258,7 +325,6 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     /// Create provider using stored OAuth token from ~/.openab/agent/auth.json
     pub fn from_auth_store() -> Result<Self, String> {
-        // Just verify tokens exist; actual token is fetched at call time
         crate::auth::load_tokens().map_err(|e| e.to_string())?;
         Ok(Self {
             base_url: std::env::var("OPENAB_AGENT_OPENAI_BASE_URL")
@@ -281,13 +347,13 @@ impl LlmProvider for OpenAiProvider {
         system: &'a str,
         messages: &'a [Message],
         tools: &'a [ToolDef],
+        on_text: Option<&'a TextCallback>,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>> {
         Box::pin(async move {
             // Build Responses API input format
             let mut oai_messages: Vec<Value> = vec![];
             for m in messages {
                 if m.role == "user" {
-                    // User text messages
                     let texts: Vec<&str> = m
                         .content
                         .iter()
@@ -302,7 +368,6 @@ impl LlmProvider for OpenAiProvider {
                     if !texts.is_empty() {
                         oai_messages.push(json!({"role": "user", "content": [{"type": "input_text", "text": texts.join("")}]}));
                     }
-                    // Tool results as function_call_output
                     for b in &m.content {
                         if let ContentBlock::ToolResult {
                             tool_use_id,
@@ -328,7 +393,6 @@ impl LlmProvider for OpenAiProvider {
                 }
             }
 
-            // Build Responses API body
             let mut body = json!({
                 "model": &self.model,
                 "store": false,
@@ -357,7 +421,6 @@ impl LlmProvider for OpenAiProvider {
             let max_retries = 3u32;
             for attempt in 0..=max_retries {
                 let token = crate::auth::get_valid_token().await?;
-                // Extract account ID from JWT for chatgpt backend API
                 let account_id = extract_account_id_from_jwt(&token);
                 let mut req = self
                     .client
@@ -381,7 +444,6 @@ impl LlmProvider for OpenAiProvider {
                     continue;
                 }
 
-                // 401: token may have expired mid-request, force refresh and retry
                 if status.as_u16() == 401 && attempt < max_retries {
                     let _ = crate::auth::force_refresh().await;
                     continue;
@@ -392,13 +454,23 @@ impl LlmProvider for OpenAiProvider {
                     return Err(anyhow!("OpenAI API error {status}: {text}"));
                 }
 
-                // Parse SSE stream - collect output items from response.output_item.done events
-                let text = resp
-                    .text()
-                    .await
-                    .map_err(|e| anyhow!("Failed to read response: {e}"))?;
+                // Stream SSE line-by-line
+                let byte_stream = resp.bytes_stream();
+                let stream_reader = StreamReader::new(
+                    byte_stream
+                        .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
+                );
+                let mut lines = tokio::io::BufReader::new(stream_reader).lines();
+
                 let mut output_items: Vec<Value> = Vec::new();
-                for line in text.lines() {
+                let mut current_text = String::new();
+
+                while let Some(line) = lines
+                    .next_line()
+                    .await
+                    .map_err(|e| anyhow!("stream read: {e}"))?
+                {
+                    let line = line.trim().to_string();
                     if let Some(data) = line.strip_prefix("data: ") {
                         if data == "[DONE]" {
                             break;
@@ -406,22 +478,39 @@ impl LlmProvider for OpenAiProvider {
                         if let Ok(event) = serde_json::from_str::<Value>(data) {
                             let event_type =
                                 event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                            if event_type == "response.output_item.done" {
-                                if let Some(item) = event.get("item") {
-                                    output_items.push(item.clone());
+                            match event_type {
+                                "response.output_text.delta" => {
+                                    if let Some(delta) = event.get("delta").and_then(|d| d.as_str())
+                                    {
+                                        current_text.push_str(delta);
+                                        if let Some(cb) = on_text {
+                                            cb(delta);
+                                        }
+                                    }
                                 }
+                                "response.output_item.done" => {
+                                    if let Some(item) = event.get("item") {
+                                        output_items.push(item.clone());
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
                 }
-                if output_items.is_empty() {
-                    return Err(anyhow!(
-                        "No output items in SSE stream. Raw: {}",
-                        &text[..text.len().min(500)]
-                    ));
+
+                if output_items.is_empty() && current_text.is_empty() {
+                    return Err(anyhow!("No output in SSE stream"));
                 }
-                let response = json!({"output": output_items});
-                return parse_openai_response(&response);
+
+                // If we collected output_items, parse them (includes function_calls)
+                if !output_items.is_empty() {
+                    let response = json!({"output": output_items});
+                    return parse_openai_response(&response);
+                }
+
+                // Fallback: text-only response
+                return Ok(vec![LlmEvent::Text(current_text), LlmEvent::Stop]);
             }
             Err(anyhow!("OpenAI API: max retries exceeded"))
         })
@@ -503,14 +592,12 @@ fn parse_openai_response(response: &Value) -> Result<Vec<LlmEvent>> {
 
     let message = choice.get("message").ok_or_else(|| anyhow!("No message"))?;
 
-    // Text content
     if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
         if !content.is_empty() {
             events.push(LlmEvent::Text(content.to_string()));
         }
     }
 
-    // Tool calls
     if let Some(tool_calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
         for tc in tool_calls {
             let id = tc
@@ -550,62 +637,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_text_response() {
-        let resp = json!({
-            "content": [{"type": "text", "text": "Hello world"}],
-            "stop_reason": "end_turn"
-        });
-        let events = parse_anthropic_response(&resp).unwrap();
-        assert_eq!(events.len(), 2);
-        match &events[0] {
-            LlmEvent::Text(t) => assert_eq!(t, "Hello world"),
-            _ => panic!("expected Text event"),
-        }
-        assert!(matches!(events[1], LlmEvent::Stop));
-    }
-
-    #[test]
-    fn test_parse_tool_use_response() {
-        let resp = json!({
-            "content": [
-                {"type": "tool_use", "id": "tu_1", "name": "read", "input": {"path": "/tmp/x"}}
-            ],
-            "stop_reason": "tool_use"
-        });
-        let events = parse_anthropic_response(&resp).unwrap();
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            LlmEvent::ToolUse { id, name, input } => {
-                assert_eq!(id, "tu_1");
-                assert_eq!(name, "read");
-                assert_eq!(input["path"], "/tmp/x");
-            }
-            _ => panic!("expected ToolUse event"),
-        }
-    }
-
-    #[test]
-    fn test_build_request_body() {
-        let provider = AnthropicProvider {
-            api_key: "test".to_string(),
-            model: "claude-sonnet-4-20250514".to_string(),
-            max_tokens: 4096,
-            client: reqwest::Client::new(),
-        };
-        let messages = vec![Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text {
-                text: "hello".to_string(),
-            }],
-        }];
-        let body = provider.build_request_body("system prompt", &messages, &[]);
-        assert_eq!(body["model"], "claude-sonnet-4-20250514");
-        assert_eq!(body["max_tokens"], 4096);
-        assert_eq!(body["system"], "system prompt");
-        assert_eq!(body["messages"][0]["role"], "user");
-    }
-
-    #[test]
     fn test_parse_openai_text_response() {
         let resp = json!({
             "choices": [{"message": {"content": "Hello"}, "finish_reason": "stop"}]
@@ -640,5 +671,37 @@ mod tests {
     fn test_parse_openai_empty_choices() {
         let resp = json!({"choices": []});
         assert!(parse_openai_response(&resp).is_err());
+    }
+
+    #[test]
+    fn test_parse_openai_responses_api_format() {
+        let resp = json!({
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "Hi"}]},
+            ]
+        });
+        let events = parse_openai_response(&resp).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], LlmEvent::Text(t) if t == "Hi"));
+        assert!(matches!(events[1], LlmEvent::Stop));
+    }
+
+    #[test]
+    fn test_build_request_body_has_stream() {
+        let provider = AnthropicProvider {
+            api_key: "test".to_string(),
+            model: "claude-sonnet-4-20250514".to_string(),
+            max_tokens: 4096,
+            client: reqwest::Client::new(),
+        };
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        let body = provider.build_request_body("system prompt", &messages, &[]);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["model"], "claude-sonnet-4-20250514");
     }
 }

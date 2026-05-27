@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
-use crate::llm::{ContentBlock, LlmEvent, LlmProvider, Message, ToolDef};
+use crate::llm::{ContentBlock, LlmEvent, LlmProvider, Message, TextCallback, ToolDef};
 use crate::tools;
 
 const SYSTEM_PROMPT: &str = r#"You are openab-agent, a coding assistant. You help users by reading, writing, and editing files, and running shell commands.
@@ -52,8 +52,6 @@ impl Agent {
         }
     }
 
-    /// Run the agent with a user prompt, executing tool calls until completion.
-    /// Returns the final text response.
     fn build_system_prompt(working_dir: &str) -> String {
         let agents_md = std::path::Path::new(working_dir).join("AGENTS.md");
         let custom = std::fs::read_to_string(&agents_md).unwrap_or_default();
@@ -72,8 +70,13 @@ impl Agent {
         }
     }
 
-    pub async fn run(&mut self, prompt: &str) -> Result<String> {
-        // Add user message
+    /// Run the agent with a user prompt, executing tool calls until completion.
+    /// Returns the final text response.
+    ///
+    /// If `on_text` is provided, text chunks are streamed to the callback as
+    /// they arrive from the LLM — enabling real-time output before the full
+    /// response is assembled.
+    pub async fn run(&mut self, prompt: &str, on_text: Option<&TextCallback>) -> Result<String> {
         self.messages.push(Message {
             role: "user".to_string(),
             content: vec![ContentBlock::Text {
@@ -86,10 +89,9 @@ impl Agent {
         for iteration in 0..MAX_TOOL_LOOPS {
             debug!("agent loop iteration {iteration}");
 
-            // Truncate context to prevent unbounded growth / token limit
             self.truncate_context();
 
-            let events = self.call_llm().await?;
+            let events = self.call_llm(on_text).await?;
 
             let mut tool_calls = Vec::new();
             let mut text_parts = Vec::new();
@@ -128,7 +130,6 @@ impl Agent {
             });
 
             if tool_calls.is_empty() || !text_parts.is_empty() {
-                // No tool calls — we're done
                 final_text = text_parts.join("");
                 break;
             }
@@ -175,15 +176,14 @@ impl Agent {
     /// first user message and maintaining strict user/assistant alternation.
     fn truncate_context(&mut self) {
         while self.messages.len() > MAX_CONTEXT_MESSAGES {
-            // Drain in pairs (assistant + user) from index 1 to maintain alternation
             let end = (1 + 2).min(self.messages.len());
             self.messages.drain(1..end);
         }
     }
 
-    async fn call_llm(&self) -> Result<Vec<LlmEvent>> {
+    async fn call_llm(&self, on_text: Option<&TextCallback>) -> Result<Vec<LlmEvent>> {
         self.provider
-            .chat(&self.system_prompt, &self.messages, &self.tools)
+            .chat(&self.system_prompt, &self.messages, &self.tools, on_text)
             .await
     }
 }
@@ -215,11 +215,22 @@ mod tests {
             _system: &'a str,
             _messages: &'a [Message],
             _tools: &'a [ToolDef],
+            on_text: Option<&'a TextCallback>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>>
         {
             let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
             let events = self.responses[idx].clone();
-            Box::pin(async move { Ok(events) })
+            Box::pin(async move {
+                // Simulate streaming: call on_text for each Text event
+                if let Some(cb) = on_text {
+                    for event in &events {
+                        if let LlmEvent::Text(t) = event {
+                            cb(t);
+                        }
+                    }
+                }
+                Ok(events)
+            })
         }
     }
 
@@ -232,8 +243,31 @@ mod tests {
 
         let tmp = tempfile::TempDir::new().unwrap();
         let mut agent = Agent::new(mock, tmp.path().to_string_lossy().to_string());
-        let result = agent.run("hi").await.unwrap();
+        let result = agent.run("hi", None).await.unwrap();
         assert_eq!(result, "Hello!");
+    }
+
+    #[tokio::test]
+    async fn test_agent_streams_text_via_callback() {
+        let mock = MockLlmProvider::new(vec![vec![
+            LlmEvent::Text("Hello ".to_string()),
+            LlmEvent::Text("world!".to_string()),
+            LlmEvent::Stop,
+        ]]);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut agent = Agent::new(mock, tmp.path().to_string_lossy().to_string());
+
+        let chunks: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let chunks_clone = chunks.clone();
+        let cb: TextCallback = Box::new(move |text| {
+            chunks_clone.lock().unwrap().push(text.to_string());
+        });
+
+        let result = agent.run("hi", Some(&cb)).await.unwrap();
+        assert_eq!(result, "Hello world!");
+        let collected = chunks.lock().unwrap();
+        assert_eq!(*collected, vec!["Hello ", "world!"]);
     }
 
     #[tokio::test]
@@ -243,13 +277,11 @@ mod tests {
         std::fs::write(tmp.path().join("test.txt"), "file content here").unwrap();
 
         let mock = MockLlmProvider::new(vec![
-            // First call: LLM requests to read a file
             vec![LlmEvent::ToolUse {
                 id: "tu_1".to_string(),
                 name: "read".to_string(),
                 input: serde_json::json!({ "path": "test.txt" }),
             }],
-            // Second call: LLM responds with text
             vec![
                 LlmEvent::Text("The file contains: file content here".to_string()),
                 LlmEvent::Stop,
@@ -257,7 +289,7 @@ mod tests {
         ]);
 
         let mut agent = Agent::new(mock, tmp.path().to_string_lossy().to_string());
-        let result = agent.run("read test.txt").await.unwrap();
+        let result = agent.run("read test.txt", None).await.unwrap();
         assert_eq!(result, "The file contains: file content here");
     }
 
@@ -267,13 +299,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
 
         let mock = MockLlmProvider::new(vec![
-            // First call: LLM requests to read a non-existent file
             vec![LlmEvent::ToolUse {
                 id: "tu_1".to_string(),
                 name: "read".to_string(),
                 input: serde_json::json!({ "path": "nonexistent.txt" }),
             }],
-            // Second call: LLM acknowledges the error
             vec![
                 LlmEvent::Text("File not found.".to_string()),
                 LlmEvent::Stop,
@@ -281,11 +311,10 @@ mod tests {
         ]);
 
         let mut agent = Agent::new(mock, tmp.path().to_string_lossy().to_string());
-        let result = agent.run("read nonexistent.txt").await.unwrap();
+        let result = agent.run("read nonexistent.txt", None).await.unwrap();
         assert_eq!(result, "File not found.");
 
-        // Verify the tool result was marked as error
-        assert_eq!(agent.messages.len(), 4); // user, assistant(tool_use), user(tool_result), assistant(text)
+        assert_eq!(agent.messages.len(), 4);
         let tool_result_msg = &agent.messages[2];
         match &tool_result_msg.content[0] {
             ContentBlock::ToolResult { is_error, .. } => {
@@ -301,19 +330,16 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
 
         let mock = MockLlmProvider::new(vec![
-            // First call: write a file
             vec![LlmEvent::ToolUse {
                 id: "tu_1".to_string(),
                 name: "write".to_string(),
                 input: serde_json::json!({ "path": "out.txt", "content": "hello" }),
             }],
-            // Second call: read it back
             vec![LlmEvent::ToolUse {
                 id: "tu_2".to_string(),
                 name: "read".to_string(),
                 input: serde_json::json!({ "path": "out.txt" }),
             }],
-            // Third call: done
             vec![
                 LlmEvent::Text("Done. File contains: hello".to_string()),
                 LlmEvent::Stop,
@@ -322,12 +348,11 @@ mod tests {
 
         let mut agent = Agent::new(mock, tmp.path().to_string_lossy().to_string());
         let result = agent
-            .run("write hello to out.txt then read it")
+            .run("write hello to out.txt then read it", None)
             .await
             .unwrap();
         assert_eq!(result, "Done. File contains: hello");
 
-        // Verify file was actually written
         let content = std::fs::read_to_string(tmp.path().join("out.txt")).unwrap();
         assert_eq!(content, "hello");
     }
