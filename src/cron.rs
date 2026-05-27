@@ -238,7 +238,7 @@ pub fn should_fire(schedule: &Schedule, tz: Tz) -> bool {
 }
 
 /// Known platforms that have adapter support.
-const VALID_PLATFORMS: &[&str] = &["discord", "slack"];
+const VALID_PLATFORMS: &[&str] = &["discord", "slack", "zulip"];
 
 /// Validate all cronjob configs (fail-fast on bad cron expressions or timezones).
 pub fn validate_cronjobs(
@@ -1566,6 +1566,50 @@ message = "a"
             disable_on_success_working_dir: None,
         }];
         assert!(validate_cronjobs(&jobs, &["discord"]).is_ok());
+    }
+
+    #[test]
+    fn validate_cronjobs_zulip_platform_passes_when_configured() {
+        let jobs = vec![CronJobConfig {
+            id: None,
+            enabled: true,
+            schedule: "0 9 * * 1-5".into(),
+            channel: "42".into(),
+            message: "hi".into(),
+            platform: "zulip".into(),
+            sender_name: "test".into(),
+            thread_id: Some("deploy".into()),
+            timezone: "UTC".into(),
+            disable_on_success: None,
+            disable_on_success_match: None,
+            disable_on_success_timeout_secs: 60,
+            disable_on_success_working_dir: None,
+        }];
+        assert!(validate_cronjobs(&jobs, &["zulip"]).is_ok());
+    }
+
+    #[test]
+    fn validate_cronjobs_zulip_platform_fails_when_unconfigured() {
+        let jobs = vec![CronJobConfig {
+            id: None,
+            enabled: true,
+            schedule: "0 9 * * 1-5".into(),
+            channel: "42".into(),
+            message: "hi".into(),
+            platform: "zulip".into(),
+            sender_name: "test".into(),
+            thread_id: None,
+            timezone: "UTC".into(),
+            disable_on_success: None,
+            disable_on_success_match: None,
+            disable_on_success_timeout_secs: 60,
+            disable_on_success_working_dir: None,
+        }];
+        let err = validate_cronjobs(&jobs, &["discord"]).unwrap_err();
+        assert!(
+            err.to_string().contains("not configured"),
+            "expected unconfigured-platform error, got: {err}"
+        );
     }
 
     #[test]
