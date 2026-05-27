@@ -361,6 +361,7 @@ async fn main() -> anyhow::Result<()> {
         let sink: Arc<dyn zulip::ZulipMessageSink> = Arc::new(zulip::BrokerSink::new(
             zulip_adapter.clone(),
             zulip_dispatcher,
+            pool.clone(),
         ));
         let zulip_shutdown_rx = shutdown_rx.clone();
         Some(tokio::spawn(async move {
