@@ -122,10 +122,7 @@ async fn main() -> anyhow::Result<()> {
         "config loaded"
     );
 
-    if cfg.discord.is_none()
-        && cfg.slack.is_none()
-        && cfg.gateway.is_none()
-        && cfg.zulip.is_none()
+    if cfg.discord.is_none() && cfg.slack.is_none() && cfg.gateway.is_none() && cfg.zulip.is_none()
     {
         anyhow::bail!(
             "no adapter configured — add [discord], [slack], [gateway], and/or [zulip] to config.toml"
