@@ -70,6 +70,7 @@ pub struct Config {
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
     pub gateway: Option<GatewayConfig>,
+    pub zulip: Option<ZulipConfig>,
     pub agent: AgentConfig,
     #[serde(default)]
     pub pool: PoolConfig,
@@ -247,6 +248,49 @@ pub struct SlackConfig {
     pub allow_user_messages: AllowUsers,
     /// Max consecutive bot turns (without human intervention) before throttling.
     /// Human message resets the counter. Default: 100.
+    #[serde(default = "default_max_bot_turns")]
+    pub max_bot_turns: u32,
+    /// Message dispatch mode. Default: per-message.
+    #[serde(default)]
+    pub message_processing_mode: MessageProcessingMode,
+    /// Batched mode only: per-thread channel capacity. Default: 10.
+    #[serde(default = "default_max_buffered_messages")]
+    pub max_buffered_messages: usize,
+    /// Batched mode only: soft token cap for greedy drain. Default: 24000.
+    #[serde(default = "default_max_batch_tokens")]
+    pub max_batch_tokens: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ZulipConfig {
+    /// Base URL of the Zulip server, e.g. `https://your-org.zulipchat.com`.
+    pub site: String,
+    /// Bot email address (used as HTTP Basic auth username).
+    pub bot_email: String,
+    /// Bot API key (HTTP Basic auth password).
+    pub api_key: String,
+    /// Explicit flag: true = allow all streams, false = check allowed_channels list.
+    /// When not set, auto-detected: non-empty list → false, empty list → true.
+    pub allow_all_channels: Option<bool>,
+    /// Explicit flag: true = allow all users, false = check allowed_users list.
+    /// When not set, auto-detected: non-empty list → false, empty list → true.
+    pub allow_all_users: Option<bool>,
+    /// Allowed Zulip stream IDs (numeric, as strings).
+    #[serde(default)]
+    pub allowed_channels: Vec<String>,
+    /// Allowed Zulip user IDs (numeric, as strings).
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    #[serde(default)]
+    pub allow_bot_messages: AllowBots,
+    /// Bot User IDs allowed to interact when allow_bot_messages is
+    /// "mentions" or "all". Empty = allow any bot (mode permitting).
+    #[serde(default)]
+    pub trusted_bot_ids: Vec<String>,
+    #[serde(default)]
+    pub allow_user_messages: AllowUsers,
+    /// Max consecutive bot turns (without human intervention) before throttling.
+    /// Default: 100.
     #[serde(default = "default_max_bot_turns")]
     pub max_bot_turns: u32,
     /// Message dispatch mode. Default: per-message.
@@ -660,6 +704,13 @@ fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
             "gateway.max_batch_tokens must be > 0"
         );
     }
+    if let Some(ref z) = config.zulip {
+        anyhow::ensure!(
+            z.max_buffered_messages > 0,
+            "zulip.max_buffered_messages must be > 0"
+        );
+        anyhow::ensure!(z.max_batch_tokens > 0, "zulip.max_batch_tokens must be > 0");
+    }
     anyhow::ensure!(
         config.pool.liveness_check_secs > 0,
         "pool.liveness_check_secs must be > 0 (zero would spin the recv loop)"
@@ -920,6 +971,44 @@ command = "echo"
         assert!(
             !cfg.echo_transcript,
             "echo_transcript should default to false"
+        );
+    }
+
+    #[test]
+    fn parse_zulip_config_minimal() {
+        let toml = r#"
+[zulip]
+site = "https://x.zulipchat.com"
+bot_email = "b@x"
+api_key = "k"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let z = cfg.zulip.expect("zulip should be Some");
+        assert_eq!(z.site, "https://x.zulipchat.com");
+        assert_eq!(z.bot_email, "b@x");
+        assert_eq!(z.api_key, "k");
+        assert!(z.allowed_channels.is_empty());
+        assert!(z.allowed_users.is_empty());
+        assert_eq!(z.max_bot_turns, 100);
+    }
+
+    #[test]
+    fn parse_zulip_config_missing_site_errors() {
+        let toml = r#"
+[zulip]
+bot_email = "b@x"
+api_key = "k"
+
+[agent]
+command = "echo"
+"#;
+        let err = parse_config(toml, "test").unwrap_err();
+        assert!(
+            err.to_string().contains("site"),
+            "error should mention missing `site` field, got: {err}"
         );
     }
 
