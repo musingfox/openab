@@ -416,12 +416,106 @@ async fn poll_events(
     Ok(resp.get("events").cloned().unwrap_or(serde_json::Value::Array(vec![])))
 }
 
+/// Bundle of fields the event loop hands to a sink per accepted message.
+/// Kept as a struct so adding new fields (e.g. attachment URLs) does not break
+/// existing implementations.
+#[derive(Debug, Clone)]
+pub struct ZulipDispatchedMessage {
+    /// ACP session/thread key as produced by `thread_key_for_event`.
+    pub thread_key: String,
+    /// Stream ID as numeric string for stream messages, `None` for DMs.
+    pub stream_id: Option<String>,
+    /// Stream topic — empty for DMs.
+    pub topic: String,
+    /// Sender's Zulip user ID as numeric string.
+    pub sender_id: String,
+    /// Zulip integer message ID as string (for reactions / streaming edits).
+    pub message_id: String,
+    /// Verbatim message body.
+    pub content: String,
+}
+
 /// Trait surface for the dispatch side-effect: the event loop calls this for
 /// every accepted message. Production wires this to the broker's `Dispatcher`;
 /// unit tests use a recording double to assert thread-key correctness.
 #[async_trait]
 pub trait ZulipMessageSink: Send + Sync {
-    async fn dispatch(&self, thread_key: String, stream_id: Option<String>, sender_id: String, content: String);
+    async fn dispatch(&self, evt: ZulipDispatchedMessage);
+}
+
+/// Production sink: builds the broker `SenderContext` + `BufferedMessage` and
+/// submits to the shared `Dispatcher`. Built once at startup and shared across
+/// the event loop via `Arc`.
+pub struct BrokerSink {
+    adapter: Arc<ZulipAdapter>,
+    dispatcher: Arc<crate::dispatch::Dispatcher>,
+}
+
+impl BrokerSink {
+    pub fn new(adapter: Arc<ZulipAdapter>, dispatcher: Arc<crate::dispatch::Dispatcher>) -> Self {
+        Self { adapter, dispatcher }
+    }
+}
+
+#[async_trait]
+impl ZulipMessageSink for BrokerSink {
+    async fn dispatch(&self, evt: ZulipDispatchedMessage) {
+        // Build the trigger MessageRef so reactions / streaming edits land on
+        // the originating Zulip message.
+        let channel_id = evt.stream_id.clone().unwrap_or_default();
+        let thread_id_opt = if evt.topic.is_empty() {
+            None
+        } else {
+            Some(evt.topic.clone())
+        };
+        let trigger_channel = ChannelRef {
+            platform: "zulip".into(),
+            channel_id: channel_id.clone(),
+            thread_id: thread_id_opt.clone(),
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let trigger_msg = MessageRef {
+            channel: trigger_channel.clone(),
+            message_id: evt.message_id.clone(),
+        };
+
+        // v1: minimal SenderContext. User-display-name resolution is deferred
+        // (operator sees sender_id verbatim). Logged as a known limitation.
+        let sender = crate::adapter::SenderContext {
+            schema: "openab.sender.v1".into(),
+            sender_id: evt.sender_id.clone(),
+            sender_name: evt.sender_id.clone(),
+            display_name: evt.sender_id.clone(),
+            channel: "zulip".into(),
+            channel_id: channel_id.clone(),
+            thread_id: thread_id_opt.clone(),
+            is_bot: false,
+            timestamp: None,
+            message_id: Some(evt.message_id.clone()),
+            receiver_id: None,
+        };
+        let sender_json = serde_json::to_string(&sender).unwrap_or_else(|_| "{}".into());
+        let estimated_tokens = crate::dispatch::estimate_tokens(&evt.content, &[]);
+        let adapter_dyn: Arc<dyn ChatAdapter> = self.adapter.clone();
+        let buf = crate::dispatch::BufferedMessage {
+            sender_json,
+            sender_name: evt.sender_id.clone(),
+            prompt: evt.content.clone(),
+            extra_blocks: Vec::new(),
+            trigger_msg,
+            arrived_at: std::time::Instant::now(),
+            estimated_tokens,
+            other_bot_present: false,
+        };
+        if let Err(e) = self
+            .dispatcher
+            .submit(evt.thread_key, trigger_channel, adapter_dyn, buf)
+            .await
+        {
+            warn!(error = %e, "zulip dispatcher submit failed");
+        }
+    }
 }
 
 /// Run the Zulip event loop. Long-polls until shutdown.
@@ -549,6 +643,11 @@ pub async fn run_zulip_adapter(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                let message_id = body
+                    .get("id")
+                    .and_then(|v| v.as_i64())
+                    .map(|i| i.to_string())
+                    .unwrap_or_default();
 
                 if !allowlist_accepts(
                     stream_id.as_deref(),
@@ -582,7 +681,15 @@ pub async fn run_zulip_adapter(
                     thread_key_for_event(&ZulipEventKind::Dm { user_ids: &ids })
                 };
                 debug!(thread_key = %key, "zulip message dispatched");
-                sink.dispatch(key, stream_id, sender_id, content).await;
+                sink.dispatch(ZulipDispatchedMessage {
+                    thread_key: key,
+                    stream_id,
+                    topic,
+                    sender_id,
+                    message_id,
+                    content,
+                })
+                .await;
             }
         }
     }
@@ -1025,18 +1132,12 @@ mod tests {
 
     #[async_trait]
     impl ZulipMessageSink for RecordingSink {
-        async fn dispatch(
-            &self,
-            thread_key: String,
-            stream_id: Option<String>,
-            sender_id: String,
-            content: String,
-        ) {
+        async fn dispatch(&self, evt: ZulipDispatchedMessage) {
             self.log.lock().unwrap().push(DispatchedEvent {
-                thread_key,
-                stream_id,
-                sender_id,
-                content,
+                thread_key: evt.thread_key,
+                stream_id: evt.stream_id,
+                sender_id: evt.sender_id,
+                content: evt.content,
             });
         }
     }

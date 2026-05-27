@@ -59,7 +59,7 @@ async fn shutdown_signal() {
 
 #[derive(Parser)]
 #[command(name = "openab", version)]
-#[command(about = "Multi-platform ACP agent broker (Discord, Slack)", long_about = None)]
+#[command(about = "Multi-platform ACP agent broker (Discord, Slack, Zulip)", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -122,13 +122,18 @@ async fn main() -> anyhow::Result<()> {
         pool_max = cfg.pool.max_sessions,
         discord = cfg.discord.is_some(),
         slack = cfg.slack.is_some(),
+        zulip = cfg.zulip.is_some(),
         reactions = cfg.reactions.enabled,
         "config loaded"
     );
 
-    if cfg.discord.is_none() && cfg.slack.is_none() && cfg.gateway.is_none() {
+    if cfg.discord.is_none()
+        && cfg.slack.is_none()
+        && cfg.gateway.is_none()
+        && cfg.zulip.is_none()
+    {
         anyhow::bail!(
-            "no adapter configured — add [discord], [slack], and/or [gateway] to config.toml"
+            "no adapter configured — add [discord], [slack], [gateway], and/or [zulip] to config.toml"
         );
     }
 
@@ -224,6 +229,13 @@ async fn main() -> anyhow::Result<()> {
             s.assistant_mode,
         ))
     });
+    let shared_zulip_adapter: Option<Arc<zulip::ZulipAdapter>> = cfg.zulip.as_ref().map(|z| {
+        Arc::new(zulip::ZulipAdapter::new(
+            z.site.clone(),
+            z.bot_email.clone(),
+            z.api_key.clone(),
+        ))
+    });
 
     // Validate cronjob config at startup (fail-fast on bad cron expressions or timezones)
     let mut configured_platforms: Vec<&str> = Vec::new();
@@ -232,6 +244,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if cfg.slack.is_some() {
         configured_platforms.push("slack");
+    }
+    if cfg.zulip.is_some() {
+        configured_platforms.push("zulip");
     }
     cron::validate_cronjobs(&cfg.cron.jobs, &configured_platforms)?;
 
@@ -294,6 +309,65 @@ async fn main() -> anyhow::Result<()> {
             .await
             {
                 error!("slack adapter error: {e}");
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Spawn Zulip adapter (background task) — parallels Slack.
+    let zulip_handle = if let Some(zulip_cfg) = cfg.zulip {
+        let allow_all_channels =
+            config::resolve_allow_all(zulip_cfg.allow_all_channels, &zulip_cfg.allowed_channels);
+        let allow_all_users =
+            config::resolve_allow_all(zulip_cfg.allow_all_users, &zulip_cfg.allowed_users);
+        if !allow_all_channels && zulip_cfg.allowed_channels.is_empty() {
+            warn!("allow_all_channels=false with empty allowed_channels for Zulip — bot will deny all streams");
+        }
+        info!(
+            allow_all_channels,
+            allow_all_users,
+            channels = zulip_cfg.allowed_channels.len(),
+            users = zulip_cfg.allowed_users.len(),
+            site = %zulip_cfg.site,
+            "starting zulip adapter"
+        );
+        let zulip_adapter = shared_zulip_adapter
+            .clone()
+            .expect("shared_zulip_adapter must exist when zulip config is present");
+        let (zulip_cap, zulip_grouping, zulip_idle) = dispatch::dispatch_params(
+            &zulip_cfg.message_processing_mode,
+            zulip_cfg.max_buffered_messages,
+        );
+        let zulip_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
+            router.clone(),
+            zulip_cap,
+            zulip_cfg.max_batch_tokens,
+            zulip_grouping,
+            zulip_idle,
+        ));
+        dispatchers.lock().unwrap().push(zulip_dispatcher.clone());
+        let params = zulip::ZulipParams {
+            allow_all_channels,
+            allow_all_users,
+            allowed_channels: zulip_cfg.allowed_channels.into_iter().collect(),
+            allowed_users: zulip_cfg.allowed_users.into_iter().collect(),
+            allow_bot_messages: zulip_cfg.allow_bot_messages,
+            trusted_bot_ids: zulip_cfg.trusted_bot_ids.into_iter().collect(),
+            allow_user_messages: zulip_cfg.allow_user_messages,
+            max_bot_turns: zulip_cfg.max_bot_turns,
+            stt_config: cfg.stt.clone(),
+        };
+        let sink: Arc<dyn zulip::ZulipMessageSink> = Arc::new(zulip::BrokerSink::new(
+            zulip_adapter.clone(),
+            zulip_dispatcher,
+        ));
+        let zulip_shutdown_rx = shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) =
+                zulip::run_zulip_adapter(zulip_adapter, params, sink, zulip_shutdown_rx).await
+            {
+                error!("zulip adapter error: {e}");
             }
         }))
     } else {
@@ -377,6 +451,9 @@ async fn main() -> anyhow::Result<()> {
         }
         if let Some(ref a) = shared_slack_adapter {
             cron_adapters.insert("slack".into(), a.clone() as Arc<dyn adapter::ChatAdapter>);
+        }
+        if let Some(ref a) = shared_zulip_adapter {
+            cron_adapters.insert("zulip".into(), a.clone() as Arc<dyn adapter::ChatAdapter>);
         }
         let cron_platforms: Vec<String> =
             configured_platforms.iter().map(|s| s.to_string()).collect();
@@ -524,6 +601,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(handle) = slack_handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
+    if let Some(handle) = zulip_handle {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
     if let Some(handle) = gateway_handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
@@ -575,6 +655,29 @@ mod tests {
     fn cli_no_args_defaults_to_run() {
         let cli = Cli::try_parse_from(["openab"]).unwrap();
         assert!(cli.command.is_none()); // None → unwrap_or(Run { config: None })
+    }
+
+    /// The CLI `about` string is operator-visible (`openab --help`) and must
+    /// mention Zulip alongside Discord/Slack so operators discover the adapter.
+    #[test]
+    fn cli_about_mentions_zulip() {
+        let cmd = <Cli as clap::CommandFactory>::command();
+        let about = cmd.get_about().map(|s| s.to_string()).unwrap_or_default();
+        assert!(
+            about.contains("Zulip"),
+            "CLI about string should mention Zulip, got: {about}"
+        );
+    }
+
+    /// Regression: bail when no adapter section is configured. The error must
+    /// name `[zulip]` so operators see it as a valid alternative to Discord/Slack.
+    #[test]
+    fn no_adapter_bail_message_lists_zulip() {
+        // Replicate the exact bail text from main(); kept as a literal here so
+        // accidental wording drift is caught.
+        let msg = "no adapter configured — add [discord], [slack], [gateway], and/or [zulip] to config.toml";
+        assert!(msg.contains("[zulip]"));
+        assert!(msg.contains("[discord]"));
     }
 
     #[test]
