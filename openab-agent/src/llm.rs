@@ -58,7 +58,8 @@ pub enum LlmEvent {
 }
 
 /// Callback invoked for each text chunk during streaming.
-pub type TextCallback = Box<dyn Fn(&str) + Send + Sync>;
+/// Pass `&dyn Fn(&str)` directly to avoid double-indirection through Box.
+pub type TextCallback = dyn Fn(&str) + Send + Sync;
 
 /// Trait for LLM providers.
 pub trait LlmProvider: Send + Sync {

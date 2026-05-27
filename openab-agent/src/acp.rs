@@ -1,5 +1,5 @@
 use crate::agent::Agent;
-use crate::llm::{AnthropicProvider, TextCallback};
+use crate::llm::AnthropicProvider;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -192,14 +192,14 @@ impl AcpServer {
             }
         };
 
-        // Collect streaming notifications in a buffer. The callback writes
-        // session/update notifications as text chunks arrive from the LLM.
+        // Real streaming: write each text chunk to stdout immediately as it
+        // arrives from the LLM, so the harness can update Discord in real time.
         let session_id_owned = session_id.to_string();
-        let notifications: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let notif_clone = notifications.clone();
+        let stdout = Arc::new(Mutex::new(io::stdout()));
+        let stdout_clone = stdout.clone();
         let sid = session_id_owned.clone();
 
-        let cb: TextCallback = Box::new(move |text: &str| {
+        let cb = |text: &str| {
             let notification = serde_json::to_string(&JsonRpcNotification {
                 jsonrpc: "2.0",
                 method: "session/update".to_string(),
@@ -212,25 +212,23 @@ impl AcpServer {
                 }),
             })
             .unwrap();
-            notif_clone.lock().unwrap().push(notification);
-        });
+            let mut out = stdout_clone.lock().unwrap();
+            let _ = writeln!(out, "{}", notification);
+            let _ = out.flush();
+        };
 
         let result = agent.run(&prompt_text, Some(&cb)).await;
 
-        let mut output_lines: Vec<String> = notifications.lock().unwrap().drain(..).collect();
-
+        // Only the final response/error goes through the return path;
+        // all text chunks were already written to stdout above.
         match result {
-            Ok(_response_text) => {
-                // Text was already streamed via notifications above.
-                // Send final response to signal completion.
-                output_lines.push(self.ok_response(id, json!({ "stopReason": "end_turn" })));
+            Ok(_) => {
+                vec![self.ok_response(id, json!({ "stopReason": "end_turn" }))]
             }
             Err(e) => {
-                output_lines.push(self.error_response(id, -32000, &format!("agent error: {e}")));
+                vec![self.error_response(id, -32000, &format!("agent error: {e}"))]
             }
         }
-
-        output_lines
     }
 
     fn ok_response(&self, id: u64, result: Value) -> String {
@@ -259,7 +257,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_initialize_response() {
+    fn initialize_returns_streaming_capability() {
         let server = AcpServer::new();
         let resp_str = server.handle_initialize(1);
         let resp: Value = serde_json::from_str(&resp_str).unwrap();
@@ -270,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_new() {
+    fn session_new_with_valid_key_returns_session_id() {
         unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
         let mut server = AcpServer::new();
         let resp_str = server.handle_session_new(2);
@@ -281,7 +279,8 @@ mod tests {
     }
 
     #[test]
-    fn test_session_new_missing_key() {
+    #[ignore] // Modifies filesystem (removes auth.json)
+    fn session_new_without_credentials_returns_error() {
         let auth_path =
             std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
                 .join(".openab/agent/auth.json");

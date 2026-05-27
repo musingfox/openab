@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_agent_simple_text_response() {
+    async fn simple_prompt_returns_text_response() {
         let mock = MockLlmProvider::new(vec![vec![
             LlmEvent::Text("Hello!".to_string()),
             LlmEvent::Stop,
@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_agent_streams_text_via_callback() {
+    async fn streaming_callback_receives_all_text_chunks() {
         let mock = MockLlmProvider::new(vec![vec![
             LlmEvent::Text("Hello ".to_string()),
             LlmEvent::Text("world!".to_string()),
@@ -260,9 +260,9 @@ mod tests {
 
         let chunks: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
         let chunks_clone = chunks.clone();
-        let cb: TextCallback = Box::new(move |text| {
+        let cb = move |text: &str| {
             chunks_clone.lock().unwrap().push(text.to_string());
-        });
+        };
 
         let result = agent.run("hi", Some(&cb)).await.unwrap();
         assert_eq!(result, "Hello world!");
@@ -272,7 +272,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore] // Integration test: executes real file tools
-    async fn test_agent_tool_call_then_response() {
+    async fn tool_call_executes_then_returns_text() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("test.txt"), "file content here").unwrap();
 
@@ -295,7 +295,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore] // Integration test: executes real file tools
-    async fn test_agent_tool_error_handling() {
+    async fn tool_error_marked_as_is_error() {
         let tmp = tempfile::TempDir::new().unwrap();
 
         let mock = MockLlmProvider::new(vec![
@@ -326,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore] // Integration test: executes real file tools
-    async fn test_agent_multiple_tool_calls() {
+    async fn multiple_tool_rounds_execute_sequentially() {
         let tmp = tempfile::TempDir::new().unwrap();
 
         let mock = MockLlmProvider::new(vec![
