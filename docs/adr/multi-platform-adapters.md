@@ -288,6 +288,27 @@ Config stores Unicode emoji. Each adapter converts internally:
 | **Phase 3** | Slack adapter (Socket Mode), channel threading | ✅ Merged (#259) | Includes simultaneous Discord + Slack |
 | **Phase 4** | Per-adapter session soft limits, streaming timeout | Not started | See Known Limitations |
 | **Phase 5** | Platform-specific features: Slack blocks, Telegram inline keyboards, Discord embeds | Not started | Text-only for v1; extend via `PlatformExt` traits later |
+| **Phase Zulip** | Zulip adapter (`src/zulip.rs`), long-poll events API, generic-bot auth | ✅ Implemented | See entry below |
+
+### Phase Zulip notes
+
+Adds `ZulipAdapter` (REST + long-poll, no new crates — reuses `reqwest`) so
+`[zulip]` becomes a fourth adapter block alongside `[discord]`, `[slack]`, and
+`[gateway]`. Key design points:
+
+- **Thread key (D1)**: stream messages → `zulip:stream:{stream_id}:{normalized_topic}`
+  (lowercased + trimmed); DMs → `zulip:dm:{sorted_csv_of_user_ids}`. Topic
+  rename forks the ACP session — accepted v1 limitation, documented in
+  `docs/zulip.md`.
+- **Bot type (D5)**: requires a Zulip **generic bot**. Outgoing-webhook bots
+  cannot edit messages or react; both are required by the streaming + reaction
+  status protocol.
+- **Allowlist v1 (D2)**: `allowed_channels` (numeric stream IDs) +
+  `allowed_users` (numeric user IDs), matching Slack/Discord schema. No
+  `allowed_topics` — purely additive future extension if needed.
+- **Recovery**: long-poll loop detects `BAD_EVENT_QUEUE_ID` (string match) or
+  HTTP 400 on `/events` and transparently re-registers. 5xx errors back off
+  1/2/5/10s. `Retry-After` on 429 is honoured with a single retry.
 
 ---
 
