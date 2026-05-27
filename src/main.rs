@@ -121,10 +121,7 @@ async fn main() -> anyhow::Result<()> {
         "config loaded"
     );
 
-    if cfg.discord.is_none()
-        && cfg.slack.is_none()
-        && cfg.gateway.is_none()
-        && cfg.zulip.is_none()
+    if cfg.discord.is_none() && cfg.slack.is_none() && cfg.gateway.is_none() && cfg.zulip.is_none()
     {
         anyhow::bail!(
             "no adapter configured — add [discord], [slack], [gateway], and/or [zulip] to config.toml"
@@ -457,7 +454,8 @@ async fn main() -> anyhow::Result<()> {
         let allowed_users = parse_id_set(&discord_cfg.allowed_users, "discord.allowed_users")?;
         let trusted_bot_ids =
             parse_id_set(&discord_cfg.trusted_bot_ids, "discord.trusted_bot_ids")?;
-        let allowed_role_ids = parse_id_set(&discord_cfg.allowed_role_ids, "discord.allowed_role_ids")?;
+        let allowed_role_ids =
+            parse_id_set(&discord_cfg.allowed_role_ids, "discord.allowed_role_ids")?;
         info!(
             allow_all_channels,
             allow_all_users,

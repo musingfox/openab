@@ -152,7 +152,11 @@ impl ZulipAdapter {
     /// Construct a new adapter. `site` is the Zulip server base URL
     /// (e.g. `https://your-org.zulipchat.com`) — used as the prefix for all
     /// REST calls. `bot_email` + `api_key` form the HTTP Basic auth pair.
-    pub fn new(site: impl Into<String>, bot_email: impl Into<String>, api_key: impl Into<String>) -> Self {
+    pub fn new(
+        site: impl Into<String>,
+        bot_email: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Self {
         let mut site_str = site.into();
         // Normalize: strip trailing slash so we can paste-concat `/api/v1/...`.
         while site_str.ends_with('/') {
@@ -216,19 +220,17 @@ impl ZulipAdapter {
             let parsed: serde_json::Value =
                 serde_json::from_str(&body_text).unwrap_or(serde_json::Value::Null);
             if !status.is_success() {
-                let code = parsed
-                    .get("code")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let msg = parsed
-                    .get("msg")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let code = parsed.get("code").and_then(|v| v.as_str()).unwrap_or("");
+                let msg = parsed.get("msg").and_then(|v| v.as_str()).unwrap_or("");
                 return Err(anyhow!(
                     "Zulip {path}: HTTP {} {}{}",
                     status.as_u16(),
                     if code.is_empty() { "" } else { code },
-                    if msg.is_empty() { String::new() } else { format!(": {msg}") }
+                    if msg.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {msg}")
+                    }
                 ));
             }
             if parsed.get("result").and_then(|v| v.as_str()) == Some("error") {
@@ -411,7 +413,10 @@ async fn register_queue(adapter: &ZulipAdapter) -> Result<(String, i64)> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("no queue_id in register response"))?
         .to_string();
-    let last_event_id = resp.get("last_event_id").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let last_event_id = resp
+        .get("last_event_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
     Ok((queue_id, last_event_id))
 }
 
@@ -429,7 +434,10 @@ async fn poll_events(
     let resp = adapter
         .api_call(reqwest::Method::GET, "/api/v1/events", None, Some(&query))
         .await?;
-    Ok(resp.get("events").cloned().unwrap_or(serde_json::Value::Array(vec![])))
+    Ok(resp
+        .get("events")
+        .cloned()
+        .unwrap_or(serde_json::Value::Array(vec![])))
 }
 
 /// Bundle of fields the event loop hands to a sink per accepted message.
@@ -488,9 +496,12 @@ impl BrokerSink {
         dispatcher: Arc<crate::dispatch::Dispatcher>,
         pool: Arc<crate::acp::SessionPool>,
     ) -> Self {
-        Self { adapter, dispatcher, pool }
+        Self {
+            adapter,
+            dispatcher,
+            pool,
+        }
     }
-
 }
 
 #[async_trait]
@@ -505,13 +516,19 @@ impl ZulipMessageSink for BrokerSink {
         }
         // thread_key is `zulip:<thread_id>` — strip the `zulip:` prefix to get
         // the dispatcher's thread_id (mirrors gateway.rs:798-800).
-        let thread_id_for_dispatcher =
-            cmd.thread_key.strip_prefix("zulip:").unwrap_or(&cmd.thread_key);
+        let thread_id_for_dispatcher = cmd
+            .thread_key
+            .strip_prefix("zulip:")
+            .unwrap_or(&cmd.thread_key);
         self.dispatcher
             .cancel_buffered_thread("zulip", thread_id_for_dispatcher);
 
         let channel_id = cmd.stream_id.clone().unwrap_or_default();
-        let thread_id_opt = if cmd.topic.is_empty() { None } else { Some(cmd.topic.clone()) };
+        let thread_id_opt = if cmd.topic.is_empty() {
+            None
+        } else {
+            Some(cmd.topic.clone())
+        };
         let trigger_channel = ChannelRef {
             platform: "zulip".into(),
             channel_id: channel_id.clone(),
@@ -789,13 +806,27 @@ pub async fn run_zulip_adapter(
                         .and_then(|v| v.as_array())
                         .map(|arr| {
                             arr.iter()
-                                .filter_map(|r| r.get("id").and_then(|v| v.as_i64()).map(|i| i as u64))
+                                .filter_map(|r| {
+                                    r.get("id").and_then(|v| v.as_i64()).map(|i| i as u64)
+                                })
                                 .collect()
                         })
                         .unwrap_or_default();
                     thread_key_for_event(&ZulipEventKind::Dm { user_ids: &ids })
                 };
                 debug!(thread_key = %key, "zulip message dispatched");
+                if let Some(args) = parse_eom(&content) {
+                    sink.handle_eom(EomCommand {
+                        thread_key: key,
+                        stream_id,
+                        topic,
+                        sender_id,
+                        message_id,
+                        args,
+                    })
+                    .await;
+                    continue;
+                }
                 sink.dispatch(ZulipDispatchedMessage {
                     thread_key: key,
                     stream_id,
@@ -829,7 +860,10 @@ mod tests {
             stream_id: 42,
             topic: "Deploy 2026-Q2",
         };
-        assert_eq!(thread_key_for_event(&kind), "zulip:stream:42:deploy 2026-q2");
+        assert_eq!(
+            thread_key_for_event(&kind),
+            "zulip:stream:42:deploy 2026-q2"
+        );
     }
 
     #[test]
@@ -838,7 +872,10 @@ mod tests {
             stream_id: 42,
             topic: "  Deploy 2026-Q2  ",
         };
-        assert_eq!(thread_key_for_event(&kind), "zulip:stream:42:deploy 2026-q2");
+        assert_eq!(
+            thread_key_for_event(&kind),
+            "zulip:stream:42:deploy 2026-q2"
+        );
     }
 
     #[test]
@@ -892,7 +929,10 @@ mod tests {
             channel: channel.clone(),
             message_id: "9001".into(),
         };
-        let out = a.create_thread(&channel, &trigger, "anything").await.unwrap();
+        let out = a
+            .create_thread(&channel, &trigger, "anything")
+            .await
+            .unwrap();
         assert_eq!(out.platform, "zulip");
         assert_eq!(out.channel_id, "42");
         assert_eq!(out.thread_id.as_deref(), Some("deploy"));
@@ -956,7 +996,10 @@ mod tests {
 
     #[test]
     fn parse_eom_with_args() {
-        assert_eq!(parse_eom("/eom hello world"), Some("hello world".to_string()));
+        assert_eq!(
+            parse_eom("/eom hello world"),
+            Some("hello world".to_string())
+        );
     }
 
     #[test]
@@ -1068,7 +1111,10 @@ mod tests {
             .await
             .expect("should succeed after retry");
         let elapsed = start.elapsed();
-        assert!(elapsed.as_millis() >= 900, "should have slept ~1s, got {elapsed:?}");
+        assert!(
+            elapsed.as_millis() >= 900,
+            "should have slept ~1s, got {elapsed:?}"
+        );
         assert_eq!(resp["id"].as_i64(), Some(9001));
     }
 
@@ -1181,7 +1227,8 @@ mod tests {
         let canned = vec![Canned {
             status: 200,
             headers: vec![("Content-Type", "application/json".into())],
-            body: r#"{"result":"error","code":"MESSAGE_EDIT_HISTORY_DISABLED","msg":"no edits"}"#.into(),
+            body: r#"{"result":"error","code":"MESSAGE_EDIT_HISTORY_DISABLED","msg":"no edits"}"#
+                .into(),
         }];
         let base = spawn_mock(canned).await;
         let adapter = ZulipAdapter::new(base, "b@x", "k");
@@ -1375,9 +1422,8 @@ mod tests {
         let (tx, rx) = watch::channel(false);
 
         let sink_clone = sink.clone();
-        let handle = tokio::spawn(async move {
-            run_zulip_adapter(adapter, params, sink_clone, rx).await
-        });
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
 
         // Allow the loop to register + poll once + dispatch.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1389,7 +1435,12 @@ mod tests {
         res.expect("loop should return Ok");
 
         let log = sink.log.lock().unwrap();
-        assert_eq!(log.len(), 1, "expected 1 dispatched message, got {}", log.len());
+        assert_eq!(
+            log.len(),
+            1,
+            "expected 1 dispatched message, got {}",
+            log.len()
+        );
         assert_eq!(log[0].thread_key, "zulip:stream:42:x");
         assert_eq!(log[0].stream_id.as_deref(), Some("42"));
         assert_eq!(log[0].sender_id, "7");
@@ -1422,16 +1473,18 @@ mod tests {
         let (tx, rx) = watch::channel(false);
 
         let sink_clone = sink.clone();
-        let handle = tokio::spawn(async move {
-            run_zulip_adapter(adapter, params, sink_clone, rx).await
-        });
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let _ = tx.send(true);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
 
         let log = sink.log.lock().unwrap();
-        assert!(log.is_empty(), "expected no dispatched message, got {log:?}");
+        assert!(
+            log.is_empty(),
+            "expected no dispatched message, got {log:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1475,17 +1528,23 @@ mod tests {
         let (tx, rx) = watch::channel(false);
 
         let sink_clone = sink.clone();
-        let handle = tokio::spawn(async move {
-            run_zulip_adapter(adapter, params, sink_clone, rx).await
-        });
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let _ = tx.send(true);
         let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
-        assert!(res.is_ok(), "loop should exit within 5s after BAD_EVENT_QUEUE_ID recovery");
+        assert!(
+            res.is_ok(),
+            "loop should exit within 5s after BAD_EVENT_QUEUE_ID recovery"
+        );
 
         let log = sink.log.lock().unwrap();
-        assert_eq!(log.len(), 1, "expected message after re-register, got {log:?}");
+        assert_eq!(
+            log.len(),
+            1,
+            "expected message after re-register, got {log:?}"
+        );
         assert_eq!(log[0].thread_key, "zulip:stream:42:y");
     }
 
@@ -1523,14 +1582,16 @@ mod tests {
         let (tx, rx) = watch::channel(false);
 
         let sink_clone = sink.clone();
-        let handle = tokio::spawn(async move {
-            run_zulip_adapter(adapter, params, sink_clone, rx).await
-        });
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let _ = tx.send(true);
         let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
-        assert!(res.is_ok(), "loop should exit within 5s after HTTP 400 recovery");
+        assert!(
+            res.is_ok(),
+            "loop should exit within 5s after HTTP 400 recovery"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1550,9 +1611,8 @@ mod tests {
         let (tx, rx) = watch::channel(false);
 
         let sink_clone = sink.clone();
-        let handle = tokio::spawn(async move {
-            run_zulip_adapter(adapter, params, sink_clone, rx).await
-        });
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let _ = tx.send(true);
@@ -1565,7 +1625,7 @@ mod tests {
     // --- BrokerSinkHandleEom -----------------------------------------------
 
     use crate::dispatch::{
-        BatchGrouping, Dispatcher, DispatchTarget, DEFAULT_CONSUMER_IDLE_TIMEOUT,
+        BatchGrouping, DispatchTarget, Dispatcher, DEFAULT_CONSUMER_IDLE_TIMEOUT,
     };
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -1735,4 +1795,68 @@ mod tests {
         );
     }
 
+    // --- EomWiredInEventLoop -----------------------------------------------
+
+    #[tokio::test]
+    async fn parse_then_route_branches_correctly() {
+        // Smaller unit: verify the parse-then-route decision in isolation —
+        // /eom content routes to handle_eom, plain content routes to dispatch.
+        let sink = Arc::new(RecordingSink::new());
+
+        let content_a = "hello world".to_string();
+        if let Some(args) = parse_eom(&content_a) {
+            sink.handle_eom(EomCommand {
+                thread_key: "k".into(),
+                stream_id: None,
+                topic: String::new(),
+                sender_id: "7".into(),
+                message_id: "1".into(),
+                args,
+            })
+            .await;
+        } else {
+            sink.dispatch(ZulipDispatchedMessage {
+                thread_key: "k".into(),
+                stream_id: None,
+                topic: String::new(),
+                sender_id: "7".into(),
+                message_id: "1".into(),
+                content: content_a,
+            })
+            .await;
+        }
+
+        let content_b = "/eom replan now".to_string();
+        if let Some(args) = parse_eom(&content_b) {
+            sink.handle_eom(EomCommand {
+                thread_key: "k".into(),
+                stream_id: None,
+                topic: String::new(),
+                sender_id: "7".into(),
+                message_id: "2".into(),
+                args,
+            })
+            .await;
+        } else {
+            sink.dispatch(ZulipDispatchedMessage {
+                thread_key: "k".into(),
+                stream_id: None,
+                topic: String::new(),
+                sender_id: "7".into(),
+                message_id: "2".into(),
+                content: content_b,
+            })
+            .await;
+        }
+
+        let dispatched = sink.log.lock().unwrap();
+        let eom_called = sink.eom_log.lock().unwrap();
+        assert_eq!(dispatched.len(), 1, "plain message routes to dispatch only");
+        assert_eq!(
+            eom_called.len(),
+            1,
+            "/eom message routes to handle_eom only"
+        );
+        assert_eq!(eom_called[0].args, "replan now");
+    }
 }
