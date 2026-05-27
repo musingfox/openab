@@ -173,6 +173,31 @@ Workarounds, none ideal:
 
 If/when `/help` lands, link from here and from the Troubleshooting section.
 
+### `/eom` may stall the event loop (observed 2026-05-27)
+
+After invoking `/eom` against a thread whose ACP session had already
+naturally completed (so `pool.reset_session` errors with "no session
+for thread"), the Zulip event loop emitted the `reset_session failed`
+warn and then went completely silent — no further events processed,
+no queue re-register. Container stayed `healthy`. A `docker compose
+restart openab-bot1` fixed it; the new queue immediately resumed
+processing.
+
+Repro suggestion: send a /eom on an inactive thread, wait the
+`idle_queue_timeout_secs` (default ~600s), watch for whether
+`BAD_EVENT_QUEUE_ID` recovery fires. If it does not, the event loop
+task is dead — likely a panic or `.await` deadlock inside
+`handle_eom`'s `send_message` ack path. Suspects in priority order:
+(1) `adapter.send_message(...).await` panicked or hung;
+(2) `dispatcher.cancel_buffered_thread` did something unexpected
+   on a thread with no buffered messages;
+(3) panic uncaught by the event loop's outer `loop`.
+
+Mitigation until fixed: wrap the entire `handle_eom` body in a
+`tokio::spawn` so a failure cannot kill the event loop task, and add
+`catch_unwind` around the event loop's main `loop` so a panic
+re-registers instead of silently dying.
+
 ### Other deferred items
 
 - `/reset` and `/cancel` parity with the Discord/Slack adapters
