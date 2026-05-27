@@ -129,7 +129,8 @@ impl Agent {
                 content: assistant_content,
             });
 
-            if tool_calls.is_empty() || !text_parts.is_empty() {
+            if tool_calls.is_empty() {
+                // No tool calls — we're done, use whatever text was produced
                 final_text = text_parts.join("");
                 break;
             }

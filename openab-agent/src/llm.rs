@@ -292,7 +292,13 @@ impl LlmProvider for AnthropicProvider {
                                 stop_reason = sr.to_string();
                             }
                         }
-                        _ => {}
+                        "error" => {
+                            let msg = event["error"]["message"]
+                                .as_str()
+                                .unwrap_or("unknown stream error");
+                            return Err(anyhow!("Anthropic stream error: {msg}"));
+                        }
+                        _ => {} // message_start, ping, etc. — no action needed
                     }
                 }
 
@@ -494,7 +500,14 @@ impl LlmProvider for OpenAiProvider {
                                         output_items.push(item.clone());
                                     }
                                 }
-                                _ => {}
+                                "error" => {
+                                    let msg = event["error"]["message"]
+                                        .as_str()
+                                        .or_else(|| event.get("message").and_then(|m| m.as_str()))
+                                        .unwrap_or("unknown stream error");
+                                    return Err(anyhow!("OpenAI stream error: {msg}"));
+                                }
+                                _ => {} // response.created, response.in_progress, etc.
                             }
                         }
                     }
