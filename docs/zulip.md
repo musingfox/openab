@@ -137,3 +137,49 @@ The adapter re-registers its event queue cleanly.
 - User display names are not resolved in v1 — the prompt SenderContext sees
   the numeric `sender_id` verbatim. Agents that pretty-print sender names
   will show numbers instead of names.
+- `allow_user_messages = "involved"` is parsed but not yet enforced by the Zulip
+  event loop (review advisory #4). All allowlisted messages dispatch; "involved"
+  thread tracking lands in v1.1.
+- Bot self-suppression not yet wired (review advisory #5). Workaround:
+  set `allowed_users` to an explicit list that EXCLUDES the bot's own user_id,
+  so the existing allowlist gate drops the bot's own messages. Default
+  `allowed_users = []` (= `allow_all_users`) **will** cause an echo loop once the
+  bot is subscribed to the stream — see Troubleshooting #4.
+
+## Known gaps for v1.1
+
+Tracked here so they don't get rediscovered.
+
+### Slash command UX integration
+
+Zulip does **not** expose any API for third-party bots to register slash
+commands in the compose-box autocomplete (`/me`, `/poll`, `/todo` etc. are
+hardcoded in the Zulip server). The text-prefix commands (`/eom` today,
+likely `/help` and `/reset` later) work but get no UI affordance — users
+must know to type them.
+
+Workarounds, none ideal:
+
+1. Implement a `/help` text-prefix command (~20 LOC, same shape as `/eom`)
+   that returns a markdown list of available bot commands. Industry standard
+   for Zulip bots — `zulip_bots` framework defaults to this.
+2. Edit the bot's Zulip `full_name` to embed a hint, e.g.
+   `adam-bot (try /eom <task>)`. Visible on hover; cluttered in message list.
+3. Bot posts an inline tip on first @mention per topic. Annoying on repeat.
+4. Zulip admin sets a linkifier to highlight `/eom` text — visual hint only,
+   no autocomplete. Affects ALL messages, not bot-specific.
+5. Fork Zulip server itself. Only viable for self-hosted; massive effort;
+   not pursued.
+
+If/when `/help` lands, link from here and from the Troubleshooting section.
+
+### Other deferred items
+
+- `/reset` and `/cancel` parity with the Discord/Slack adapters
+  (they have native slash command versions; Zulip needs the text-prefix shape).
+- HTTP-400 fallback detection for `BAD_EVENT_QUEUE_ID` uses substring match
+  (review advisory #2). Extract a sentinel constant shared by `api_call`'s
+  formatter and `classify_events_error` so a refactor of one breaks the other
+  at compile time.
+- TCP-mock test helper depends on `Connection: close` to avoid reqwest
+  keep-alive reuse (review advisory #3). Test infra concern only.
