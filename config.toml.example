@@ -40,6 +40,19 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 #                                       # an AI app with the `assistant:write` scope (plus chat:write).
 #                                       # Set false for non-AI Slack apps to keep emoji reactions.
 
+# [zulip]
+# site = "${ZULIP_SITE}"               # e.g. "https://your-org.zulipchat.com"
+# bot_email = "${ZULIP_BOT_EMAIL}"     # generic-bot email (NOT outgoing webhook)
+# api_key = "${ZULIP_API_KEY}"         # generic-bot API key
+# allow_all_channels = false           # true = allow all streams; false = only allowed_channels
+#                                      # omitted = auto-detect from list (non-empty → false, empty → true)
+# allowed_channels = ["42"]            # numeric Zulip stream IDs (as strings)
+# allow_all_users = false              # true = any user; false = only allowed_users
+# allowed_users = ["7"]                # numeric Zulip user IDs (as strings)
+# allow_bot_messages = "off"           # "off" (default) | "mentions" | "all"
+# allow_user_messages = "involved"     # "involved" (default) | "mentions"
+# max_bot_turns = 100
+
 # [gateway]
 # url = "ws://openab-gateway:8080/ws"  # WebSocket URL of the custom gateway
 # platform = "line"                     # "telegram" (default) | "line" | "googlechat"
