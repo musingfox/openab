@@ -194,12 +194,10 @@ impl AcpServer {
 
         // Real streaming: write each text chunk to stdout immediately as it
         // arrives from the LLM, so the harness can update Discord in real time.
-        let session_id_owned = session_id.to_string();
+        let sid = session_id.to_string();
         let stdout = Arc::new(Mutex::new(io::stdout()));
-        let stdout_clone = stdout.clone();
-        let sid = session_id_owned.clone();
 
-        let cb = |text: &str| {
+        let cb = move |text: &str| {
             let notification = serde_json::to_string(&JsonRpcNotification {
                 jsonrpc: "2.0",
                 method: "session/update".to_string(),
@@ -212,7 +210,7 @@ impl AcpServer {
                 }),
             })
             .unwrap();
-            let mut out = stdout_clone.lock().unwrap();
+            let mut out = stdout.lock().unwrap();
             let _ = writeln!(out, "{}", notification);
             let _ = out.flush();
         };

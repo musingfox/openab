@@ -777,7 +777,7 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
- "futures-core",
+ "futures-util",
  "getrandom 0.4.2",
  "libc",
  "open",
