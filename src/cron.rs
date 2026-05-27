@@ -630,8 +630,7 @@ async fn fire_cronjob(
                 DisableOnSuccessResult::NotAchieved(reason) => {
                     info!(
                         id = job.id.as_deref().unwrap_or(""),
-                        reason,
-                        "disable_on_success not achieved, firing cronjob normally"
+                        reason, "disable_on_success not achieved, firing cronjob normally"
                     );
                 }
             }
@@ -711,7 +710,7 @@ async fn fire_cronjob(
             .or(Some(reply_channel.channel_id.clone())),
         is_bot: true,
         timestamp: Some(Utc::now().to_rfc3339()),
-        message_id: None, // cron jobs don't originate from a message
+        message_id: None,  // cron jobs don't originate from a message
         receiver_id: None, // cron jobs are self-triggered, no external receiver
     };
     let sender_json = match serde_json::to_string(&sender) {
@@ -1236,7 +1235,7 @@ message = "hello"
 "#;
         let cfg: UsercronFile = toml::from_str(toml_str).unwrap();
         let job = &cfg.jobs[0];
-        assert_eq!(job.enabled, true);
+        assert!(job.enabled);
         assert_eq!(job.platform, "discord");
         assert_eq!(job.sender_name, "openab-cron");
         assert_eq!(job.timezone, "UTC");
@@ -1258,7 +1257,7 @@ channel = "123"
 message = "hello"
 "#;
         let cfg: UsercronFile = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.jobs[0].enabled, false);
+        assert!(!cfg.jobs[0].enabled);
     }
 
     #[test]
