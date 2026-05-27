@@ -62,6 +62,22 @@ pub fn thread_key_for_event(kind: &ZulipEventKind<'_>) -> String {
     }
 }
 
+/// Parse an `/eom` invocation. Returns `Some(args)` if `body` starts with
+/// the literal `/eom` followed by whitespace or end-of-string; `args` is the
+/// trimmed remainder (may be empty). Leading whitespace before `/eom`
+/// disqualifies — keeps the rule simple and unambiguous.
+pub fn parse_eom(body: &str) -> Option<String> {
+    let rest = body.strip_prefix("/eom")?;
+    if rest.is_empty() {
+        return Some(String::new());
+    }
+    let next = rest.chars().next().unwrap();
+    if !next.is_whitespace() {
+        return None;
+    }
+    Some(rest.trim().to_string())
+}
+
 /// Decide whether a Zulip event passes the allowlist gate.
 ///
 /// `stream_id` is `Some(numeric_id_as_str)` for stream messages and `None` for
@@ -835,6 +851,48 @@ mod tests {
             &set(&["42"]),
             &set(&["7"]),
         ));
+    }
+
+    // --- EomCommandParser ---
+
+    #[test]
+    fn parse_eom_with_args() {
+        assert_eq!(parse_eom("/eom hello world"), Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn parse_eom_preserves_interior_whitespace() {
+        assert_eq!(parse_eom("/eom  do  this  "), Some("do  this".to_string()));
+    }
+
+    #[test]
+    fn parse_eom_no_args() {
+        assert_eq!(parse_eom("/eom"), Some(String::new()));
+    }
+
+    #[test]
+    fn parse_eom_whitespace_only_args() {
+        assert_eq!(parse_eom("/eom   "), Some(String::new()));
+    }
+
+    #[test]
+    fn parse_eom_not_at_start_is_rejected() {
+        assert_eq!(parse_eom("Hey /eom inside"), None);
+    }
+
+    #[test]
+    fn parse_eom_rejects_prefix_extension() {
+        assert_eq!(parse_eom("/eomx blah"), None);
+    }
+
+    #[test]
+    fn parse_eom_empty_body_is_none() {
+        assert_eq!(parse_eom(""), None);
+    }
+
+    #[test]
+    fn parse_eom_leading_whitespace_disqualifies() {
+        assert_eq!(parse_eom("  /eom hi"), None);
     }
 
     // --- HTTP test plumbing -------------------------------------------------
