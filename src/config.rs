@@ -768,7 +768,7 @@ fn emoji_queued() -> String {
     "👀".into()
 }
 fn emoji_thinking() -> String {
-    "🤔".into()
+    "🛠\u{fe0f}".into()
 }
 fn emoji_tool() -> String {
     "🔥".into()
@@ -780,10 +780,10 @@ fn emoji_web() -> String {
     "⚡".into()
 }
 fn emoji_done() -> String {
-    "🆗".into()
+    "✅".into()
 }
 fn emoji_error() -> String {
-    "😱".into()
+    "❌".into()
 }
 
 fn default_debounce_ms() -> u64 {
@@ -1060,6 +1060,18 @@ command = "echo"
         assert_eq!(cfg.agent.command, "echo");
         assert_eq!(cfg.pool.max_sessions, 10);
         assert!(cfg.reactions.enabled);
+    }
+
+    #[test]
+    fn reaction_emojis_default_uses_aligned_lifecycle_palette() {
+        let d = ReactionEmojis::default();
+        // Lifecycle palette aligned cross-platform — hammer-and-wrench /
+        // check-mark / cross-mark replace the legacy 🤔 / 🆗 / 😱.
+        assert_eq!(d.thinking, "🛠\u{fe0f}");
+        assert_eq!(d.done, "✅");
+        assert_eq!(d.error, "❌");
+        // Regression guard — queued must stay 👀.
+        assert_eq!(d.queued, "👀");
     }
 
     #[test]

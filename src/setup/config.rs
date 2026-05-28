@@ -106,12 +106,12 @@ pub fn generate_config(
             remove_after_reply: false,
             emojis: EmojisToml {
                 queued: "👀".into(),
-                thinking: "🤔".into(),
+                thinking: "🛠\u{fe0f}".into(),
                 tool: "🔥".into(),
                 coding: "👨💻".into(),
                 web: "⚡".into(),
-                done: "🆗".into(),
-                error: "😱".into(),
+                done: "✅".into(),
+                error: "❌".into(),
             },
             timing: TimingToml {
                 debounce_ms: 700,
