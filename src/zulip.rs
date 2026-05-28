@@ -110,6 +110,29 @@ pub fn allowlist_accepts(
 // ZulipAdapter
 // ---------------------------------------------------------------------------
 
+/// Build the form body for a `/api/v1/typing` request.
+///
+/// Mirrors `send_message`'s form shape (`zulip.rs` send_message): stream events
+/// carry `type=stream`, `to=<stream_id>`, `topic=<topic>`, and `stream_id` for
+/// server compatibility; DMs carry `type=direct` with `to=<json-array>` (the
+/// recipient list verbatim, as already stored on the ChannelRef).
+#[allow(dead_code)] // wired in DispatcherSpawnsTyping; tests exercise directly.
+fn typing_form(op: &str, channel: &ChannelRef) -> Vec<(&'static str, String)> {
+    let mut form: Vec<(&'static str, String)> = vec![("op", op.to_string())];
+    if let Some(topic) = &channel.thread_id {
+        form.push(("type", "stream".to_string()));
+        form.push(("to", channel.channel_id.clone()));
+        form.push(("topic", topic.clone()));
+        form.push(("stream_id", channel.channel_id.clone()));
+    } else {
+        // DM: `type=direct` (Zulip's typing endpoint uses `direct`, not
+        // `private`); `to` is the JSON-array literal of recipient IDs.
+        form.push(("type", "direct".to_string()));
+        form.push(("to", channel.channel_id.clone()));
+    }
+    form
+}
+
 /// Maps the default `[reactions.emojis]` unicode codepoints to Zulip emoji
 /// names (the API accepts a CLDR-style short name). Unknown emoji fall back to
 /// `question` so a misconfigured custom emoji doesn't break the reaction path.
@@ -351,6 +374,20 @@ impl ChatAdapter for ZulipAdapter {
 
     fn use_streaming(&self, other_bot_present: bool) -> bool {
         !other_bot_present
+    }
+
+    async fn start_typing(&self, channel: &ChannelRef) -> Result<()> {
+        let form = typing_form("start", channel);
+        self.api_call(reqwest::Method::POST, "/api/v1/typing", Some(&form), None)
+            .await?;
+        Ok(())
+    }
+
+    async fn stop_typing(&self, channel: &ChannelRef) -> Result<()> {
+        let form = typing_form("stop", channel);
+        self.api_call(reqwest::Method::POST, "/api/v1/typing", Some(&form), None)
+            .await?;
+        Ok(())
     }
 }
 
@@ -1858,5 +1895,51 @@ mod tests {
             "/eom message routes to handle_eom only"
         );
         assert_eq!(eom_called[0].args, "replan now");
+    }
+
+    // --- ZulipTyping (stream + direct) -------------------------------------
+
+    fn stream_channel() -> ChannelRef {
+        ChannelRef {
+            platform: "zulip".into(),
+            channel_id: "42".into(),
+            thread_id: Some("topic-x".into()),
+            parent_id: None,
+            origin_event_id: None,
+        }
+    }
+
+    fn form_get<'a>(form: &'a [(&'a str, String)], key: &str) -> Option<&'a str> {
+        form.iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn typing_form_stream_has_op_type_topic_and_stream_identifier() {
+        let f = typing_form("start", &stream_channel());
+        assert_eq!(form_get(&f, "op"), Some("start"));
+        assert_eq!(form_get(&f, "type"), Some("stream"));
+        assert_eq!(form_get(&f, "topic"), Some("topic-x"));
+        // Stream identifier present as either `to` or `stream_id`.
+        let to = form_get(&f, "to");
+        let sid = form_get(&f, "stream_id");
+        assert!(
+            to == Some("42") || sid == Some("42"),
+            "expected stream identifier 42, got to={to:?} stream_id={sid:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_typing_returns_err_on_http_500() {
+        let canned = vec![Canned {
+            status: 500,
+            headers: vec![("Content-Type", "application/json".into())],
+            body: r#"{"result":"error","msg":"server"}"#.into(),
+        }];
+        let base = spawn_mock(canned).await;
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        let err = adapter.start_typing(&stream_channel()).await.unwrap_err();
+        assert!(err.to_string().contains("500"), "missing 500: {err}");
     }
 }
