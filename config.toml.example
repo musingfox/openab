@@ -155,12 +155,12 @@ remove_after_reply = false
 
 [reactions.emojis]
 queued = "👀"
-thinking = "🤔"
+thinking = "🛠️"
 tool = "🔥"
 coding = "👨💻"
 web = "⚡"
-done = "🆗"
-error = "😱"
+done = "✅"
+error = "❌"
 
 [reactions.timing]
 debounce_ms = 700
