@@ -234,19 +234,16 @@ impl LlmProvider for AnthropicProvider {
                     match event_type {
                         "content_block_start" => {
                             let block = &event["content_block"];
-                            match block.get("type").and_then(|t| t.as_str()) {
-                                Some("tool_use") => {
-                                    // Flush any accumulated text
-                                    if !current_text.is_empty() {
-                                        events.push(LlmEvent::Text(current_text.clone()));
-                                        current_text.clear();
-                                    }
-                                    in_tool_use = true;
-                                    tool_id = block["id"].as_str().unwrap_or("").to_string();
-                                    tool_name = block["name"].as_str().unwrap_or("").to_string();
-                                    tool_input_json.clear();
+                            if let Some("tool_use") = block.get("type").and_then(|t| t.as_str()) {
+                                // Flush any accumulated text
+                                if !current_text.is_empty() {
+                                    events.push(LlmEvent::Text(current_text.clone()));
+                                    current_text.clear();
                                 }
-                                _ => {}
+                                in_tool_use = true;
+                                tool_id = block["id"].as_str().unwrap_or("").to_string();
+                                tool_name = block["name"].as_str().unwrap_or("").to_string();
+                                tool_input_json.clear();
                             }
                         }
                         "content_block_delta" => {

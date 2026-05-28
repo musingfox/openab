@@ -273,7 +273,7 @@ mod tests {
         let resp: Value = serde_json::from_str(&resp_str).unwrap();
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 2);
-        assert!(resp["result"]["sessionId"].as_str().unwrap().len() > 0);
+        assert!(!resp["result"]["sessionId"].as_str().unwrap().is_empty());
     }
 
     #[test]
