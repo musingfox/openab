@@ -1189,6 +1189,31 @@ mod tests {
         assert_eq!(rec.calls().len(), 1);
     }
 
+    /// Compile-time regression guard: `maybe_resolve_topic` returns `()`,
+    /// not `Result<()>`. This is the structural guarantee that a resolve
+    /// failure cannot regress the surrounding turn (ResolveErrorDoesNotRegressTurn
+    /// contract). If someone changes the signature to return Result<()>, the
+    /// post-send call site in `stream_prompt_blocks` would need a `?` or
+    /// match, and this assertion below would fail to compile.
+    #[tokio::test]
+    async fn maybe_resolve_topic_signature_returns_unit() {
+        let rec = Arc::new(ResolveRecordingAdapter::fail_with("boom"));
+        let adapter: Arc<dyn ChatAdapter> = rec.clone();
+        let directives = OutputDirectives {
+            resolve: true,
+            ..Default::default()
+        };
+        // `let () = ...` only compiles when the expression evaluates to ().
+        let () = maybe_resolve_topic(
+            &adapter,
+            &resolve_test_channel(),
+            &resolve_test_msg(),
+            &directives,
+            true,
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn resolve_topic_trait_default_impl_is_ok_noop() {
         struct StubAdapter;
