@@ -1628,4 +1628,23 @@ mod directive_tests {
         assert!(directives.resolve);
         assert_eq!(content, "body");
     }
+
+    #[test]
+    fn parse_resolve_header_never_leaks_into_stripped_content() {
+        // Regression guard: whatever the surrounding content, after parsing
+        // the directive header the literal `[[resolve]]` must NOT appear in
+        // the body sent to send_message. The user must never see it.
+        for input in [
+            "[[resolve]]\nAll done.",
+            "[[resolve]]  inline body",
+            "[[reply_to:123]]\n[[resolve]]\nMixed",
+            "[[resolve]]",
+        ] {
+            let (_d, body) = parse_output_directives(input);
+            assert!(
+                !body.contains("[[resolve]]"),
+                "stripped body must not contain literal directive, got: {body:?}"
+            );
+        }
+    }
 }
