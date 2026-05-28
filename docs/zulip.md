@@ -146,6 +146,58 @@ The adapter re-registers its event queue cleanly.
   `allowed_users = []` (= `allow_all_users`) **will** cause an echo loop once the
   bot is subscribed to the stream — see Troubleshooting #4.
 
+## Topic auto-resolve (`[[resolve]]` directive)
+
+When the agent emits `[[resolve]]` as the **first line** of its final reply,
+the broker strips that line from the visible message and — only if the turn
+completed naturally (id-bearing-success notification, not EOF / timeout /
+error / `/eom`-cancel) — issues `PATCH /api/v1/messages/{id}` with
+`topic=✔ <original topic>` and `propagate_mode=change_all`. Zulip then
+renames the topic and visually collapses it under its resolved-topic UX.
+
+### Agent-side system-prompt snippet
+
+To opt the agent into this behaviour, include a line like this in your
+agent's system prompt (or `opencode.json` instructions):
+
+> When the user has confirmed the task is complete and the conversation is
+> done, emit `[[resolve]]` as the first line of your final response.
+
+### Required Zulip permission
+
+The bot user must belong to a group permitted to rename topics. The exact
+setting name depends on your Zulip server version:
+
+- Zulip ≥ 10.0: `can_resolve_topics_group` (preferred)
+- Earlier Zulip: `can_move_messages_between_topics_group`
+
+If neither is granted, the PATCH returns HTTP 400 with a permission error;
+see Failure mode below.
+
+### Failure mode
+
+If the PATCH fails (permission, network, etc.) the broker logs a `warn` with
+the underlying error and the turn **completes normally** — the agent's reply
+is still posted and the success reaction still fires. The user sees no
+warning; only operators tailing the broker log see the failure. Fix the
+permission or unblock the bot, then the next `[[resolve]]` will succeed.
+
+### Idempotency
+
+If the topic already starts with `✔ ` (e.g., it was resolved earlier and the
+agent emits `[[resolve]]` again), the broker reuses the existing prefix
+instead of stacking — the PATCH carries the unchanged `✔ <name>` rather than
+`✔ ✔ <name>`. Calling `[[resolve]]` on an already-resolved topic is safe.
+
+### Side effect: thread key forks
+
+A topic rename changes the Zulip topic name, which is part of the broker's
+session key (see "Limitations (v1)" #3). The ACP session anchored at the
+old topic is implicitly retired — subsequent messages on the renamed topic
+will start a fresh session. Since `[[resolve]]` is emitted at end-of-turn
+this is generally the intended outcome (the conversation is, after all,
+resolved); it is documented here so the behaviour is not surprising.
+
 ## Known gaps for v1.1
 
 Tracked here so they don't get rediscovered.
