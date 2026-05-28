@@ -372,6 +372,30 @@ impl ChatAdapter for ZulipAdapter {
         Ok(())
     }
 
+    /// Mark the topic resolved by prepending `✔ ` (U+2714 + ASCII space).
+    /// Idempotent: if the topic already starts with `✔ `, the existing prefix
+    /// is reused (no double-prefix). DMs (no topic) are a no-op.
+    async fn resolve_topic(
+        &self,
+        channel: &ChannelRef,
+        trigger_msg: &MessageRef,
+    ) -> Result<()> {
+        let Some(topic) = channel.thread_id.as_deref() else {
+            // No topic — DM or otherwise topic-less. Nothing to resolve.
+            return Ok(());
+        };
+        let unprefixed = topic.strip_prefix("\u{2714} ").unwrap_or(topic);
+        let new_topic = format!("\u{2714} {unprefixed}");
+        let form = [
+            ("topic", new_topic),
+            ("propagate_mode", "change_all".to_string()),
+        ];
+        let path = format!("/api/v1/messages/{}", trigger_msg.message_id);
+        self.api_call(reqwest::Method::PATCH, &path, Some(&form), None)
+            .await?;
+        Ok(())
+    }
+
     fn use_streaming(&self, other_bot_present: bool) -> bool {
         !other_bot_present
     }
@@ -1087,29 +1111,69 @@ mod tests {
     /// per incoming connection. Returns the bound base URL (without trailing
     /// slash) so the adapter can be pointed at it.
     async fn spawn_mock(canned: Vec<Canned>) -> String {
+        let (url, _recorded) = spawn_mock_recording(canned).await;
+        url
+    }
+
+    /// Variant of `spawn_mock` that captures the full request string (headers
+    /// + body) for each handled connection. Returns `(base_url, recorded)`.
+    /// Tests inspect `recorded` to assert request shape (method, path, form
+    /// fields). Body-aware: reads Content-Length bytes after \r\n\r\n.
+    async fn spawn_mock_recording(
+        canned: Vec<Canned>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
+        let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let rec_clone = recorded.clone();
         tokio::spawn(async move {
             for c in canned {
                 let (mut sock, _) = match listener.accept().await {
                     Ok(s) => s,
                     Err(_) => return,
                 };
-                // Drain the request (best-effort, until \r\n\r\n).
                 let mut buf = [0u8; 4096];
                 let mut total = String::new();
+                // Read until headers complete.
                 while let Ok(n) = sock.read(&mut buf).await {
                     if n == 0 {
                         break;
                     }
                     total.push_str(&String::from_utf8_lossy(&buf[..n]));
                     if total.contains("\r\n\r\n") {
-                        // For requests with a body, the Content-Length header tells
-                        // us if there is more — but for these tests we don't need
-                        // to parse the body, just respond.
                         break;
                     }
                 }
+                // If a Content-Length is declared, read the remaining body bytes.
+                let header_end = total.find("\r\n\r\n").map(|i| i + 4).unwrap_or(total.len());
+                let content_length: usize = total[..header_end]
+                    .lines()
+                    .find_map(|l| {
+                        let mut parts = l.splitn(2, ':');
+                        let k = parts.next()?.trim();
+                        let v = parts.next()?.trim();
+                        if k.eq_ignore_ascii_case("content-length") {
+                            v.parse().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let already = total.len() - header_end;
+                if content_length > already {
+                    let need = content_length - already;
+                    let mut got = 0;
+                    while got < need {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                total.push_str(&String::from_utf8_lossy(&buf[..n]));
+                                got += n;
+                            }
+                        }
+                    }
+                }
+                rec_clone.lock().unwrap().push(total);
                 let mut resp = format!("HTTP/1.1 {} OK\r\n", c.status);
                 for (k, v) in &c.headers {
                     resp.push_str(&format!("{k}: {v}\r\n"));
@@ -1121,7 +1185,7 @@ mod tests {
                 let _ = sock.shutdown().await;
             }
         });
-        format!("http://{addr}")
+        (format!("http://{addr}"), recorded)
     }
 
     // --- ZulipApiClient ---
@@ -1281,6 +1345,113 @@ mod tests {
         };
         let err = adapter.edit_message(&msg, "hello world").await.unwrap_err();
         assert!(err.to_string().contains("MESSAGE_EDIT_HISTORY_DISABLED"));
+    }
+
+    // --- ZulipResolveTopic ---
+
+    fn ok_200() -> Canned {
+        Canned {
+            status: 200,
+            headers: vec![("Content-Type", "application/json".into())],
+            body: r#"{"result":"success"}"#.into(),
+        }
+    }
+
+    fn resolve_channel(topic: &str) -> ChannelRef {
+        ChannelRef {
+            platform: "zulip".into(),
+            channel_id: "42".into(),
+            thread_id: Some(topic.into()),
+            parent_id: None,
+            origin_event_id: None,
+        }
+    }
+
+    fn resolve_trigger(message_id: &str, channel: ChannelRef) -> MessageRef {
+        MessageRef {
+            channel,
+            message_id: message_id.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_topic_prepends_check_mark_and_propagate_all() {
+        let (base, recorded) = spawn_mock_recording(vec![ok_200()]).await;
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        let channel = resolve_channel("Bug X");
+        let msg = resolve_trigger("42", channel.clone());
+        adapter.resolve_topic(&channel, &msg).await.unwrap();
+
+        let reqs = recorded.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 1);
+        let req = &reqs[0];
+        // Method + path on the request line.
+        assert!(
+            req.starts_with("PATCH /api/v1/messages/42 "),
+            "expected PATCH on message 42, got: {}",
+            req.lines().next().unwrap_or("")
+        );
+        // Form body should carry URL-encoded check-mark + topic + propagate_mode.
+        // U+2714 = E2 9C 94 → %E2%9C%94
+        assert!(
+            req.contains("topic=%E2%9C%94+Bug+X") || req.contains("topic=%E2%9C%94%20Bug%20X"),
+            "missing topic=✔ Bug X (url-encoded), body: {req}"
+        );
+        assert!(
+            req.contains("propagate_mode=change_all"),
+            "missing propagate_mode=change_all, body: {req}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_topic_is_idempotent_on_already_resolved() {
+        let (base, recorded) = spawn_mock_recording(vec![ok_200()]).await;
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        let channel = resolve_channel("\u{2714} Bug X");
+        let msg = resolve_trigger("42", channel.clone());
+        adapter.resolve_topic(&channel, &msg).await.unwrap();
+
+        let reqs = recorded.lock().unwrap().clone();
+        let req = &reqs[0];
+        // Must NOT double-prefix — body should contain exactly one ✔ (encoded).
+        let occurrences = req.matches("%E2%9C%94").count();
+        assert_eq!(
+            occurrences, 1,
+            "expected single ✔ prefix, got {occurrences} in body: {req}"
+        );
+        assert!(req.contains("Bug+X") || req.contains("Bug%20X"));
+    }
+
+    #[tokio::test]
+    async fn resolve_topic_surfaces_permission_error() {
+        let canned = vec![Canned {
+            status: 400,
+            headers: vec![("Content-Type", "application/json".into())],
+            body: r#"{"result":"error","code":"BAD_REQUEST","msg":"You don't have permission"}"#
+                .into(),
+        }];
+        let base = spawn_mock(canned).await;
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        let channel = resolve_channel("Bug X");
+        let msg = resolve_trigger("42", channel.clone());
+        let err = adapter.resolve_topic(&channel, &msg).await.unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("400"), "missing status: {s}");
+    }
+
+    #[tokio::test]
+    async fn resolve_topic_dm_no_topic_is_noop() {
+        // No mock canned: if it tried HTTP, the test would hang/fail.
+        let adapter = ZulipAdapter::new("http://127.0.0.1:1", "b@x", "k");
+        let channel = ChannelRef {
+            platform: "zulip".into(),
+            channel_id: "[7,11]".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let msg = resolve_trigger("42", channel.clone());
+        adapter.resolve_topic(&channel, &msg).await.unwrap();
     }
 
     // --- ZulipReactionToggle ---
