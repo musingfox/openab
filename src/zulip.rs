@@ -375,11 +375,7 @@ impl ChatAdapter for ZulipAdapter {
     /// Mark the topic resolved by prepending `✔ ` (U+2714 + ASCII space).
     /// Idempotent: if the topic already starts with `✔ `, the existing prefix
     /// is reused (no double-prefix). DMs (no topic) are a no-op.
-    async fn resolve_topic(
-        &self,
-        channel: &ChannelRef,
-        trigger_msg: &MessageRef,
-    ) -> Result<()> {
+    async fn resolve_topic(&self, channel: &ChannelRef, trigger_msg: &MessageRef) -> Result<()> {
         let Some(topic) = channel.thread_id.as_deref() else {
             // No topic — DM or otherwise topic-less. Nothing to resolve.
             return Ok(());
@@ -1116,12 +1112,10 @@ mod tests {
     }
 
     /// Variant of `spawn_mock` that captures the full request string (headers
-    /// + body) for each handled connection. Returns `(base_url, recorded)`.
-    /// Tests inspect `recorded` to assert request shape (method, path, form
-    /// fields). Body-aware: reads Content-Length bytes after \r\n\r\n.
-    async fn spawn_mock_recording(
-        canned: Vec<Canned>,
-    ) -> (String, Arc<Mutex<Vec<String>>>) {
+    /// and body) for each handled connection. Returns `(base_url, recorded)`;
+    /// tests inspect `recorded` to assert request shape — method, path, form
+    /// fields. Body-aware: reads the declared `Content-Length` bytes.
+    async fn spawn_mock_recording(canned: Vec<Canned>) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
