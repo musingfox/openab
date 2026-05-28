@@ -139,6 +139,7 @@ fn typing_form(op: &str, channel: &ChannelRef) -> Vec<(&'static str, String)> {
 fn unicode_to_zulip_emoji(unicode: &str) -> &str {
     match unicode {
         "👀" => "eyes",
+        "🛠\u{fe0f}" => "working_on_it",
         "🤔" => "thinking",
         "🔥" => "fire",
         "👨\u{200d}💻" => "man_technologist",
@@ -1895,6 +1896,25 @@ mod tests {
             "/eom message routes to handle_eom only"
         );
         assert_eq!(eom_called[0].args, "replan now");
+    }
+
+    // --- ZulipEmojiMap -----------------------------------------------------
+
+    #[test]
+    fn unicode_to_zulip_emoji_maps_hammer_and_wrench() {
+        // U+1F6E0 (HAMMER AND WRENCH) + U+FE0F (VS-16) — the canonical default
+        // glyph that ReactionEmojis::default().thinking will yield.
+        assert_eq!(unicode_to_zulip_emoji("\u{1f6e0}\u{fe0f}"), "working_on_it");
+    }
+
+    #[test]
+    fn default_thinking_emoji_resolves_to_a_known_name() {
+        let thinking = crate::config::ReactionEmojis::default().thinking;
+        assert_ne!(
+            unicode_to_zulip_emoji(&thinking),
+            "question",
+            "thinking glyph {thinking:?} must map to a real Zulip emoji name"
+        );
     }
 
     // --- ZulipTyping (stream + direct) -------------------------------------
