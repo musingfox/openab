@@ -15,10 +15,14 @@ use crate::reactions::StatusReactionController;
 
 /// Parsed directives from agent output header block.
 /// Consecutive `[[key:value]]` lines at the start of output are directives.
+/// Bare `[[resolve]]` (no colon) is also recognized and signals that the
+/// platform-side topic should be marked resolved on natural turn completion.
 #[derive(Default, Debug)]
 pub struct OutputDirectives {
     /// Message ID to reply to (Discord: message_reference)
     pub reply_to: Option<String>,
+    /// Agent requests that the conversation topic be marked resolved.
+    pub resolve: bool,
 }
 
 /// Parse `[[key:value]]` directives from the beginning of agent output.
@@ -75,7 +79,33 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                         content_start += 1;
                     }
                 } else {
-                    // [[X]] without colon — not a directive, stop parsing
+                    // [[X]] without colon — only `[[resolve]]` is recognized
+                    // as a bare keyword directive; everything else falls
+                    // through to break (preserved as content).
+                    if inner.trim() == "resolve" {
+                        directives.resolve = true;
+                        // Check for trailing content after ]] (mirror colon branch).
+                        let remainder = after_open[close_pos + 2..].trim();
+                        if !remainder.is_empty() {
+                            trailing_content = Some(remainder);
+                            content_start += line.len();
+                            if content.as_bytes().get(content_start) == Some(&b'\r') {
+                                content_start += 1;
+                            }
+                            if content.as_bytes().get(content_start) == Some(&b'\n') {
+                                content_start += 1;
+                            }
+                            break;
+                        }
+                        content_start += line.len();
+                        if content.as_bytes().get(content_start) == Some(&b'\r') {
+                            content_start += 1;
+                        }
+                        if content.as_bytes().get(content_start) == Some(&b'\n') {
+                            content_start += 1;
+                        }
+                        continue;
+                    }
                     break;
                 }
             } else {
@@ -1492,5 +1522,73 @@ mod directive_tests {
         let (directives, content) = parse_output_directives(input);
         assert_eq!(directives.reply_to, Some("456".to_string()));
         assert_eq!(content, "看看 [[這個]] 怎麼樣");
+    }
+
+    #[test]
+    fn parse_resolve_directive_strips_header() {
+        let input = "[[resolve]]\nbody";
+        let (directives, content) = parse_output_directives(input);
+        assert!(directives.resolve);
+        assert_eq!(content, "body");
+    }
+
+    #[test]
+    fn parse_unknown_bare_directive_preserved_as_content() {
+        // `[[foo]]` is NOT in the closed set — preserved as content,
+        // directives.resolve stays false. Mirrors `parse_bracket_without_colon_preserved`.
+        let input = "[[foo]]\nbody";
+        let (directives, content) = parse_output_directives(input);
+        assert!(!directives.resolve);
+        assert_eq!(content, input);
+    }
+
+    #[test]
+    fn parse_reply_to_then_resolve_both_set() {
+        let input = "[[reply_to:abc]]\n[[resolve]]\nbody";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(directives.reply_to, Some("abc".to_string()));
+        assert!(directives.resolve);
+        assert_eq!(content, "body");
+    }
+
+    #[test]
+    fn parse_no_resolve_when_directive_absent() {
+        let input = "body without directive";
+        let (directives, content) = parse_output_directives(input);
+        assert!(!directives.resolve);
+        assert_eq!(content, input);
+    }
+
+    #[test]
+    fn parse_resolve_only_no_content() {
+        let input = "[[resolve]]";
+        let (directives, content) = parse_output_directives(input);
+        assert!(directives.resolve);
+        assert_eq!(content, "");
+    }
+
+    #[test]
+    fn parse_resolve_with_inline_content() {
+        let input = "[[resolve]]  body inline";
+        let (directives, content) = parse_output_directives(input);
+        assert!(directives.resolve);
+        assert_eq!(content, "body inline");
+    }
+
+    #[test]
+    fn parse_resolve_only_first_line_recognized() {
+        // header-only — [[resolve]] not on first line is content
+        let input = "Hello\n[[resolve]]";
+        let (directives, content) = parse_output_directives(input);
+        assert!(!directives.resolve);
+        assert_eq!(content, input);
+    }
+
+    #[test]
+    fn parse_resolve_crlf_line_ending() {
+        let input = "[[resolve]]\r\nbody";
+        let (directives, content) = parse_output_directives(input);
+        assert!(directives.resolve);
+        assert_eq!(content, "body");
     }
 }
