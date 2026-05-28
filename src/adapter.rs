@@ -299,6 +299,17 @@ pub trait ChatAdapter: Send + Sync + 'static {
         self.edit_message(msg, "\u{200b}").await
     }
 
+    /// Mark the conversation topic as resolved on the underlying platform.
+    /// Invoked when the agent emits `[[resolve]]` and the turn completes naturally.
+    /// Default: no-op (adapters without topic-resolution semantics silently succeed).
+    async fn resolve_topic(
+        &self,
+        _channel: &ChannelRef,
+        _trigger_msg: &MessageRef,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether this adapter should use streaming edit (true) or send-once (false).
     /// `other_bot_present` indicates if another bot has posted in the current thread.
     /// Streaming should be disabled in multi-bot threads to avoid edit interference.
@@ -979,6 +990,55 @@ mod tests {
         let adapter = TestAdapter;
         // Verify the method is callable and returns the declared value
         assert!(!adapter.use_streaming(false));
+    }
+
+    #[tokio::test]
+    async fn resolve_topic_trait_default_impl_is_ok_noop() {
+        struct StubAdapter;
+
+        #[async_trait]
+        impl ChatAdapter for StubAdapter {
+            fn platform(&self) -> &'static str {
+                "stub"
+            }
+            fn message_limit(&self) -> usize {
+                2000
+            }
+            async fn send_message(&self, _: &ChannelRef, _: &str) -> Result<MessageRef> {
+                unimplemented!()
+            }
+            async fn create_thread(
+                &self,
+                _: &ChannelRef,
+                _: &MessageRef,
+                _: &str,
+            ) -> Result<ChannelRef> {
+                unimplemented!()
+            }
+            async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn use_streaming(&self, _: bool) -> bool {
+                false
+            }
+        }
+
+        let adapter = StubAdapter;
+        let ch = ChannelRef {
+            platform: "stub".into(),
+            channel_id: "c1".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let msg = MessageRef {
+            channel: ch.clone(),
+            message_id: "m1".into(),
+        };
+        assert!(adapter.resolve_topic(&ch, &msg).await.is_ok());
     }
 
     #[tokio::test]
