@@ -22,6 +22,7 @@ use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
 use crate::config::ReactionsConfig;
 use crate::error_display::format_user_error;
 use crate::reactions::StatusReactionController;
+use crate::typing::TypingHeartbeatController;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -767,6 +768,19 @@ async fn dispatch_batch(
     ));
     // 👀 already applied above; skip set_queued() to avoid double-reaction.
 
+    // Typing heartbeat — piggybacks on `reactions.enabled` (no separate knob).
+    // Held for the duration of the turn; drop after set_done/set_error so the
+    // badge clears in lockstep with the lifecycle reaction.
+    let _typing = if reactions_config.enabled {
+        Some(TypingHeartbeatController::new(
+            adapter.clone(),
+            thread_channel.clone(),
+            Duration::from_secs(10),
+        ))
+    } else {
+        None
+    };
+
     let result = target
         .stream_prompt_blocks(
             adapter,
@@ -1442,7 +1456,16 @@ mod tests {
     /// Mock `ChatAdapter` — every method is a no-op success. The dispatch loop
     /// invokes `add_reaction` (queued 👀), `platform`, and on the error path
     /// `send_message`; nothing else needs real behavior here.
-    struct MockChatAdapter;
+    #[derive(Default)]
+    struct MockChatAdapter {
+        typing_calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl MockChatAdapter {
+        fn typing_calls(&self) -> Vec<&'static str> {
+            self.typing_calls.lock().unwrap().clone()
+        }
+    }
 
     #[async_trait]
     impl ChatAdapter for MockChatAdapter {
@@ -1473,6 +1496,14 @@ mod tests {
             Ok(())
         }
         async fn remove_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn start_typing(&self, _channel: &ChannelRef) -> Result<()> {
+            self.typing_calls.lock().unwrap().push("start");
+            Ok(())
+        }
+        async fn stop_typing(&self, _channel: &ChannelRef) -> Result<()> {
+            self.typing_calls.lock().unwrap().push("stop");
             Ok(())
         }
         fn use_streaming(&self, _other_bot_present: bool) -> bool {
@@ -1517,7 +1548,7 @@ mod tests {
     ) -> Vec<RecordedDispatch> {
         let mock = Arc::new(MockDispatchTarget::new());
         let target: Arc<dyn DispatchTarget> = mock.clone();
-        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter::default());
         let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(msgs.len().max(1));
         for m in msgs {
             tx.send(m).await.unwrap();
@@ -1650,7 +1681,7 @@ mod tests {
         // "all senders dropped" branch.
         let mock = Arc::new(MockDispatchTarget::new());
         let target: Arc<dyn DispatchTarget> = mock.clone();
-        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter::default());
         let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(1);
         let consumer = tokio::spawn(consumer_loop(
             "mock:T".into(),
@@ -1688,7 +1719,7 @@ mod tests {
             BatchGrouping::Thread,
             DEFAULT_CONSUMER_IDLE_TIMEOUT,
         );
-        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter::default());
 
         let key = "mock:T".to_string();
         let parked = {
@@ -1723,5 +1754,71 @@ mod tests {
         assert_eq!(calls[0].block_count, 2);
 
         parked.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // DispatcherSpawnsTyping — typing badge auto-starts and auto-stops once
+    // per turn, and is gated by `reactions.enabled`.
+    // -----------------------------------------------------------------------
+
+    async fn run_dispatch_collect_typing(
+        reactions_enabled: bool,
+        stream_err: Option<String>,
+    ) -> (Vec<&'static str>, Result<()>) {
+        let mut mock = MockDispatchTarget::new();
+        mock.reactions.enabled = reactions_enabled;
+        *mock.stream_err.lock().unwrap() = stream_err;
+        let target: Arc<dyn DispatchTarget> = Arc::new(mock);
+        let chat = Arc::new(MockChatAdapter::default());
+        let adapter: Arc<dyn ChatAdapter> = chat.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(1);
+        tx.send(make_msg("hi", 10)).await.unwrap();
+        drop(tx);
+
+        consumer_loop(
+            "mock:T".into(),
+            make_channel("T"),
+            rx,
+            target,
+            adapter,
+            10,
+            24_000,
+            Duration::from_secs(60),
+        )
+        .await;
+        // Give the heartbeat task a tick to post its terminal stop_typing.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        (chat.typing_calls(), Ok(()))
+    }
+
+    #[tokio::test]
+    async fn dispatch_batch_starts_and_stops_typing_once_per_turn() {
+        let (calls, _) = run_dispatch_collect_typing(true, None).await;
+        let starts = calls.iter().filter(|c| **c == "start").count();
+        let stops = calls.iter().filter(|c| **c == "stop").count();
+        assert!(starts >= 1, "expected >=1 start_typing, got {calls:?}");
+        assert_eq!(stops, 1, "expected exactly 1 stop_typing, got {calls:?}");
+        assert_eq!(
+            calls.last().copied(),
+            Some("stop"),
+            "stop_typing must be the last typing call: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_batch_stops_typing_when_stream_errors() {
+        let (calls, _) =
+            run_dispatch_collect_typing(true, Some("simulated stream failure".into())).await;
+        let stops = calls.iter().filter(|c| **c == "stop").count();
+        assert_eq!(stops, 1, "stop_typing must fire on error path: {calls:?}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_batch_records_zero_typing_when_reactions_disabled() {
+        let (calls, _) = run_dispatch_collect_typing(false, None).await;
+        assert!(
+            calls.is_empty(),
+            "reactions.enabled=false must skip typing entirely, got {calls:?}"
+        );
     }
 }

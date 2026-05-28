@@ -237,15 +237,12 @@ pub trait ChatAdapter: Send + Sync + 'static {
 
     /// Begin a typing indicator on the given channel.
     /// Default: no-op (adapters without typing support silently succeed).
-    // dead_code: callers land in DispatcherSpawnsTyping; keep surface available now.
-    #[allow(dead_code)]
     async fn start_typing(&self, _channel: &ChannelRef) -> Result<()> {
         Ok(())
     }
 
     /// End a typing indicator on the given channel.
     /// Default: no-op (adapters without typing support silently succeed).
-    #[allow(dead_code)]
     async fn stop_typing(&self, _channel: &ChannelRef) -> Result<()> {
         Ok(())
     }
@@ -494,6 +491,19 @@ impl AdapterRouter {
         if !assistant_status {
             reactions.set_queued().await;
         }
+
+        // Typing heartbeat — piggybacks on `reactions.enabled` (no separate
+        // knob). Held for the duration of the turn; dropped at scope exit so
+        // stop_typing fires after set_done/set_error.
+        let _typing = if self.reactions_config.enabled {
+            Some(crate::typing::TypingHeartbeatController::new(
+                adapter.clone(),
+                ctx.thread_channel.clone(),
+                std::time::Duration::from_secs(10),
+            ))
+        } else {
+            None
+        };
 
         let result = self
             .stream_prompt(

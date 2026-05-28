@@ -28,7 +28,6 @@ pub struct TypingHeartbeatController {
 impl TypingHeartbeatController {
     /// Spawn the heartbeat task. Posts one `start_typing` immediately, then
     /// every `interval` until dropped.
-    #[allow(dead_code)] // wired in DispatcherSpawnsTyping.
     pub fn new(adapter: Arc<dyn ChatAdapter>, channel: ChannelRef, interval: Duration) -> Self {
         let (kill_tx, mut kill_rx) = watch::channel(false);
         let handle = tokio::spawn(async move {
