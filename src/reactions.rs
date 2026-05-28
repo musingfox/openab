@@ -274,3 +274,124 @@ fn cancel_timers(inner: &mut Inner) {
         h.abort();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::{ChannelRef, MessageRef};
+    use crate::config::{ReactionEmojis, ReactionTiming};
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    /// Records reaction add/remove calls so tests can assert the lifecycle
+    /// sequence. Other adapter methods are unimplemented — only the reaction
+    /// path is exercised by StatusReactionController.
+    #[derive(Default)]
+    struct RecordingAdapter {
+        ops: Mutex<Vec<(String, String)>>, // (verb, emoji)
+    }
+
+    impl RecordingAdapter {
+        fn ops(&self) -> Vec<(String, String)> {
+            self.ops.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl crate::adapter::ChatAdapter for RecordingAdapter {
+        fn platform(&self) -> &'static str {
+            "rec"
+        }
+        fn message_limit(&self) -> usize {
+            2000
+        }
+        async fn send_message(&self, _: &ChannelRef, _: &str) -> Result<MessageRef> {
+            unimplemented!()
+        }
+        async fn create_thread(
+            &self,
+            _: &ChannelRef,
+            _: &MessageRef,
+            _: &str,
+        ) -> Result<ChannelRef> {
+            unimplemented!()
+        }
+        async fn add_reaction(&self, _: &MessageRef, emoji: &str) -> Result<()> {
+            self.ops.lock().unwrap().push(("add".into(), emoji.into()));
+            Ok(())
+        }
+        async fn remove_reaction(&self, _: &MessageRef, emoji: &str) -> Result<()> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(("remove".into(), emoji.into()));
+            Ok(())
+        }
+        fn use_streaming(&self, _: bool) -> bool {
+            false
+        }
+    }
+
+    fn fake_msg() -> MessageRef {
+        MessageRef {
+            channel: ChannelRef {
+                platform: "rec".into(),
+                channel_id: "c1".into(),
+                thread_id: None,
+                parent_id: None,
+                origin_event_id: None,
+            },
+            message_id: "m1".into(),
+        }
+    }
+
+    fn fast_timing() -> ReactionTiming {
+        ReactionTiming {
+            debounce_ms: 50,
+            stall_soft_ms: 60_000,
+            stall_hard_ms: 120_000,
+            done_hold_ms: 0,
+            error_hold_ms: 0,
+        }
+    }
+
+    fn count_op(ops: &[(String, String)], verb: &str, emoji: &str) -> usize {
+        ops.iter().filter(|(v, e)| v == verb && e == emoji).count()
+    }
+
+    #[tokio::test]
+    async fn turn_start_records_queued_then_thinking_swap() {
+        let rec = Arc::new(RecordingAdapter::default());
+        let adapter: Arc<dyn crate::adapter::ChatAdapter> = rec.clone();
+        let ctrl = StatusReactionController::new(
+            true,
+            adapter,
+            fake_msg(),
+            ReactionEmojis::default(),
+            fast_timing(),
+        );
+        ctrl.set_queued().await;
+        ctrl.set_thinking().await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let ops = rec.ops();
+        let thinking = ReactionEmojis::default().thinking;
+        assert!(count_op(&ops, "add", "👀") >= 1, "missing add(👀): {ops:?}");
+        assert!(
+            count_op(&ops, "add", &thinking) >= 1,
+            "missing add(thinking): {ops:?}"
+        );
+        assert!(
+            count_op(&ops, "remove", "👀") >= 1,
+            "missing remove(👀): {ops:?}"
+        );
+
+        // Second set_thinking is idempotent — no additional add(thinking).
+        let before = count_op(&ops, "add", &thinking);
+        ctrl.set_thinking().await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let after = count_op(&rec.ops(), "add", &thinking);
+        assert_eq!(before, after, "set_thinking should be idempotent");
+    }
+}
