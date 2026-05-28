@@ -346,11 +346,16 @@ pub async fn handle_reply(
         Ok(resp) => {
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
             if body["ok"].as_bool() != Some(true) {
-                warn!(
-                    desc = %body["description"].as_str().unwrap_or("unknown"),
-                    "telegram Markdown send failed, retrying as plain text"
-                );
-                true
+                let desc = body["description"].as_str().unwrap_or("unknown");
+                // Only retry as plain text for parse-related errors; other failures
+                // (rate limit, forbidden, etc.) should not trigger a second request.
+                if desc.contains("parse") || desc.contains("entities") {
+                    warn!(desc = %desc, "telegram Markdown parse failed, retrying as plain text");
+                    true
+                } else {
+                    error!(desc = %desc, "telegram send failed (non-parse error)");
+                    false
+                }
             } else {
                 false
             }
@@ -362,7 +367,7 @@ pub async fn handle_reply(
     };
 
     if retry_plain {
-        let _ = client
+        match client
             .post(&url)
             .json(&serde_json::json!({
                 "chat_id": reply.channel.id,
@@ -371,7 +376,18 @@ pub async fn handle_reply(
             }))
             .send()
             .await
-            .map_err(|e| error!("telegram plain text send error: {e}"));
+        {
+            Ok(resp) => {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                if body["ok"].as_bool() != Some(true) {
+                    error!(
+                        desc = %body["description"].as_str().unwrap_or("unknown"),
+                        "telegram plain text fallback also failed"
+                    );
+                }
+            }
+            Err(e) => error!("telegram plain text send error: {e}"),
+        }
     }
 }
 
