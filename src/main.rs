@@ -19,6 +19,7 @@ mod setup;
 mod slack;
 mod stt;
 mod timestamp;
+mod typing;
 mod zulip;
 
 use adapter::AdapterRouter;
