@@ -129,6 +129,7 @@ pub trait DispatchTarget: Send + Sync + 'static {
         session_key: &str,
         content_blocks: Vec<ContentBlock>,
         thread_channel: &ChannelRef,
+        trigger_msg: &MessageRef,
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
     ) -> Result<()>;
@@ -150,6 +151,7 @@ impl DispatchTarget for AdapterRouter {
         session_key: &str,
         content_blocks: Vec<ContentBlock>,
         thread_channel: &ChannelRef,
+        trigger_msg: &MessageRef,
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
     ) -> Result<()> {
@@ -159,6 +161,7 @@ impl DispatchTarget for AdapterRouter {
             session_key,
             content_blocks,
             thread_channel,
+            trigger_msg,
             reactions,
             other_bot_present,
         )
@@ -638,7 +641,7 @@ async fn dispatch_batch(
     let reactions = Arc::new(StatusReactionController::new(
         reactions_config.enabled,
         adapter.clone(),
-        trigger_msg,
+        trigger_msg.clone(),
         reactions_config.emojis.clone(),
         reactions_config.timing.clone(),
     ));
@@ -663,6 +666,7 @@ async fn dispatch_batch(
             &session_key,
             content_blocks,
             thread_channel,
+            &trigger_msg,
             reactions.clone(),
             other_bot_present,
         )
@@ -1290,6 +1294,7 @@ mod tests {
             _session_key: &str,
             content_blocks: Vec<ContentBlock>,
             _thread_channel: &ChannelRef,
+            _trigger_msg: &MessageRef,
             _reactions: Arc<StatusReactionController>,
             other_bot_present: bool,
         ) -> Result<()> {
