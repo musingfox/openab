@@ -116,7 +116,6 @@ pub fn allowlist_accepts(
 /// carry `type=stream`, `to=<stream_id>`, `topic=<topic>`, and `stream_id` for
 /// server compatibility; DMs carry `type=direct` with `to=<json-array>` (the
 /// recipient list verbatim, as already stored on the ChannelRef).
-#[allow(dead_code)] // wired in DispatcherSpawnsTyping; tests exercise directly.
 fn typing_form(op: &str, channel: &ChannelRef) -> Vec<(&'static str, String)> {
     let mut form: Vec<(&'static str, String)> = vec![("op", op.to_string())];
     if let Some(topic) = &channel.thread_id {
