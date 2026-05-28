@@ -552,6 +552,7 @@ impl AdapterRouter {
                 &thread_key,
                 content_blocks,
                 &ctx.thread_channel,
+                &ctx.trigger_msg,
                 reactions.clone(),
                 ctx.other_bot_present,
             )
@@ -586,12 +587,14 @@ impl AdapterRouter {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn stream_prompt(
         &self,
         adapter: &Arc<dyn ChatAdapter>,
         thread_key: &str,
         content_blocks: Vec<ContentBlock>,
         thread_channel: &ChannelRef,
+        trigger_msg: &MessageRef,
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
     ) -> Result<()> {
@@ -600,6 +603,7 @@ impl AdapterRouter {
             thread_key,
             content_blocks,
             thread_channel,
+            trigger_msg,
             reactions,
             other_bot_present,
             // handle_message path (e.g. cron) is never Slack assistant-mode native
@@ -619,12 +623,14 @@ impl AdapterRouter {
         thread_key: &str,
         content_blocks: Vec<ContentBlock>,
         thread_channel: &ChannelRef,
+        trigger_msg: &MessageRef,
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
     ) -> Result<()> {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
+        let trigger_msg = trigger_msg.clone();
         let message_limit = adapter.message_limit();
         let streaming = adapter.use_streaming(other_bot_present);
         let native = adapter.uses_native_streaming(other_bot_present);
@@ -720,6 +726,10 @@ impl AdapterRouter {
                     // messages and abandons cleanly on dead agent / hard ceiling
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
+                    // Flipped to true ONLY on the id-bearing-success path —
+                    // gates topic auto-resolve so EOF / timeout / errors /
+                    // /eom-cancel never trigger it.
+                    let mut natural_completion = false;
                     let prompt_start = tokio::time::Instant::now();
                     loop {
                         let notification = tokio::select! {
@@ -756,6 +766,8 @@ impl AdapterRouter {
                             }
                             if let Some(ref err) = notification.error {
                                 response_error = Some(format_coded_error(err.code, &err.message, err.data_message()));
+                            } else {
+                                natural_completion = true;
                             }
                             break;
                         }
@@ -1017,10 +1029,41 @@ impl AdapterRouter {
                         }
                     }
 
+                    maybe_resolve_topic(
+                        &adapter,
+                        &thread_channel,
+                        &trigger_msg,
+                        &directives,
+                        natural_completion,
+                    )
+                    .await;
+
                     Ok(())
                 })
             })
             .await
+    }
+}
+
+/// Invoke `adapter.resolve_topic` iff the agent requested it (`[[resolve]]`)
+/// AND the turn ended naturally (id-bearing-success). All other exit paths
+/// — EOF, hard timeout, dead process, id-bearing-error, /eom-cancel — leave
+/// `natural_completion = false` and this becomes a no-op.
+///
+/// Resolve failures are logged at `warn` and swallowed so the rename never
+/// regresses the turn outcome (constraint C7).
+pub(crate) async fn maybe_resolve_topic(
+    adapter: &Arc<dyn ChatAdapter>,
+    channel: &ChannelRef,
+    trigger_msg: &MessageRef,
+    directives: &OutputDirectives,
+    natural_completion: bool,
+) {
+    if !(directives.resolve && natural_completion) {
+        return;
+    }
+    if let Err(e) = adapter.resolve_topic(channel, trigger_msg).await {
+        tracing::warn!(error = ?e, "resolve_topic failed; continuing turn");
     }
 }
 
@@ -1210,6 +1253,159 @@ mod tests {
         // renders_native_tables defaults to false: platforms that don't override
         // it keep the table→code/bullets conversion (e.g. Discord, Gateway).
         assert!(!adapter.renders_native_tables());
+    }
+
+    use std::sync::Mutex;
+
+    /// Records `resolve_topic` invocations + optional error injection.
+    /// Other ChatAdapter methods are unimplemented — only the resolve path is
+    /// exercised by `maybe_resolve_topic`.
+    #[derive(Default)]
+    struct ResolveRecordingAdapter {
+        resolve_calls: Mutex<Vec<MessageRef>>,
+        resolve_err: Mutex<Option<String>>,
+    }
+
+    impl ResolveRecordingAdapter {
+        fn calls(&self) -> Vec<MessageRef> {
+            self.resolve_calls.lock().unwrap().clone()
+        }
+        fn fail_with(msg: &str) -> Self {
+            Self {
+                resolve_calls: Mutex::new(Vec::new()),
+                resolve_err: Mutex::new(Some(msg.to_string())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ChatAdapter for ResolveRecordingAdapter {
+        fn platform(&self) -> &'static str {
+            "rec"
+        }
+        fn message_limit(&self) -> usize {
+            2000
+        }
+        async fn send_message(&self, _: &ChannelRef, _: &str) -> Result<MessageRef> {
+            unimplemented!()
+        }
+        async fn create_thread(
+            &self,
+            _: &ChannelRef,
+            _: &MessageRef,
+            _: &str,
+        ) -> Result<ChannelRef> {
+            unimplemented!()
+        }
+        async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn use_streaming(&self, _: bool) -> bool {
+            false
+        }
+        async fn resolve_topic(&self, _: &ChannelRef, msg: &MessageRef) -> Result<()> {
+            self.resolve_calls.lock().unwrap().push(msg.clone());
+            if let Some(e) = self.resolve_err.lock().unwrap().take() {
+                return Err(anyhow::anyhow!(e));
+            }
+            Ok(())
+        }
+    }
+
+    fn resolve_test_channel() -> ChannelRef {
+        ChannelRef {
+            platform: "rec".into(),
+            channel_id: "c1".into(),
+            thread_id: Some("topic".into()),
+            parent_id: None,
+            origin_event_id: None,
+        }
+    }
+
+    fn resolve_test_msg() -> MessageRef {
+        MessageRef {
+            channel: resolve_test_channel(),
+            message_id: "m1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn maybe_resolve_topic_fires_on_natural_completion_with_directive() {
+        let rec = Arc::new(ResolveRecordingAdapter::default());
+        let adapter: Arc<dyn ChatAdapter> = rec.clone();
+        let directives = OutputDirectives {
+            resolve: true,
+            ..Default::default()
+        };
+        maybe_resolve_topic(
+            &adapter,
+            &resolve_test_channel(),
+            &resolve_test_msg(),
+            &directives,
+            true,
+        )
+        .await;
+        assert_eq!(rec.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn maybe_resolve_topic_no_op_without_natural_completion() {
+        let rec = Arc::new(ResolveRecordingAdapter::default());
+        let adapter: Arc<dyn ChatAdapter> = rec.clone();
+        let directives = OutputDirectives {
+            resolve: true,
+            ..Default::default()
+        };
+        maybe_resolve_topic(
+            &adapter,
+            &resolve_test_channel(),
+            &resolve_test_msg(),
+            &directives,
+            false,
+        )
+        .await;
+        assert!(rec.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn maybe_resolve_topic_no_op_without_directive() {
+        let rec = Arc::new(ResolveRecordingAdapter::default());
+        let adapter: Arc<dyn ChatAdapter> = rec.clone();
+        let directives = OutputDirectives::default();
+        maybe_resolve_topic(
+            &adapter,
+            &resolve_test_channel(),
+            &resolve_test_msg(),
+            &directives,
+            true,
+        )
+        .await;
+        assert!(rec.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn maybe_resolve_topic_swallows_error() {
+        // Err from resolve_topic must NOT propagate — function returns ()
+        let rec = Arc::new(ResolveRecordingAdapter::fail_with("permission denied"));
+        let adapter: Arc<dyn ChatAdapter> = rec.clone();
+        let directives = OutputDirectives {
+            resolve: true,
+            ..Default::default()
+        };
+        // No panic, no return value to check — function is infallible by signature.
+        maybe_resolve_topic(
+            &adapter,
+            &resolve_test_channel(),
+            &resolve_test_msg(),
+            &directives,
+            true,
+        )
+        .await;
+        // Still recorded the attempt
+        assert_eq!(rec.calls().len(), 1);
     }
 
     #[tokio::test]
