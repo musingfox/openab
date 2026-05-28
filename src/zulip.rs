@@ -21,6 +21,31 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
+/// Zulip-scoped instructions injected as the first ContentBlock of every ACP
+/// user turn (see ChatAdapter::platform_instructions). Teaches the agent the
+/// `[[resolve]]` directive contract — emitted ONLY when the user has explicitly
+/// confirmed the whole conversation is finished. Broker rewrites the topic name
+/// to prefix `✔ `; the directive itself is stripped before send_message.
+const ZULIP_RESOLVE_INSTRUCTIONS: &str = r#"[Zulip broker contract — `[[resolve]]` directive]
+You are talking on Zulip, where each conversation lives under a "topic". The broker can mark the current topic as resolved (prefix the topic name with `✔ `) when, and only when, you emit the bare directive `[[resolve]]` as the very first line of your FINAL assistant message in this turn.
+
+When to emit `[[resolve]]`:
+- ONLY after the user has explicitly confirmed that the WHOLE conversation (not just one sub-step) is done. Examples of acceptable confirmations: "好了", "收掉吧", "done", "thanks that's it", "沒問題了", "we're good".
+- Never infer completion from the fact that YOUR own work is done. Wait for the user.
+
+Position rule:
+- `[[resolve]]` must be on a line by itself, as the very first line of your final assistant message in this turn.
+- The only line that may precede it is `[[reply_to:<message_id>]]`. Nothing else.
+
+Do NOT emit `[[resolve]]` when:
+- You are about to ask the user a follow-up question or expect another reply.
+- You are mid-debug, mid-tool-loop, or partway through a task.
+- The user's acknowledgement is ambiguous (e.g., "ok" mid-thread, "got it" while a task is still in flight).
+- You are sending an intermediate progress update inside a turn; only the FINAL assistant message of the turn may carry the directive.
+- The conversation involves multiple sub-tasks and only one is finished.
+
+Effect: when the directive reaches the broker, the Zulip topic name is prefixed with `✔ ` (idempotent) and is treated as resolved. The directive itself is stripped before your message is sent — users never see `[[resolve]]` in chat."#;
+
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-testable without HTTP)
 // ---------------------------------------------------------------------------
@@ -282,6 +307,10 @@ impl ChatAdapter for ZulipAdapter {
         // Zulip allows up to 10_000 chars per message; keep parity with Slack's
         // generous limit and let the broker's format module split as needed.
         10_000
+    }
+
+    fn platform_instructions(&self) -> Option<&'static str> {
+        Some(ZULIP_RESOLVE_INSTRUCTIONS)
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
@@ -2161,5 +2190,41 @@ mod tests {
         let adapter = ZulipAdapter::new(base, "b@x", "k");
         let err = adapter.start_typing(&stream_channel()).await.unwrap_err();
         assert!(err.to_string().contains("500"), "missing 500: {err}");
+    }
+
+    // --- ZulipPlatformInstructions + RuleTextDoesNotSelfTrigger ---
+
+    #[test]
+    fn zulip_platform_instructions_returns_rule_body_with_required_tokens() {
+        let adapter = ZulipAdapter::new("http://example.invalid", "b@x", "k");
+        let s = adapter
+            .platform_instructions()
+            .expect("Zulip adapter must expose platform_instructions");
+        // Substring guards — keep agent-facing contract stable.
+        assert!(s.contains("[[resolve]]"), "must name the directive");
+        assert!(
+            s.contains("final"),
+            "must pin the 'final assistant message' rule"
+        );
+        assert!(s.contains("✔"), "must describe the resolved-topic effect");
+        assert!(s.contains("sub-step"), "must distinguish whole vs sub-step");
+        assert!(
+            s.contains("[[reply_to:"),
+            "must mention the precedent directive"
+        );
+        // Bilingual confirmation examples — regression for accidental monolingual drift.
+        assert!(s.contains("好了"), "must include zh confirmation example");
+        assert!(s.contains("done"), "must include en confirmation example");
+    }
+
+    #[test]
+    fn zulip_rule_body_does_not_self_trigger_directive_parser() {
+        use crate::adapter::parse_output_directives;
+        let (dirs, _rest) = parse_output_directives(ZULIP_RESOLVE_INSTRUCTIONS);
+        assert!(!dirs.resolve, "rule body must not self-trigger [[resolve]]");
+        assert!(
+            dirs.reply_to.is_none(),
+            "rule body must not self-trigger [[reply_to:...]]"
+        );
     }
 }

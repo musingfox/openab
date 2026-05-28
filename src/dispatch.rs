@@ -625,6 +625,7 @@ async fn dispatch_batch(
             AdapterRouter::pack_arrival_event(&msg.sender_json, &msg.prompt, msg.extra_blocks);
         content_blocks.append(&mut event_blocks);
     }
+    crate::adapter::maybe_prepend_platform_instructions(adapter.as_ref(), &mut content_blocks);
     let packed_block_count = content_blocks.len();
 
     // Ensure session exists.
@@ -1607,5 +1608,135 @@ mod tests {
             calls.is_empty(),
             "reactions.enabled=false must skip typing entirely, got {calls:?}"
         );
+    }
+
+    // --- DispatchBatchSingleInjection -------------------------------------
+    //
+    // dispatch_batch packs each arrival via `pack_arrival_event` inside a
+    // for-loop, then calls `maybe_prepend_platform_instructions` exactly once
+    // for the whole batch. These tests mirror that loop directly so the
+    // single-injection invariant is asserted on the same code path the
+    // production dispatcher uses, without standing up the full async target.
+
+    /// Mirror of dispatch_batch's per-arrival packing loop (src/dispatch.rs
+    /// ~620-627) — kept in sync so the tests assert on the same shape the
+    /// real dispatcher produces just before stream_prompt_blocks is called.
+    fn pack_batch_and_inject(
+        adapter: &dyn ChatAdapter,
+        batch: Vec<BufferedMessage>,
+    ) -> Vec<ContentBlock> {
+        let mut content_blocks: Vec<ContentBlock> = Vec::new();
+        for msg in batch {
+            let mut event_blocks =
+                AdapterRouter::pack_arrival_event(&msg.sender_json, &msg.prompt, msg.extra_blocks);
+            content_blocks.append(&mut event_blocks);
+        }
+        crate::adapter::maybe_prepend_platform_instructions(adapter, &mut content_blocks);
+        content_blocks
+    }
+
+    fn text_of(b: &ContentBlock) -> &str {
+        match b {
+            ContentBlock::Text { text } => text.as_str(),
+            _ => panic!("expected ContentBlock::Text, got {b:?}"),
+        }
+    }
+
+    /// Test adapter that returns a fixed instruction string — Some path
+    /// without coupling tests to the production Zulip rule body.
+    #[derive(Default)]
+    struct SomeInstructionsAdapter;
+    #[async_trait]
+    impl ChatAdapter for SomeInstructionsAdapter {
+        fn platform(&self) -> &'static str {
+            "some-instr"
+        }
+        fn message_limit(&self) -> usize {
+            2000
+        }
+        fn platform_instructions(&self) -> Option<&'static str> {
+            Some("RULE-BODY")
+        }
+        async fn send_message(&self, channel: &ChannelRef, _: &str) -> Result<MessageRef> {
+            Ok(MessageRef {
+                channel: channel.clone(),
+                message_id: "x".into(),
+            })
+        }
+        async fn create_thread(
+            &self,
+            channel: &ChannelRef,
+            _: &MessageRef,
+            _: &str,
+        ) -> Result<ChannelRef> {
+            Ok(channel.clone())
+        }
+        async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn use_streaming(&self, _: bool) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn dispatch_batch_layout_unchanged_when_adapter_returns_none() {
+        let adapter = MockChatAdapter::default();
+        let batch = vec![make_msg("a", 10), make_msg("b", 10)];
+        let blocks = pack_batch_and_inject(&adapter, batch);
+        assert_eq!(blocks.len(), 4, "2 sender_context + 2 prompt = 4 blocks");
+        let platform_count = blocks
+            .iter()
+            .filter(|b| text_of(b).contains("<platform_instructions>"))
+            .count();
+        assert_eq!(
+            platform_count, 0,
+            "no platform_instructions when adapter returns None"
+        );
+        let sender_count = blocks
+            .iter()
+            .filter(|b| text_of(b).contains("<sender_context>"))
+            .count();
+        assert_eq!(sender_count, 2);
+    }
+
+    #[test]
+    fn dispatch_batch_injects_platform_instructions_exactly_once_for_n2() {
+        let adapter = SomeInstructionsAdapter;
+        let batch = vec![make_msg("a", 10), make_msg("b", 10)];
+        let blocks = pack_batch_and_inject(&adapter, batch);
+        assert_eq!(
+            blocks.len(),
+            5,
+            "1 platform + 2 sender + 2 prompt = 5 blocks"
+        );
+        assert!(
+            text_of(&blocks[0]).starts_with("<platform_instructions>"),
+            "platform_instructions must be at index 0, got: {}",
+            text_of(&blocks[0])
+        );
+        let platform_count = blocks
+            .iter()
+            .filter(|b| text_of(b).contains("<platform_instructions>"))
+            .count();
+        assert_eq!(platform_count, 1, "exactly one injection per batch");
+        assert!(text_of(&blocks[1]).contains("<sender_context>"));
+        assert_eq!(text_of(&blocks[2]), "a");
+        assert!(text_of(&blocks[3]).contains("<sender_context>"));
+        assert_eq!(text_of(&blocks[4]), "b");
+    }
+
+    #[test]
+    fn dispatch_batch_single_arrival_matches_single_dispatch_layout() {
+        let adapter = SomeInstructionsAdapter;
+        let batch = vec![make_msg("solo", 10)];
+        let blocks = pack_batch_and_inject(&adapter, batch);
+        assert_eq!(blocks.len(), 3);
+        assert!(text_of(&blocks[0]).starts_with("<platform_instructions>"));
+        assert!(text_of(&blocks[1]).contains("<sender_context>"));
+        assert_eq!(text_of(&blocks[2]), "solo");
     }
 }

@@ -306,6 +306,12 @@ pub trait ChatAdapter: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Optional per-platform instructions injected as the first ContentBlock of every turn.
+    /// Default: None (Discord/Slack/etc. unchanged). Zulip overrides to teach [[resolve]].
+    fn platform_instructions(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Whether this adapter should use streaming edit (true) or send-once (false).
     /// `other_bot_present` indicates if another bot has posted in the current thread.
     /// Streaming should be disabled in multi-bot threads to avoid edit interference.
@@ -410,8 +416,9 @@ impl AdapterRouter {
     ) -> Result<()> {
         tracing::debug!(platform = adapter.platform(), "processing message");
 
-        let content_blocks =
+        let mut content_blocks =
             Self::pack_arrival_event(&ctx.sender_json, &ctx.prompt, ctx.extra_blocks);
+        maybe_prepend_platform_instructions(adapter.as_ref(), &mut content_blocks);
 
         let thread_key = format!(
             "{}:{}",
@@ -822,6 +829,24 @@ impl AdapterRouter {
                 })
             })
             .await
+    }
+}
+
+/// Prepend a `<platform_instructions>` Text block at index 0 of `blocks` when
+/// the adapter exposes a non-empty rule body, otherwise leave the Vec
+/// untouched. Called once per turn (single message OR full batch) by the
+/// dispatch paths so the injected block appears exactly once even when the
+/// turn fans out N arrivals through `pack_arrival_event`.
+pub(crate) fn maybe_prepend_platform_instructions(
+    adapter: &dyn ChatAdapter,
+    blocks: &mut Vec<ContentBlock>,
+) {
+    if let Some(instr) = adapter.platform_instructions() {
+        let header = format!(
+            "<platform_instructions>\n{}\n</platform_instructions>",
+            instr
+        );
+        blocks.insert(0, ContentBlock::Text { text: header });
     }
 }
 
@@ -1424,6 +1449,124 @@ mod tests {
         )];
         let out = compose_display(&tools, "response text", false, ToolDisplay::None);
         assert_eq!(out, "response text");
+    }
+
+    // --- TraitDefaultPlatformInstructions + HandleMessagePrependInjection ---
+
+    /// Minimal adapter that does NOT override `platform_instructions` — used
+    /// to verify the trait default (`None`) and the "no-prepend" branch of
+    /// `maybe_prepend_platform_instructions`.
+    struct NoInstructionsAdapter;
+    #[async_trait]
+    impl ChatAdapter for NoInstructionsAdapter {
+        fn platform(&self) -> &'static str {
+            "no-instr"
+        }
+        fn message_limit(&self) -> usize {
+            2000
+        }
+        async fn send_message(&self, _: &ChannelRef, _: &str) -> Result<MessageRef> {
+            unimplemented!()
+        }
+        async fn create_thread(
+            &self,
+            _: &ChannelRef,
+            _: &MessageRef,
+            _: &str,
+        ) -> Result<ChannelRef> {
+            unimplemented!()
+        }
+        async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn use_streaming(&self, _: bool) -> bool {
+            false
+        }
+    }
+
+    /// Adapter that returns a fixed instruction string. Lets us assert the
+    /// exact wrapper format independently of the production Zulip rule body.
+    struct FixedInstructionsAdapter(&'static str);
+    #[async_trait]
+    impl ChatAdapter for FixedInstructionsAdapter {
+        fn platform(&self) -> &'static str {
+            "fixed-instr"
+        }
+        fn message_limit(&self) -> usize {
+            2000
+        }
+        fn platform_instructions(&self) -> Option<&'static str> {
+            Some(self.0)
+        }
+        async fn send_message(&self, _: &ChannelRef, _: &str) -> Result<MessageRef> {
+            unimplemented!()
+        }
+        async fn create_thread(
+            &self,
+            _: &ChannelRef,
+            _: &MessageRef,
+            _: &str,
+        ) -> Result<ChannelRef> {
+            unimplemented!()
+        }
+        async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn use_streaming(&self, _: bool) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn default_platform_instructions_is_none_for_undecorated_adapter() {
+        let a = NoInstructionsAdapter;
+        assert!(a.platform_instructions().is_none());
+    }
+
+    #[test]
+    fn maybe_prepend_is_noop_when_adapter_returns_none() {
+        let a = NoInstructionsAdapter;
+        let mut blocks = AdapterRouter::pack_arrival_event("{\"sender\":\"u1\"}", "hi", Vec::new());
+        let before_len = blocks.len();
+        let before_first = match &blocks[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!("expected Text block"),
+        };
+        maybe_prepend_platform_instructions(&a, &mut blocks);
+        assert_eq!(blocks.len(), before_len, "no block inserted on None");
+        match &blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text, &before_first),
+            _ => panic!("expected Text block"),
+        }
+    }
+
+    #[test]
+    fn maybe_prepend_inserts_wrapped_block_at_index_zero_when_some() {
+        let a = FixedInstructionsAdapter("RULE-BODY");
+        let mut blocks = AdapterRouter::pack_arrival_event("{\"sender\":\"u1\"}", "hi", Vec::new());
+        let original_len = blocks.len();
+        maybe_prepend_platform_instructions(&a, &mut blocks);
+        assert_eq!(blocks.len(), original_len + 1, "exactly one block inserted");
+        match &blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(
+                text, "<platform_instructions>\nRULE-BODY\n</platform_instructions>",
+                "wrapper format must match documented tag convention"
+            ),
+            _ => panic!("expected Text block at index 0"),
+        }
+        match &blocks[1] {
+            ContentBlock::Text { text } => assert!(
+                text.starts_with("<sender_context>"),
+                "sender_context must follow at index 1, got: {text:?}"
+            ),
+            _ => panic!("expected Text block at index 1"),
+        }
     }
 }
 
