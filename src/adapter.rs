@@ -302,11 +302,7 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// Mark the conversation topic as resolved on the underlying platform.
     /// Invoked when the agent emits `[[resolve]]` and the turn completes naturally.
     /// Default: no-op (adapters without topic-resolution semantics silently succeed).
-    async fn resolve_topic(
-        &self,
-        _channel: &ChannelRef,
-        _trigger_msg: &MessageRef,
-    ) -> Result<()> {
+    async fn resolve_topic(&self, _channel: &ChannelRef, _trigger_msg: &MessageRef) -> Result<()> {
         Ok(())
     }
 
