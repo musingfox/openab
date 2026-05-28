@@ -394,4 +394,63 @@ mod tests {
         let after = count_op(&rec.ops(), "add", &thinking);
         assert_eq!(before, after, "set_thinking should be idempotent");
     }
+
+    #[tokio::test]
+    async fn finish_done_records_done_emoji_after_thinking() {
+        let rec = Arc::new(RecordingAdapter::default());
+        let adapter: Arc<dyn crate::adapter::ChatAdapter> = rec.clone();
+        let ctrl = StatusReactionController::new(
+            true,
+            adapter,
+            fake_msg(),
+            ReactionEmojis::default(),
+            fast_timing(),
+        );
+        ctrl.set_queued().await;
+        ctrl.set_thinking().await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        ctrl.set_done().await;
+
+        let ops = rec.ops();
+        let thinking = ReactionEmojis::default().thinking;
+        let done = ReactionEmojis::default().done;
+        let pos_thinking = ops.iter().position(|(v, e)| v == "add" && *e == thinking);
+        let pos_done = ops.iter().position(|(v, e)| v == "add" && *e == done);
+        assert!(pos_thinking.is_some(), "missing add(thinking): {ops:?}");
+        assert!(pos_done.is_some(), "missing add(done): {ops:?}");
+        assert!(pos_done > pos_thinking, "done must follow thinking");
+
+        // After set_done, set_thinking is terminal — no new add(thinking).
+        let before_thinking = count_op(&ops, "add", &thinking);
+        ctrl.set_thinking().await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let after_thinking = count_op(&rec.ops(), "add", &thinking);
+        assert_eq!(before_thinking, after_thinking);
+    }
+
+    #[tokio::test]
+    async fn finish_error_records_error_emoji_after_thinking() {
+        let rec = Arc::new(RecordingAdapter::default());
+        let adapter: Arc<dyn crate::adapter::ChatAdapter> = rec.clone();
+        let ctrl = StatusReactionController::new(
+            true,
+            adapter,
+            fake_msg(),
+            ReactionEmojis::default(),
+            fast_timing(),
+        );
+        ctrl.set_queued().await;
+        ctrl.set_thinking().await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        ctrl.set_error().await;
+
+        let ops = rec.ops();
+        let thinking = ReactionEmojis::default().thinking;
+        let error = ReactionEmojis::default().error;
+        let pos_thinking = ops.iter().position(|(v, e)| v == "add" && *e == thinking);
+        let pos_error = ops.iter().position(|(v, e)| v == "add" && *e == error);
+        assert!(pos_thinking.is_some(), "missing add(thinking): {ops:?}");
+        assert!(pos_error.is_some(), "missing add(error): {ops:?}");
+        assert!(pos_error > pos_thinking, "error must follow thinking");
+    }
 }
