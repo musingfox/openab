@@ -1691,6 +1691,7 @@ mod tests {
             _session_key: &str,
             _content_blocks: Vec<crate::acp::ContentBlock>,
             _thread_channel: &ChannelRef,
+            _trigger_msg: &MessageRef,
             _reactions: Arc<crate::reactions::StatusReactionController>,
             _other_bot_present: bool,
         ) -> Result<()> {
