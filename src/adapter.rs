@@ -39,7 +39,12 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                         "reply_to" => {
                             let v = value.trim();
                             // Validate: non-empty, reasonable length, no whitespace/control chars
-                            if !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
+                            if !v.is_empty()
+                                && v.len() <= 64
+                                && v.chars().all(|c| {
+                                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+                                })
+                            {
                                 directives.reply_to = Some(v.to_string());
                             }
                         }
@@ -227,6 +232,21 @@ pub trait ChatAdapter: Send + Sync + 'static {
 
     /// Remove a reaction/emoji from a message.
     async fn remove_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()>;
+
+    /// Begin a typing indicator on the given channel.
+    /// Default: no-op (adapters without typing support silently succeed).
+    // dead_code: callers land in DispatcherSpawnsTyping; keep surface available now.
+    #[allow(dead_code)]
+    async fn start_typing(&self, _channel: &ChannelRef) -> Result<()> {
+        Ok(())
+    }
+
+    /// End a typing indicator on the given channel.
+    /// Default: no-op (adapters without typing support silently succeed).
+    #[allow(dead_code)]
+    async fn stop_typing(&self, _channel: &ChannelRef) -> Result<()> {
+        Ok(())
+    }
 
     /// Edit an existing message in-place (for streaming updates).
     /// Default: unsupported (send-once only).
@@ -919,6 +939,54 @@ mod tests {
         let adapter = TestAdapter;
         // Verify the method is callable and returns the declared value
         assert!(!adapter.use_streaming(false));
+    }
+
+    #[tokio::test]
+    async fn typing_trait_default_impls_noop() {
+        // Stub adapter with no override of start_typing/stop_typing — defaults
+        // must return Ok(()) so non-Zulip adapters compile and run unchanged.
+        struct StubAdapter;
+
+        #[async_trait]
+        impl ChatAdapter for StubAdapter {
+            fn platform(&self) -> &'static str {
+                "stub"
+            }
+            fn message_limit(&self) -> usize {
+                2000
+            }
+            async fn send_message(&self, _: &ChannelRef, _: &str) -> Result<MessageRef> {
+                unimplemented!()
+            }
+            async fn create_thread(
+                &self,
+                _: &ChannelRef,
+                _: &MessageRef,
+                _: &str,
+            ) -> Result<ChannelRef> {
+                unimplemented!()
+            }
+            async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn use_streaming(&self, _: bool) -> bool {
+                false
+            }
+        }
+
+        let adapter = StubAdapter;
+        let ch = ChannelRef {
+            platform: "stub".into(),
+            channel_id: "c1".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        assert!(adapter.start_typing(&ch).await.is_ok());
+        assert!(adapter.stop_typing(&ch).await.is_ok());
     }
 
     #[test]
