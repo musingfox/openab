@@ -1909,10 +1909,45 @@ mod tests {
         }
     }
 
+    fn dm_channel() -> ChannelRef {
+        ChannelRef {
+            platform: "zulip".into(),
+            channel_id: "[1234]".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        }
+    }
+
     fn form_get<'a>(form: &'a [(&'a str, String)], key: &str) -> Option<&'a str> {
         form.iter()
             .find(|(k, _)| *k == key)
             .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn typing_form_dm_uses_type_direct_and_to_array_literal() {
+        let f_start = typing_form("start", &dm_channel());
+        assert_eq!(form_get(&f_start, "op"), Some("start"));
+        assert_eq!(form_get(&f_start, "type"), Some("direct"));
+        assert_eq!(form_get(&f_start, "to"), Some("[1234]"));
+
+        let f_stop = typing_form("stop", &dm_channel());
+        assert_eq!(form_get(&f_stop, "op"), Some("stop"));
+        assert_eq!(form_get(&f_stop, "type"), Some("direct"));
+        assert_eq!(form_get(&f_stop, "to"), Some("[1234]"));
+    }
+
+    #[tokio::test]
+    async fn stop_typing_dm_succeeds_on_200() {
+        let canned = vec![Canned {
+            status: 200,
+            headers: vec![("Content-Type", "application/json".into())],
+            body: r#"{"result":"success"}"#.into(),
+        }];
+        let base = spawn_mock(canned).await;
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        adapter.stop_typing(&dm_channel()).await.unwrap();
     }
 
     #[test]
