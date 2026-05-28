@@ -344,20 +344,25 @@ pub async fn handle_reply(
         .await
     {
         Ok(resp) => {
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            if body["ok"].as_bool() != Some(true) {
-                let desc = body["description"].as_str().unwrap_or("unknown");
-                // Only retry as plain text for parse-related errors; other failures
-                // (rate limit, forbidden, etc.) should not trigger a second request.
-                if desc.contains("parse") || desc.contains("entities") {
-                    warn!(desc = %desc, "telegram Markdown parse failed, retrying as plain text");
-                    true
-                } else {
-                    error!(desc = %desc, "telegram send failed (non-parse error)");
-                    false
+            match resp.json::<serde_json::Value>().await {
+                Ok(body) if body["ok"].as_bool() != Some(true) => {
+                    let desc = body["description"].as_str().unwrap_or("unknown");
+                    let code = body["error_code"].as_u64().unwrap_or(0);
+                    // Retry as plain text only for 400 Bad Request (parse/entity errors).
+                    // Other failures (429 rate limit, 403 forbidden) should not retry.
+                    if code == 400 {
+                        warn!(desc = %desc, "telegram Markdown send rejected (400), retrying as plain text");
+                        true
+                    } else {
+                        error!(code, desc = %desc, "telegram send failed");
+                        false
+                    }
                 }
-            } else {
-                false
+                Ok(_) => false,
+                Err(e) => {
+                    warn!("telegram response not valid JSON, retrying as plain text: {e}");
+                    true
+                }
             }
         }
         Err(e) => {
@@ -378,12 +383,15 @@ pub async fn handle_reply(
             .await
         {
             Ok(resp) => {
-                let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                if body["ok"].as_bool() != Some(true) {
-                    error!(
-                        desc = %body["description"].as_str().unwrap_or("unknown"),
-                        "telegram plain text fallback also failed"
-                    );
+                match resp.json::<serde_json::Value>().await {
+                    Ok(body) if body["ok"].as_bool() != Some(true) => {
+                        error!(
+                            desc = %body["description"].as_str().unwrap_or("unknown"),
+                            "telegram plain text fallback also failed"
+                        );
+                    }
+                    Err(e) => warn!("telegram plain text fallback response not valid JSON: {e}"),
+                    _ => {}
                 }
             }
             Err(e) => error!("telegram plain text send error: {e}"),
