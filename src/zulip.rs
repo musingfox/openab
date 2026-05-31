@@ -346,18 +346,18 @@ impl ZulipAdapter {
             ("num_after", "0".to_string()),
             ("apply_markdown", "false".to_string()),
         ];
-        let resp = match self
-            .api_call(
-                reqwest::Method::GET,
-                "/api/v1/messages",
-                None,
-                Some(&query),
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
+        // This runs inside the event loop, so bound it hard — a slow/stuck
+        // request must never freeze message processing. Fail closed on timeout
+        // or error (degrade to mention-only rather than block the loop).
+        let fetch = self.api_call(reqwest::Method::GET, "/api/v1/messages", None, Some(&query));
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(15), fetch).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 debug!(error = %e, topic, "zulip topic history fetch failed; failing closed");
+                return (false, false);
+            }
+            Err(_) => {
+                warn!(topic, "zulip topic history fetch timed out (15s); failing closed");
                 return (false, false);
             }
         };
