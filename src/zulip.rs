@@ -106,6 +106,34 @@ pub fn allowlist_accepts(
     true
 }
 
+/// Decide whether to dispatch a user message under `allow_user_messages`.
+///
+/// `is_mentioned` (this bot was @-mentioned) and `is_dm` (a private message —
+/// an implicit mention) short-circuit to `true`. Otherwise the mode decides:
+///
+/// - `Mentions` — never (an explicit mention was required and absent).
+/// - `Involved` — only if the bot already participated in the topic.
+/// - `MultibotMentions` — like `Involved`, but a sibling bot in the topic
+///   (`other_bot_present`) forces an explicit mention, so it returns `false`.
+///
+/// `involved` / `other_bot_present` are ignored when `is_mentioned || is_dm`.
+fn should_dispatch_user_message(
+    mode: AllowUsers,
+    is_mentioned: bool,
+    is_dm: bool,
+    involved: bool,
+    other_bot_present: bool,
+) -> bool {
+    if is_mentioned || is_dm {
+        return true;
+    }
+    match mode {
+        AllowUsers::Mentions => false,
+        AllowUsers::Involved => involved,
+        AllowUsers::MultibotMentions => involved && !other_bot_present,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ZulipAdapter
 // ---------------------------------------------------------------------------
@@ -269,6 +297,86 @@ impl ZulipAdapter {
             }
             return Ok(parsed);
         }
+    }
+
+    /// Resolve this bot's own Zulip `user_id` via `GET /users/me`.
+    ///
+    /// Used by the `Involved` / `MultibotMentions` dispatch gates to recognize
+    /// the bot's own past messages in a topic. Fetched once at adapter startup.
+    pub async fn fetch_bot_user_id(&self) -> Result<u64> {
+        let resp = self
+            .api_call(reqwest::Method::GET, "/api/v1/users/me", None, None)
+            .await?;
+        resp.get("user_id")
+            .and_then(|v| v.as_i64())
+            .map(|i| i as u64)
+            .ok_or_else(|| anyhow!("no user_id in /users/me response"))
+    }
+
+    /// Inspect recent history of a stream `topic` to drive the `Involved` /
+    /// `MultibotMentions` dispatch gates. Returns `(involved, other_bot_present)`:
+    ///
+    /// - `involved` — this bot (`bot_user_id`) has posted in the topic before.
+    /// - `other_bot_present` — some message was sent by a user in
+    ///   `trusted_bot_ids` (a sibling bot sharing the stream).
+    ///
+    /// Fails closed: any HTTP/parse error yields `(false, false)`, so an
+    /// unreachable history API degrades to mention-only behavior rather than
+    /// over-responding.
+    async fn topic_participation(
+        &self,
+        stream_id: &str,
+        topic: &str,
+        bot_user_id: u64,
+        trusted_bot_ids: &HashSet<String>,
+    ) -> (bool, bool) {
+        let stream_num: u64 = match stream_id.parse() {
+            Ok(n) => n,
+            Err(_) => return (false, false),
+        };
+        let narrow = serde_json::json!([
+            {"operator": "stream", "operand": stream_num},
+            {"operator": "topic", "operand": topic},
+        ])
+        .to_string();
+        let query: [(&str, String); 5] = [
+            ("narrow", narrow),
+            ("anchor", "newest".to_string()),
+            ("num_before", "100".to_string()),
+            ("num_after", "0".to_string()),
+            ("apply_markdown", "false".to_string()),
+        ];
+        let resp = match self
+            .api_call(
+                reqwest::Method::GET,
+                "/api/v1/messages",
+                None,
+                Some(&query),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(error = %e, topic, "zulip topic history fetch failed; failing closed");
+                return (false, false);
+            }
+        };
+        let mut involved = false;
+        let mut other_bot_present = false;
+        if let Some(msgs) = resp.get("messages").and_then(|v| v.as_array()) {
+            for m in msgs {
+                let Some(sid) = m.get("sender_id").and_then(|v| v.as_i64()) else {
+                    continue;
+                };
+                if sid as u64 == bot_user_id {
+                    involved = true;
+                }
+                if trusted_bot_ids.contains(&sid.to_string()) {
+                    other_bot_present = true;
+                }
+            }
+        }
+        (involved, other_bot_present)
     }
 }
 
@@ -720,11 +828,25 @@ pub async fn run_zulip_adapter(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     info!("starting zulip adapter");
-    // Unused-for-now params are documented; silence dead-code at compile.
+
+    // Resolve our own user_id up front for the Involved / MultibotMentions
+    // dispatch gates (recognizing the bot's own past messages in a topic).
+    // On failure, fall back to 0 — no real sender matches, so those modes
+    // degrade to mention-only rather than over-responding.
+    let bot_user_id = match adapter.fetch_bot_user_id().await {
+        Ok(id) => {
+            info!(bot_user_id = id, "zulip identity resolved");
+            id
+        }
+        Err(e) => {
+            warn!(error = %e, "zulip /users/me failed; involved/multibot gating degraded to mentions-only");
+            0
+        }
+    };
+
+    // Params still pending Zulip support; documented to silence dead-code.
     let _ = (
         &params.allow_bot_messages,
-        &params.trusted_bot_ids,
-        &params.allow_user_messages,
         params.max_bot_turns,
         &params.stt_config,
     );
@@ -850,6 +972,55 @@ pub async fn run_zulip_adapter(
                     continue;
                 }
 
+                // Dispatch-mode gate: mentions / involved / multibot-mentions.
+                // `flags` on the event carries "mentioned" when this bot was
+                // @-mentioned; DMs (no stream) count as an implicit mention.
+                let is_dm = stream_id.is_none();
+                let is_mentioned = ev
+                    .get("flags")
+                    .and_then(|v| v.as_array())
+                    .map(|fl| fl.iter().any(|f| f.as_str() == Some("mentioned")))
+                    .unwrap_or(false);
+                let (involved, other_bot_present) = if !is_mentioned
+                    && !is_dm
+                    && matches!(
+                        params.allow_user_messages,
+                        AllowUsers::Involved | AllowUsers::MultibotMentions
+                    ) {
+                    match &stream_id {
+                        Some(sid) => {
+                            adapter
+                                .topic_participation(
+                                    sid,
+                                    &topic,
+                                    bot_user_id,
+                                    &params.trusted_bot_ids,
+                                )
+                                .await
+                        }
+                        None => (false, false),
+                    }
+                } else {
+                    (false, false)
+                };
+                if !should_dispatch_user_message(
+                    params.allow_user_messages,
+                    is_mentioned,
+                    is_dm,
+                    involved,
+                    other_bot_present,
+                ) {
+                    debug!(
+                        stream_id = ?stream_id,
+                        topic = %topic,
+                        is_mentioned,
+                        involved,
+                        other_bot_present,
+                        "zulip dispatch-mode gate: skip"
+                    );
+                    continue;
+                }
+
                 let key = if let Some(sid_str) = &stream_id {
                     let sid: u64 = sid_str.parse().unwrap_or(0);
                     thread_key_for_event(&ZulipEventKind::Stream {
@@ -954,6 +1125,96 @@ mod tests {
             thread_key_for_event(&ZulipEventKind::Dm { user_ids: &ids_a }),
             "zulip:dm:3,7,11"
         );
+    }
+
+    // --- should_dispatch_user_message ---
+
+    #[test]
+    fn dispatch_mention_always_wins() {
+        for mode in [
+            AllowUsers::Mentions,
+            AllowUsers::Involved,
+            AllowUsers::MultibotMentions,
+        ] {
+            assert!(should_dispatch_user_message(mode, true, false, false, false));
+        }
+    }
+
+    #[test]
+    fn dispatch_dm_always_wins() {
+        for mode in [
+            AllowUsers::Mentions,
+            AllowUsers::Involved,
+            AllowUsers::MultibotMentions,
+        ] {
+            assert!(should_dispatch_user_message(mode, false, true, false, false));
+        }
+    }
+
+    #[test]
+    fn dispatch_mentions_mode_requires_mention() {
+        // Even when involved, Mentions mode stays quiet without an @-mention.
+        assert!(!should_dispatch_user_message(
+            AllowUsers::Mentions,
+            false,
+            false,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn dispatch_involved_follows_topic_ignoring_other_bots() {
+        assert!(should_dispatch_user_message(
+            AllowUsers::Involved,
+            false,
+            false,
+            true,
+            false
+        ));
+        assert!(!should_dispatch_user_message(
+            AllowUsers::Involved,
+            false,
+            false,
+            false,
+            false
+        ));
+        // Other bots are irrelevant in plain Involved mode.
+        assert!(should_dispatch_user_message(
+            AllowUsers::Involved,
+            false,
+            false,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn dispatch_multibot_requires_mention_when_sibling_present() {
+        // Single bot in the topic: auto-follow.
+        assert!(should_dispatch_user_message(
+            AllowUsers::MultibotMentions,
+            false,
+            false,
+            true,
+            false
+        ));
+        // Sibling bot present + no mention: stay quiet.
+        assert!(!should_dispatch_user_message(
+            AllowUsers::MultibotMentions,
+            false,
+            false,
+            true,
+            true
+        ));
+        // Never participated: quiet.
+        assert!(!should_dispatch_user_message(
+            AllowUsers::MultibotMentions,
+            false,
+            false,
+            false,
+            false
+        ));
     }
 
     // --- ZulipStreamingPolicy ---
@@ -1579,6 +1840,16 @@ mod tests {
         assert_eq!(classify_events_error(&e), PollOutcome::Transient);
     }
 
+    /// Canned `GET /users/me` reply that `run_zulip_adapter` consumes once at
+    /// startup (before the register/poll loop) to learn its own user_id.
+    fn users_me_ok() -> Canned {
+        Canned {
+            status: 200,
+            headers: vec![("Content-Type", "application/json".into())],
+            body: r#"{"result":"success","user_id":999}"#.into(),
+        }
+    }
+
     fn make_params(channels: &[&str]) -> ZulipParams {
         ZulipParams {
             allow_all_channels: channels.is_empty(),
@@ -1598,17 +1869,18 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn event_loop_dispatches_allowed_stream_event() {
         let canned = vec![
+            users_me_ok(),
             // /register response
             Canned {
                 status: 200,
                 headers: vec![("Content-Type", "application/json".into())],
                 body: r#"{"result":"success","queue_id":"q1","last_event_id":-1}"#.into(),
             },
-            // /events first poll — one message event
+            // /events first poll — one @-mention message event
             Canned {
                 status: 200,
                 headers: vec![("Content-Type", "application/json".into())],
-                body: r#"{"result":"success","events":[{"id":1,"type":"message","message":{"stream_id":42,"subject":"x","sender_id":7,"content":"hi"}}]}"#.into(),
+                body: r#"{"result":"success","events":[{"id":1,"type":"message","flags":["mentioned"],"message":{"stream_id":42,"subject":"x","sender_id":7,"content":"hi"}}]}"#.into(),
             },
             // /events second poll — empty (loop will wait for shutdown)
             Canned {
@@ -1651,6 +1923,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn event_loop_drops_event_outside_allowlist() {
         let canned = vec![
+            users_me_ok(),
             Canned {
                 status: 200,
                 headers: vec![("Content-Type", "application/json".into())],
@@ -1692,6 +1965,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn event_loop_reregisters_on_bad_event_queue_id() {
         let canned = vec![
+            users_me_ok(),
             // first /register
             Canned {
                 status: 200,
@@ -1710,11 +1984,11 @@ mod tests {
                 headers: vec![("Content-Type", "application/json".into())],
                 body: r#"{"result":"success","queue_id":"q2","last_event_id":-1}"#.into(),
             },
-            // /events on new queue: one allowed message
+            // /events on new queue: one allowed @-mention message
             Canned {
                 status: 200,
                 headers: vec![("Content-Type", "application/json".into())],
-                body: r#"{"result":"success","events":[{"id":1,"type":"message","message":{"stream_id":42,"subject":"y","sender_id":7,"content":"hi"}}]}"#.into(),
+                body: r#"{"result":"success","events":[{"id":1,"type":"message","flags":["mentioned"],"message":{"stream_id":42,"subject":"y","sender_id":7,"content":"hi"}}]}"#.into(),
             },
             // empty poll to park the loop
             Canned {
@@ -1753,6 +2027,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn event_loop_reregisters_on_http_400_fallback() {
         let canned = vec![
+            users_me_ok(),
             Canned {
                 status: 200,
                 headers: vec![("Content-Type", "application/json".into())],
@@ -1799,12 +2074,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn event_loop_returns_ok_on_shutdown_during_long_poll() {
         let canned = vec![
+            users_me_ok(),
             Canned {
                 status: 200,
                 headers: vec![("Content-Type", "application/json".into())],
                 body: r#"{"result":"success","queue_id":"q1","last_event_id":-1}"#.into(),
             },
-            // No second response → the loop will be parked in poll_events.
+            // No further response → the loop will be parked in poll_events.
         ];
         let base = spawn_mock(canned).await;
         let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
