@@ -332,17 +332,39 @@ pub async fn handle_reply(
         "gateway → telegram"
     );
     let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage");
-    let _ = client
+    let resp = client
         .post(&url)
         .json(&serde_json::json!({
             "chat_id": reply.channel.id,
-            "text": reply.content.text,
+            "text": &reply.content.text,
             "message_thread_id": reply.channel.thread_id,
             "parse_mode": "Markdown",
         }))
         .send()
-        .await
-        .map_err(|e| error!("telegram send error: {e}"));
+        .await;
+
+    match resp {
+        Ok(r) => {
+            let body: serde_json::Value = r.json().await.unwrap_or_default();
+            if body["ok"].as_bool() != Some(true) {
+                warn!(
+                    "Markdown send failed: {}, retrying as plain text",
+                    body["description"]
+                );
+                let _ = client
+                    .post(&url)
+                    .json(&serde_json::json!({
+                        "chat_id": reply.channel.id,
+                        "text": &reply.content.text,
+                        "message_thread_id": reply.channel.thread_id,
+                    }))
+                    .send()
+                    .await
+                    .map_err(|e| error!("telegram plain-text send error: {e}"));
+            }
+        }
+        Err(e) => error!("telegram send error: {e}"),
+    }
 }
 
 /// Download media from Telegram via getFile → store to filesystem (colocate mode).
