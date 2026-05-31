@@ -648,6 +648,25 @@ mod tests {
         }
     }
 
+    fn make_test_state() -> Arc<crate::AppState> {
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+
+        Arc::new(crate::AppState {
+            telegram_bot_token: None,
+            telegram_secret_token: None,
+            line_channel_secret: None,
+            line_access_token: None,
+            teams: Some(TeamsAdapter::new(make_config(vec![]))),
+            teams_service_urls: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            feishu: None,
+            google_chat: None,
+            wecom: None,
+            ws_token: None,
+            event_tx,
+            reply_token_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        })
+    }
+
     fn make_activity_with_tenant(tenant_id: Option<&str>) -> Activity {
         Activity {
             activity_type: "message".into(),
@@ -663,6 +682,32 @@ mod tests {
             }),
             channel_data: None,
         }
+    }
+
+    // --- webhook body limit ---
+
+    #[tokio::test]
+    async fn webhook_rejects_oversized_body_before_auth() {
+        let status = webhook(
+            State(make_test_state()),
+            HeaderMap::new(),
+            "x".repeat(WEBHOOK_BODY_LIMIT + 1),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn webhook_allows_body_at_limit_to_reach_auth() {
+        let status = webhook(
+            State(make_test_state()),
+            HeaderMap::new(),
+            "x".repeat(WEBHOOK_BODY_LIMIT),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[test]
