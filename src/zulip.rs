@@ -106,6 +106,36 @@ pub fn allowlist_accepts(
     true
 }
 
+/// True if `content` carries an explicit user mention aimed at a *specific*
+/// person (a `@**Name**` / `@_**Name**` token), excluding wildcard mentions
+/// (`@**all|everyone|channel|stream|topic**`). Used so a bot does not
+/// auto-follow a message that is explicitly addressed to someone else — an
+/// `@**sibling**` handoff is the strongest "this isn't for me" signal, and it
+/// fires on the very first handoff, before the sibling has posted in the topic.
+fn mentions_specific_user(content: &str) -> bool {
+    const WILDCARDS: &[&str] = &["all", "everyone", "channel", "stream", "topic"];
+    // `@_**` (silent mention) does not contain the substring `@**`, so the two
+    // markers are scanned independently without double-counting.
+    for marker in ["@**", "@_**"] {
+        let mut hay = content;
+        while let Some(i) = hay.find(marker) {
+            let after = &hay[i + marker.len()..];
+            match after.find("**") {
+                Some(end) => {
+                    // strip the `|user_id` disambiguation suffix Zulip may add
+                    let name = after[..end].split('|').next().unwrap_or("").trim();
+                    if !name.is_empty() && !WILDCARDS.contains(&name) {
+                        return true;
+                    }
+                    hay = &after[end + 2..];
+                }
+                None => break,
+            }
+        }
+    }
+    false
+}
+
 /// Decide whether to dispatch a user message under `allow_user_messages`.
 ///
 /// `is_mentioned` (this bot was @-mentioned) and `is_dm` (a private message —
@@ -113,16 +143,21 @@ pub fn allowlist_accepts(
 ///
 /// - `Mentions` — never (an explicit mention was required and absent).
 /// - `Involved` — only if the bot already participated in the topic.
-/// - `MultibotMentions` — like `Involved`, but a sibling bot in the topic
-///   (`other_bot_present`) forces an explicit mention, so it returns `false`.
+/// - `MultibotMentions` — like `Involved`, but stays quiet when either a
+///   sibling bot is already in the topic (`other_bot_present`) OR this message
+///   explicitly @-mentions someone else (`directed_elsewhere`). The latter
+///   closes the first-handoff gap: the topic's incumbent bot would otherwise
+///   grab a message addressed to a sibling that has not posted yet.
 ///
-/// `involved` / `other_bot_present` are ignored when `is_mentioned || is_dm`.
+/// `involved` / `other_bot_present` / `directed_elsewhere` are ignored when
+/// `is_mentioned || is_dm`.
 fn should_dispatch_user_message(
     mode: AllowUsers,
     is_mentioned: bool,
     is_dm: bool,
     involved: bool,
     other_bot_present: bool,
+    directed_elsewhere: bool,
 ) -> bool {
     if is_mentioned || is_dm {
         return true;
@@ -130,7 +165,9 @@ fn should_dispatch_user_message(
     match mode {
         AllowUsers::Mentions => false,
         AllowUsers::Involved => involved,
-        AllowUsers::MultibotMentions => involved && !other_bot_present,
+        AllowUsers::MultibotMentions => {
+            involved && !other_bot_present && !directed_elsewhere
+        }
     }
 }
 
@@ -1003,12 +1040,16 @@ pub async fn run_zulip_adapter(
                 } else {
                     (false, false)
                 };
+                // An explicit @-mention of someone else (not us) means the
+                // message is directed — don't auto-follow it as topic incumbent.
+                let directed_elsewhere = !is_mentioned && mentions_specific_user(&content);
                 if !should_dispatch_user_message(
                     params.allow_user_messages,
                     is_mentioned,
                     is_dm,
                     involved,
                     other_bot_present,
+                    directed_elsewhere,
                 ) {
                     debug!(
                         stream_id = ?stream_id,
@@ -1016,6 +1057,7 @@ pub async fn run_zulip_adapter(
                         is_mentioned,
                         involved,
                         other_bot_present,
+                        directed_elsewhere,
                         "zulip dispatch-mode gate: skip"
                     );
                     continue;
@@ -1136,7 +1178,9 @@ mod tests {
             AllowUsers::Involved,
             AllowUsers::MultibotMentions,
         ] {
-            assert!(should_dispatch_user_message(mode, true, false, false, false));
+            assert!(should_dispatch_user_message(
+                mode, true, false, false, false, false
+            ));
         }
     }
 
@@ -1147,7 +1191,9 @@ mod tests {
             AllowUsers::Involved,
             AllowUsers::MultibotMentions,
         ] {
-            assert!(should_dispatch_user_message(mode, false, true, false, false));
+            assert!(should_dispatch_user_message(
+                mode, false, true, false, false, false
+            ));
         }
     }
 
@@ -1159,6 +1205,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false
         ));
     }
@@ -1170,10 +1217,12 @@ mod tests {
             false,
             false,
             true,
+            false,
             false
         ));
         assert!(!should_dispatch_user_message(
             AllowUsers::Involved,
+            false,
             false,
             false,
             false,
@@ -1185,7 +1234,8 @@ mod tests {
             false,
             false,
             true,
-            true
+            true,
+            false
         ));
     }
 
@@ -1197,6 +1247,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false
         ));
         // Sibling bot present + no mention: stay quiet.
@@ -1205,7 +1256,8 @@ mod tests {
             false,
             false,
             true,
-            true
+            true,
+            false
         ));
         // Never participated: quiet.
         assert!(!should_dispatch_user_message(
@@ -1213,8 +1265,46 @@ mod tests {
             false,
             false,
             false,
+            false,
             false
         ));
+    }
+
+    #[test]
+    fn dispatch_multibot_backs_off_when_directed_elsewhere() {
+        // Topic incumbent (involved, no sibling has posted yet) but the message
+        // explicitly @-mentions someone else: stay quiet — closes the
+        // first-handoff gap where the incumbent grabbed a sibling's message.
+        assert!(!should_dispatch_user_message(
+            AllowUsers::MultibotMentions,
+            false,
+            false,
+            true,
+            false,
+            true
+        ));
+        // A directed mention OF this bot still short-circuits to act
+        // (is_mentioned wins; directed_elsewhere is only set when !is_mentioned).
+        assert!(should_dispatch_user_message(
+            AllowUsers::MultibotMentions,
+            true,
+            false,
+            true,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn mentions_specific_user_detects_directed_handoff() {
+        assert!(mentions_specific_user("@**dev** 可以建立一個新 agent 嗎"));
+        assert!(mentions_specific_user("cc @_**invest** 看一下"));
+        assert!(mentions_specific_user("ping @**Full Name|1086906** now"));
+        // wildcard mentions are not "directed at a specific person"
+        assert!(!mentions_specific_user("@**all** heads up"));
+        assert!(!mentions_specific_user("@**everyone** sync"));
+        // plain text / no mention
+        assert!(!mentions_specific_user("just a normal follow-up message"));
     }
 
     // --- ZulipStreamingPolicy ---
