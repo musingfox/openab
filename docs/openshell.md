@@ -13,29 +13,9 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 
 ## Quick Start (Local Docker)
 
-### 1. Create a sandbox
+### 1. Create credential providers
 
-```bash
-openshell sandbox create --name oab -- bash
-```
-
-### 2. Connect and install OAB
-
-```bash
-openshell sandbox connect oab
-```
-
-Inside the sandbox:
-
-```bash
-git clone https://github.com/openabdev/openab.git
-cd openab
-cargo build --release
-```
-
-### 3. Configure credentials
-
-On the host, create providers for the tokens OAB needs:
+OpenShell injects credentials as environment variables at sandbox runtime — they never touch the sandbox filesystem. Providers persist across sandbox restarts until explicitly deleted.
 
 ```bash
 # Discord bot token
@@ -51,10 +31,11 @@ export ANTHROPIC_API_KEY="your-key"
 openshell provider create --name anthropic --env ANTHROPIC_API_KEY
 ```
 
-Then recreate the sandbox with providers attached:
+> Providers are stored in the OpenShell gateway's local state. The host env vars are only read at `provider create` time and are not needed afterwards.
+
+### 2. Create a sandbox with providers
 
 ```bash
-openshell sandbox delete oab
 openshell sandbox create --name oab \
   --provider discord \
   --provider github \
@@ -62,9 +43,9 @@ openshell sandbox create --name oab \
   -- bash
 ```
 
-### 4. Apply network policy
+### 3. Apply network policy
 
-Create `oab-policy.yaml`:
+Create `oab-policy.yaml` on the host:
 
 ```yaml
 network:
@@ -81,30 +62,39 @@ network:
       ports: [443]
 ```
 
-Apply it:
+Apply to the running sandbox:
 
 ```bash
-openshell policy set oab --policy oab-policy.yaml
+openshell policy set oab --policy oab-policy.yaml --wait
 ```
 
-### 5. Run OAB
+The `--wait` flag blocks until the policy is enforced. All egress not listed above is denied by default.
+
+### 4. Connect and run OAB
+
+```bash
+openshell sandbox connect oab
+```
 
 Inside the sandbox:
 
 ```bash
+git clone https://github.com/openabdev/openab.git
 cd openab
+cargo build --release
 ./target/release/openab serve --config config.toml
 ```
 
 ## Port Forwarding
 
-If OAB exposes a webhook endpoint (e.g., for GitHub webhooks):
+If OAB exposes a webhook endpoint (e.g., for GitHub webhooks), add `--forward` at creation:
 
 ```bash
 openshell sandbox create --name oab \
   --forward 3000 \
   --provider discord \
   --provider github \
+  --provider anthropic \
   -- bash
 ```
 
@@ -137,6 +127,7 @@ openshell sandbox create --name oab \
   --from ./Dockerfile \
   --provider discord \
   --provider github \
+  --provider anthropic \
   -- bash
 ```
 
