@@ -10,3 +10,4 @@ config.toml
 CLAUDE.md
 .claude/
 .claude.local.md
+.spiral/

@@ -62,20 +62,33 @@ pub fn thread_key_for_event(kind: &ZulipEventKind<'_>) -> String {
     }
 }
 
-/// Parse an `/eom` invocation. Returns `Some(args)` if `body` starts with
-/// the literal `/eom` followed by whitespace or end-of-string; `args` is the
-/// trimmed remainder (may be empty). Leading whitespace before `/eom`
-/// disqualifies — keeps the rule simple and unambiguous.
-pub fn parse_eom(body: &str) -> Option<String> {
-    let rest = body.strip_prefix("/eom")?;
-    if rest.is_empty() {
-        return Some(String::new());
+/// Build a Zulip `SenderContext` from a resolved sender name.
+///
+/// Mirrors `discord.rs` `build_sender_context`: a pure seam so name resolution
+/// is unit-testable without HTTP. `full_name` is the event's `sender_full_name`
+/// as `Option<&str>` — `None` (field missing) and `Some("")` (empty) both fall
+/// back to `sender_id`, so `sender_name` and `display_name` are never empty.
+fn build_sender_context(
+    full_name: Option<&str>,
+    sender_id: &str,
+    channel_id: &str,
+    thread_id: Option<&str>,
+    message_id: &str,
+) -> crate::adapter::SenderContext {
+    let name = full_name.filter(|s| !s.is_empty()).unwrap_or(sender_id);
+    crate::adapter::SenderContext {
+        schema: "openab.sender.v1".into(),
+        sender_id: sender_id.to_string(),
+        sender_name: name.to_string(),
+        display_name: name.to_string(),
+        channel: "zulip".into(),
+        channel_id: channel_id.to_string(),
+        thread_id: thread_id.map(|s| s.to_string()),
+        is_bot: false,
+        timestamp: None,
+        message_id: Some(message_id.to_string()),
+        receiver_id: None,
     }
-    let next = rest.chars().next().unwrap();
-    if !next.is_whitespace() {
-        return None;
-    }
-    Some(rest.trim().to_string())
 }
 
 /// Decide whether a Zulip event passes the allowlist gate.
@@ -655,23 +668,14 @@ pub struct ZulipDispatchedMessage {
     pub topic: String,
     /// Sender's Zulip user ID as numeric string.
     pub sender_id: String,
+    /// Sender's resolved full name (`sender_full_name` from the event), if the
+    /// field was present and non-empty. `None` falls back to `sender_id` when
+    /// building the `SenderContext`.
+    pub sender_full_name: Option<String>,
     /// Zulip integer message ID as string (for reactions / streaming edits).
     pub message_id: String,
     /// Verbatim message body.
     pub content: String,
-}
-
-/// Bundle of fields the event loop hands to the sink when an `/eom` command
-/// is recognized.
-#[derive(Debug, Clone)]
-pub struct EomCommand {
-    pub thread_key: String,
-    pub stream_id: Option<String>,
-    pub topic: String,
-    pub sender_id: String,
-    pub message_id: String,
-    /// Trimmed args following `/eom`; empty string means no-arg form.
-    pub args: String,
 }
 
 /// Trait surface for the dispatch side-effect: the event loop calls this for
@@ -680,7 +684,6 @@ pub struct EomCommand {
 #[async_trait]
 pub trait ZulipMessageSink: Send + Sync {
     async fn dispatch(&self, evt: ZulipDispatchedMessage);
-    async fn handle_eom(&self, cmd: EomCommand);
 }
 
 /// Production sink: builds the broker `SenderContext` + `BufferedMessage` and
@@ -689,20 +692,14 @@ pub trait ZulipMessageSink: Send + Sync {
 pub struct BrokerSink {
     adapter: Arc<ZulipAdapter>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
-    pool: Arc<crate::acp::SessionPool>,
 }
 
 impl BrokerSink {
     pub fn new(
         adapter: Arc<ZulipAdapter>,
         dispatcher: Arc<crate::dispatch::Dispatcher>,
-        pool: Arc<crate::acp::SessionPool>,
     ) -> Self {
-        Self {
-            adapter,
-            dispatcher,
-            pool,
-        }
+        Self { adapter, dispatcher }
     }
 }
 
@@ -710,85 +707,6 @@ impl BrokerSink {
 impl ZulipMessageSink for BrokerSink {
     async fn dispatch(&self, evt: ZulipDispatchedMessage) {
         self.dispatch_impl(evt).await
-    }
-
-    async fn handle_eom(&self, cmd: EomCommand) {
-        if let Err(e) = self.pool.reset_session(&cmd.thread_key).await {
-            warn!(error = %e, thread_key = %cmd.thread_key, "zulip /eom: pool.reset_session failed");
-        }
-        // thread_key is `zulip:<thread_id>` — strip the `zulip:` prefix to get
-        // the dispatcher's thread_id (mirrors gateway.rs:798-800).
-        let thread_id_for_dispatcher = cmd
-            .thread_key
-            .strip_prefix("zulip:")
-            .unwrap_or(&cmd.thread_key);
-        self.dispatcher
-            .cancel_buffered_thread("zulip", thread_id_for_dispatcher);
-
-        let channel_id = cmd.stream_id.clone().unwrap_or_default();
-        let thread_id_opt = if cmd.topic.is_empty() {
-            None
-        } else {
-            Some(cmd.topic.clone())
-        };
-        let trigger_channel = ChannelRef {
-            platform: "zulip".into(),
-            channel_id: channel_id.clone(),
-            thread_id: thread_id_opt.clone(),
-            parent_id: None,
-            origin_event_id: None,
-        };
-
-        let has_args = !cmd.args.trim().is_empty();
-        let ack_text = if has_args {
-            "🛑 Eyes-on-me — aborted current task, picking up new instruction…"
-        } else {
-            "🛑 Eyes-on-me — aborted current task."
-        };
-        if let Err(e) = self.adapter.send_message(&trigger_channel, ack_text).await {
-            warn!(error = %e, "zulip /eom: ack send_message failed");
-        }
-        if !has_args {
-            return;
-        }
-
-        let trigger_msg = MessageRef {
-            channel: trigger_channel.clone(),
-            message_id: cmd.message_id.clone(),
-        };
-        let sender = crate::adapter::SenderContext {
-            schema: "openab.sender.v1".into(),
-            sender_id: cmd.sender_id.clone(),
-            sender_name: cmd.sender_id.clone(),
-            display_name: cmd.sender_id.clone(),
-            channel: "zulip".into(),
-            channel_id: channel_id.clone(),
-            thread_id: thread_id_opt.clone(),
-            is_bot: false,
-            timestamp: None,
-            message_id: Some(cmd.message_id.clone()),
-            receiver_id: None,
-        };
-        let sender_json = serde_json::to_string(&sender).unwrap_or_else(|_| "{}".into());
-        let estimated_tokens = crate::dispatch::estimate_tokens(&cmd.args, &[]);
-        let adapter_dyn: Arc<dyn ChatAdapter> = self.adapter.clone();
-        let buf = crate::dispatch::BufferedMessage {
-            sender_json,
-            sender_name: cmd.sender_id.clone(),
-            prompt: cmd.args,
-            extra_blocks: Vec::new(),
-            trigger_msg,
-            arrived_at: std::time::Instant::now(),
-            estimated_tokens,
-            other_bot_present: false,
-        };
-        if let Err(e) = self
-            .dispatcher
-            .submit(cmd.thread_key, trigger_channel, adapter_dyn, buf)
-            .await
-        {
-            warn!(error = %e, "zulip /eom: dispatcher submit failed");
-        }
     }
 }
 
@@ -814,27 +732,22 @@ impl BrokerSink {
             message_id: evt.message_id.clone(),
         };
 
-        // v1: minimal SenderContext. User-display-name resolution is deferred
-        // (operator sees sender_id verbatim). Logged as a known limitation.
-        let sender = crate::adapter::SenderContext {
-            schema: "openab.sender.v1".into(),
-            sender_id: evt.sender_id.clone(),
-            sender_name: evt.sender_id.clone(),
-            display_name: evt.sender_id.clone(),
-            channel: "zulip".into(),
-            channel_id: channel_id.clone(),
-            thread_id: thread_id_opt.clone(),
-            is_bot: false,
-            timestamp: None,
-            message_id: Some(evt.message_id.clone()),
-            receiver_id: None,
-        };
+        // Resolve the display name from `sender_full_name` (falls back to the
+        // numeric sender_id when missing/empty) via the pure seam.
+        let sender = build_sender_context(
+            evt.sender_full_name.as_deref(),
+            &evt.sender_id,
+            &channel_id,
+            thread_id_opt.as_deref(),
+            &evt.message_id,
+        );
+        let resolved_name = sender.sender_name.clone();
         let sender_json = serde_json::to_string(&sender).unwrap_or_else(|_| "{}".into());
         let estimated_tokens = crate::dispatch::estimate_tokens(&evt.content, &[]);
         let adapter_dyn: Arc<dyn ChatAdapter> = self.adapter.clone();
         let buf = crate::dispatch::BufferedMessage {
             sender_json,
-            sender_name: evt.sender_id.clone(),
+            sender_name: resolved_name,
             prompt: evt.content.clone(),
             extra_blocks: Vec::new(),
             trigger_msg,
@@ -986,6 +899,10 @@ pub async fn run_zulip_adapter(
                     Some(s) => s.to_string(),
                     None => continue,
                 };
+                let sender_full_name = body
+                    .get("sender_full_name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let content = body
                     .get("content")
                     .and_then(|v| v.as_str())
@@ -1085,23 +1002,12 @@ pub async fn run_zulip_adapter(
                     thread_key_for_event(&ZulipEventKind::Dm { user_ids: &ids })
                 };
                 debug!(thread_key = %key, "zulip message dispatched");
-                if let Some(args) = parse_eom(&content) {
-                    sink.handle_eom(EomCommand {
-                        thread_key: key,
-                        stream_id,
-                        topic,
-                        sender_id,
-                        message_id,
-                        args,
-                    })
-                    .await;
-                    continue;
-                }
                 sink.dispatch(ZulipDispatchedMessage {
                     thread_key: key,
                     stream_id,
                     topic,
                     sender_id,
+                    sender_full_name,
                     message_id,
                     content,
                 })
@@ -1400,49 +1306,26 @@ mod tests {
         ));
     }
 
-    // --- EomCommandParser ---
+    // --- ZulipSenderContextSeam -------------------------------------------
 
     #[test]
-    fn parse_eom_with_args() {
-        assert_eq!(
-            parse_eom("/eom hello world"),
-            Some("hello world".to_string())
-        );
+    fn zulip_build_sender_context_resolves_display_name() {
+        let ctx = build_sender_context(Some("Alice Wu"), "7", "42", Some("x"), "1");
+        assert_eq!(ctx.display_name, "Alice Wu");
+        assert_eq!(ctx.sender_name, "Alice Wu");
+        assert_eq!(ctx.sender_id, "7");
     }
 
     #[test]
-    fn parse_eom_preserves_interior_whitespace() {
-        assert_eq!(parse_eom("/eom  do  this  "), Some("do  this".to_string()));
-    }
-
-    #[test]
-    fn parse_eom_no_args() {
-        assert_eq!(parse_eom("/eom"), Some(String::new()));
-    }
-
-    #[test]
-    fn parse_eom_whitespace_only_args() {
-        assert_eq!(parse_eom("/eom   "), Some(String::new()));
-    }
-
-    #[test]
-    fn parse_eom_not_at_start_is_rejected() {
-        assert_eq!(parse_eom("Hey /eom inside"), None);
-    }
-
-    #[test]
-    fn parse_eom_rejects_prefix_extension() {
-        assert_eq!(parse_eom("/eomx blah"), None);
-    }
-
-    #[test]
-    fn parse_eom_empty_body_is_none() {
-        assert_eq!(parse_eom(""), None);
-    }
-
-    #[test]
-    fn parse_eom_leading_whitespace_disqualifies() {
-        assert_eq!(parse_eom("  /eom hi"), None);
+    fn zulip_build_sender_context_falls_back_to_sender_id_when_name_missing() {
+        // Missing field (None) falls back to the numeric sender_id.
+        let missing = build_sender_context(None, "7", "42", Some("x"), "1");
+        assert_eq!(missing.display_name, "7");
+        assert_eq!(missing.sender_name, "7");
+        // Empty string falls back too (never an empty display name).
+        let empty = build_sender_context(Some(""), "7", "42", Some("x"), "1");
+        assert_eq!(empty.display_name, "7");
+        assert_eq!(empty.sender_name, "7");
     }
 
     // --- HTTP test plumbing -------------------------------------------------
@@ -1878,6 +1761,9 @@ mod tests {
         thread_key: String,
         stream_id: Option<String>,
         sender_id: String,
+        /// Resolved sender name (from the seam) so tests can observe that the
+        /// full name flowed through the dispatch path instead of the numeric id.
+        sender_name: String,
         #[allow(dead_code)]
         content: String,
     }
@@ -1885,14 +1771,12 @@ mod tests {
     /// Recording sink — records every dispatched event for assertions.
     struct RecordingSink {
         log: Mutex<Vec<DispatchedEvent>>,
-        eom_log: Mutex<Vec<EomCommand>>,
     }
 
     impl RecordingSink {
         fn new() -> Self {
             Self {
                 log: Mutex::new(Vec::new()),
-                eom_log: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1900,15 +1784,26 @@ mod tests {
     #[async_trait]
     impl ZulipMessageSink for RecordingSink {
         async fn dispatch(&self, evt: ZulipDispatchedMessage) {
+            // Resolve through the same seam production uses, so the recorded
+            // name reflects the real dispatch-path resolution.
+            let ctx = build_sender_context(
+                evt.sender_full_name.as_deref(),
+                &evt.sender_id,
+                evt.stream_id.as_deref().unwrap_or_default(),
+                if evt.topic.is_empty() {
+                    None
+                } else {
+                    Some(evt.topic.as_str())
+                },
+                &evt.message_id,
+            );
             self.log.lock().unwrap().push(DispatchedEvent {
                 thread_key: evt.thread_key,
                 stream_id: evt.stream_id,
                 sender_id: evt.sender_id,
+                sender_name: ctx.sender_name,
                 content: evt.content,
             });
-        }
-        async fn handle_eom(&self, cmd: EomCommand) {
-            self.eom_log.lock().unwrap().push(cmd);
         }
     }
 
@@ -2008,6 +1903,52 @@ mod tests {
         assert_eq!(log[0].thread_key, "zulip:stream:42:x");
         assert_eq!(log[0].stream_id.as_deref(), Some("42"));
         assert_eq!(log[0].sender_id, "7");
+    }
+
+    /// E1: a stream event carrying `sender_full_name:"Alice Wu"` must reach the
+    /// sink with the resolved name "Alice Wu" (not the numeric sender_id "7").
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_dispatches_resolved_sender_full_name() {
+        let canned = vec![
+            users_me_ok(),
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","queue_id":"q1","last_event_id":-1}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[{"id":1,"type":"message","flags":["mentioned"],"message":{"stream_id":42,"subject":"x","sender_id":7,"sender_full_name":"Alice Wu","content":"hi"}}]}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[]}"#.into(),
+            },
+        ];
+        let base = spawn_mock(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let params = make_params(&["42"]);
+        let sink = Arc::new(RecordingSink::new());
+        let (tx, rx) = watch::channel(false);
+
+        let sink_clone = sink.clone();
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = tx.send(true);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("loop should exit within 5s")
+            .expect("task should join");
+        res.expect("loop should return Ok");
+
+        let log = sink.log.lock().unwrap();
+        assert_eq!(log.len(), 1, "expected 1 dispatched message");
+        assert_eq!(log[0].sender_name, "Alice Wu");
+        assert_ne!(log[0].sender_name, "7");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2188,245 +2129,6 @@ mod tests {
             .await
             .expect("loop should exit within 5s of shutdown signal");
         res.expect("task join").expect("loop Ok");
-    }
-
-    // --- BrokerSinkHandleEom -----------------------------------------------
-
-    use crate::dispatch::{
-        BatchGrouping, DispatchTarget, Dispatcher, DEFAULT_CONSUMER_IDLE_TIMEOUT,
-    };
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-
-    /// Test DispatchTarget that just counts how many times `ensure_session` is
-    /// invoked. A real submit's consumer task calls `ensure_session` once before
-    /// touching ACP, so a non-zero count proves the submit reached the consumer.
-    struct CountingTarget {
-        ensure_calls: Arc<AtomicUsize>,
-        reactions: crate::config::ReactionsConfig,
-    }
-
-    #[async_trait]
-    impl DispatchTarget for CountingTarget {
-        fn reactions_config(&self) -> &crate::config::ReactionsConfig {
-            &self.reactions
-        }
-        async fn ensure_session(&self, _session_key: &str) -> Result<()> {
-            self.ensure_calls.fetch_add(1, AtomicOrdering::SeqCst);
-            // Return Err so the consumer aborts the turn quickly without
-            // attempting to stream against a non-existent ACP process.
-            Err(anyhow!("test target: no ACP backing"))
-        }
-        async fn stream_prompt_blocks(
-            &self,
-            _adapter: &Arc<dyn ChatAdapter>,
-            _session_key: &str,
-            _content_blocks: Vec<crate::acp::ContentBlock>,
-            _thread_channel: &ChannelRef,
-            _trigger_msg: &MessageRef,
-            _reactions: Arc<crate::reactions::StatusReactionController>,
-            _other_bot_present: bool,
-        ) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    fn make_test_dispatcher(ensure_calls: Arc<AtomicUsize>) -> Arc<Dispatcher> {
-        let target = Arc::new(CountingTarget {
-            ensure_calls,
-            reactions: crate::config::ReactionsConfig::default(),
-        });
-        Arc::new(Dispatcher::with_idle_timeout(
-            target,
-            10,
-            24_000,
-            BatchGrouping::Thread,
-            DEFAULT_CONSUMER_IDLE_TIMEOUT,
-        ))
-    }
-
-    fn make_test_pool() -> Arc<crate::acp::SessionPool> {
-        let agent_cfg = crate::config::AgentConfig {
-            command: "/bin/true".into(),
-            args: vec![],
-            working_dir: "/tmp".into(),
-            env: std::collections::HashMap::new(),
-            inherit_env: vec![],
-        };
-        Arc::new(crate::acp::SessionPool::new(agent_cfg, 1))
-    }
-
-    #[tokio::test]
-    async fn handle_eom_empty_args_acks_and_does_not_submit() {
-        // One canned response: success for the ack POST /api/v1/messages.
-        let canned = vec![Canned {
-            status: 200,
-            headers: vec![("Content-Type", "application/json".into())],
-            body: r#"{"result":"success","id":4242}"#.into(),
-        }];
-        let base = spawn_mock(canned).await;
-        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
-        let ensure_calls = Arc::new(AtomicUsize::new(0));
-        let dispatcher = make_test_dispatcher(ensure_calls.clone());
-        let pool = make_test_pool();
-        let sink = BrokerSink::new(adapter, dispatcher, pool);
-
-        sink.handle_eom(EomCommand {
-            thread_key: "zulip:stream:42:deploy".into(),
-            stream_id: Some("42".into()),
-            topic: "deploy".into(),
-            sender_id: "7".into(),
-            message_id: "9001".into(),
-            args: String::new(),
-        })
-        .await;
-
-        // Give any (unexpected) consumer task a chance to run.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(
-            ensure_calls.load(AtomicOrdering::SeqCst),
-            0,
-            "no-arg /eom must not re-submit"
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_eom_with_args_acks_and_submits() {
-        let canned = vec![Canned {
-            status: 200,
-            headers: vec![("Content-Type", "application/json".into())],
-            body: r#"{"result":"success","id":4242}"#.into(),
-        }];
-        let base = spawn_mock(canned).await;
-        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
-        let ensure_calls = Arc::new(AtomicUsize::new(0));
-        let dispatcher = make_test_dispatcher(ensure_calls.clone());
-        let pool = make_test_pool();
-        let sink = BrokerSink::new(adapter, dispatcher, pool);
-
-        sink.handle_eom(EomCommand {
-            thread_key: "zulip:stream:42:deploy".into(),
-            stream_id: Some("42".into()),
-            topic: "deploy".into(),
-            sender_id: "7".into(),
-            message_id: "9001".into(),
-            args: "do the thing".into(),
-        })
-        .await;
-
-        // Wait briefly for the consumer task spawned by submit() to call ensure_session.
-        for _ in 0..50 {
-            if ensure_calls.load(AtomicOrdering::SeqCst) > 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(
-            ensure_calls.load(AtomicOrdering::SeqCst) > 0,
-            "/eom with args must re-submit (consumer should reach ensure_session)"
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_eom_continues_when_pool_reset_errors() {
-        // Pool has no session for this key — reset_session returns Err, but the
-        // ack and submit must still happen.
-        let canned = vec![Canned {
-            status: 200,
-            headers: vec![("Content-Type", "application/json".into())],
-            body: r#"{"result":"success","id":4242}"#.into(),
-        }];
-        let base = spawn_mock(canned).await;
-        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
-        let ensure_calls = Arc::new(AtomicUsize::new(0));
-        let dispatcher = make_test_dispatcher(ensure_calls.clone());
-        let pool = make_test_pool(); // empty pool → reset_session errors
-        let sink = BrokerSink::new(adapter, dispatcher, pool);
-
-        sink.handle_eom(EomCommand {
-            thread_key: "zulip:stream:99:nope".into(),
-            stream_id: Some("99".into()),
-            topic: "nope".into(),
-            sender_id: "7".into(),
-            message_id: "9001".into(),
-            args: "retry please".into(),
-        })
-        .await;
-
-        for _ in 0..50 {
-            if ensure_calls.load(AtomicOrdering::SeqCst) > 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(
-            ensure_calls.load(AtomicOrdering::SeqCst) > 0,
-            "ack and submit must still happen when pool.reset_session errors"
-        );
-    }
-
-    // --- EomWiredInEventLoop -----------------------------------------------
-
-    #[tokio::test]
-    async fn parse_then_route_branches_correctly() {
-        // Smaller unit: verify the parse-then-route decision in isolation —
-        // /eom content routes to handle_eom, plain content routes to dispatch.
-        let sink = Arc::new(RecordingSink::new());
-
-        let content_a = "hello world".to_string();
-        if let Some(args) = parse_eom(&content_a) {
-            sink.handle_eom(EomCommand {
-                thread_key: "k".into(),
-                stream_id: None,
-                topic: String::new(),
-                sender_id: "7".into(),
-                message_id: "1".into(),
-                args,
-            })
-            .await;
-        } else {
-            sink.dispatch(ZulipDispatchedMessage {
-                thread_key: "k".into(),
-                stream_id: None,
-                topic: String::new(),
-                sender_id: "7".into(),
-                message_id: "1".into(),
-                content: content_a,
-            })
-            .await;
-        }
-
-        let content_b = "/eom replan now".to_string();
-        if let Some(args) = parse_eom(&content_b) {
-            sink.handle_eom(EomCommand {
-                thread_key: "k".into(),
-                stream_id: None,
-                topic: String::new(),
-                sender_id: "7".into(),
-                message_id: "2".into(),
-                args,
-            })
-            .await;
-        } else {
-            sink.dispatch(ZulipDispatchedMessage {
-                thread_key: "k".into(),
-                stream_id: None,
-                topic: String::new(),
-                sender_id: "7".into(),
-                message_id: "2".into(),
-                content: content_b,
-            })
-            .await;
-        }
-
-        let dispatched = sink.log.lock().unwrap();
-        let eom_called = sink.eom_log.lock().unwrap();
-        assert_eq!(dispatched.len(), 1, "plain message routes to dispatch only");
-        assert_eq!(
-            eom_called.len(),
-            1,
-            "/eom message routes to handle_eom only"
-        );
-        assert_eq!(eom_called[0].args, "replan now");
     }
 
     // --- ZulipEmojiMap -----------------------------------------------------
