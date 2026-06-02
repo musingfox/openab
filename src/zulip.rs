@@ -97,9 +97,23 @@ fn build_sender_context(
 /// Zulip bot accounts have an email whose local-part (the segment before `@`)
 /// ends in `-bot` (e.g. `weather-bot@example.com`). Only the local-part is
 /// inspected so a domain that merely contains `bot` (e.g. `alice@bot.example`)
-/// is never misclassified as a bot.
+/// is never misclassified as a bot. Matching is case-insensitive on the
+/// local-part, and a short allowlist of known Zulip system bots whose
+/// local-part does NOT end in `-bot` (e.g. `emailgateway`) is also recognized.
+///
+/// accepted_hole(H3-residual): this is a pure email heuristic + known-bot list.
+/// It cannot cover custom bots renamed to a non-`-bot` local-part, nor future
+/// system bots not yet in the allowlist below. Unlike Slack (`bot_id`) or
+/// Discord (`author.bot`), Zulip's message event exposes no authoritative bot
+/// flag on the sender, so this is a known, accepted limitation.
 fn email_is_bot(email: &str) -> bool {
-    email.split('@').next().unwrap_or("").ends_with("-bot")
+    // Known Zulip system bots whose local-part does not end in `-bot`.
+    // `notification-bot` / `welcome-bot` are already covered by the `-bot`
+    // suffix but are listed for clarity of intent.
+    const KNOWN_SYSTEM_BOTS: &[&str] =
+        &["emailgateway", "notification-bot", "welcome-bot"];
+    let local = email.split('@').next().unwrap_or("").to_ascii_lowercase();
+    local.ends_with("-bot") || KNOWN_SYSTEM_BOTS.contains(&local.as_str())
 }
 
 /// Decide whether a Zulip event passes the allowlist gate.
@@ -731,7 +745,6 @@ impl ZulipMessageSink for BrokerSink {
 /// construction (name resolution + `is_bot` flow) is unit-testable in isolation.
 fn build_dispatch_parts(
     evt: ZulipDispatchedMessage,
-    is_bot: bool,
 ) -> (String, ChannelRef, crate::dispatch::BufferedMessage) {
     // Build the trigger MessageRef so reactions / streaming edits land on
     // the originating Zulip message.
@@ -761,7 +774,7 @@ fn build_dispatch_parts(
         &channel_id,
         thread_id_opt.as_deref(),
         &evt.message_id,
-        is_bot,
+        evt.is_bot,
     );
     let resolved_name = sender.sender_name.clone();
     let sender_json = serde_json::to_string(&sender).unwrap_or_else(|_| "{}".into());
@@ -781,9 +794,8 @@ fn build_dispatch_parts(
 
 impl BrokerSink {
     async fn dispatch_impl(&self, evt: ZulipDispatchedMessage) {
-        let is_bot = evt.is_bot;
         let adapter_dyn: Arc<dyn ChatAdapter> = self.adapter.clone();
-        let (thread_key, trigger_channel, buf) = build_dispatch_parts(evt, is_bot);
+        let (thread_key, trigger_channel, buf) = build_dispatch_parts(evt);
         if let Err(e) = self
             .dispatcher
             .submit(thread_key, trigger_channel, adapter_dyn, buf)
@@ -957,6 +969,19 @@ pub async fn run_zulip_adapter(
                     &params.allowed_users,
                 ) {
                     debug!(stream_id = ?stream_id, sender_id = %sender_id, "zulip allowlist denied");
+                    continue;
+                }
+
+                // Self-message filter: the Zulip event queue echoes back the
+                // bot's own messages. Skip dispatching our own message so we
+                // don't treat it as a respondable external bot. This sits at the
+                // dispatch *decision* point (not at the top of the event loop),
+                // so a future BotTurnTracker can still observe self messages by
+                // hooking above this skip — see discord.rs counts-before-skip.
+                // Placed before the dispatch-mode gate so a self message never
+                // triggers the topic_participation history fetch.
+                if sender_id == bot_user_id.to_string() {
+                    debug!(sender_id = %sender_id, "zulip self message, not dispatching");
                     continue;
                 }
 
@@ -1383,6 +1408,27 @@ mod tests {
         assert!(!email_is_bot(""));
     }
 
+    /// H2: the `-bot` suffix match is case-insensitive on the local-part, while
+    /// a domain merely containing "bot" is still not a bot.
+    #[test]
+    fn email_is_bot_is_case_insensitive() {
+        assert!(email_is_bot("weather-BOT@example.com"));
+        assert!(email_is_bot("weather-Bot@x"));
+        assert!(email_is_bot("WEATHER-bot@x"));
+        assert!(!email_is_bot("alice@bot.example.com"));
+    }
+
+    /// H3: known Zulip system bots are recognized even when their local-part
+    /// does not end in `-bot` (load-bearing: `emailgateway`), while an ordinary
+    /// user email is not.
+    #[test]
+    fn email_is_bot_recognizes_known_system_bots() {
+        assert!(email_is_bot("emailgateway@zulip.com"));
+        assert!(email_is_bot("notification-bot@zulip.com"));
+        assert!(email_is_bot("welcome-bot@zulip.com"));
+        assert!(!email_is_bot("alice@example.com"));
+    }
+
     // --- ZulipDispatchSeam (A3 + D1) --------------------------------------
     // SenderContext is Serialize-only (no Deserialize), so test bodies parse
     // the produced `sender_json` as a generic `serde_json::Value` and index it.
@@ -1407,12 +1453,29 @@ mod tests {
     #[test]
     fn dispatch_impl_seam_serializes_is_bot_true_for_bot_sender() {
         let evt = seam_evt("Weather Bot", "9", true);
-        let (_thread_key, _channel, buf) = build_dispatch_parts(evt, true);
+        let (_thread_key, _channel, buf) = build_dispatch_parts(evt);
         let v: serde_json::Value = serde_json::from_str(&buf.sender_json).unwrap();
         assert_eq!(
             v["is_bot"].as_bool(),
             Some(true),
             "bot sender must serialize is_bot == true: {}",
+            buf.sender_json
+        );
+    }
+
+    /// H1: the post-refactor single-arg `build_dispatch_parts(evt)` reads the
+    /// bot flag from `evt.is_bot` (the single production source of truth). With
+    /// is_bot=false the serialized SenderContext must carry is_bot == false —
+    /// the false direction complements the existing true-direction seam test.
+    #[test]
+    fn dispatch_parts_reads_is_bot_from_event_false() {
+        let evt = seam_evt("Alice Wu", "7", false);
+        let (_thread_key, _channel, buf) = build_dispatch_parts(evt);
+        let v: serde_json::Value = serde_json::from_str(&buf.sender_json).unwrap();
+        assert_eq!(
+            v["is_bot"].as_bool(),
+            Some(false),
+            "is_bot=false on the event must serialize is_bot == false: {}",
             buf.sender_json
         );
     }
@@ -1424,7 +1487,7 @@ mod tests {
     #[test]
     fn dispatch_impl_seam_preserves_resolved_sender_name() {
         let evt = seam_evt("Alice Wu", "7", false);
-        let (_thread_key, _channel, buf) = build_dispatch_parts(evt, false);
+        let (_thread_key, _channel, buf) = build_dispatch_parts(evt);
         assert_eq!(buf.sender_name, "Alice Wu");
         assert_ne!(buf.sender_name, "7");
         let v: serde_json::Value = serde_json::from_str(&buf.sender_json).unwrap();
@@ -2111,6 +2174,61 @@ mod tests {
         assert!(
             !log[1].is_bot,
             "alice@example.com must be classified as a human"
+        );
+    }
+
+    /// H4: the dispatch path uses the startup-resolved bot_user_id (==999 from
+    /// users_me_ok) to skip the bot's own echoed messages. One poll carries two
+    /// @-mention `-bot` events differing only in sender_id: 999 (self) and 8
+    /// (external bot). The self message must NOT reach the sink; the external
+    /// bot message must.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_does_not_dispatch_self_bot_message() {
+        let canned = vec![
+            users_me_ok(),
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","queue_id":"q1","last_event_id":-1}"#.into(),
+            },
+            // One poll, two @-mention `-bot` events: self (999) then external (8).
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[{"id":1,"type":"message","flags":["mentioned"],"message":{"stream_id":42,"subject":"x","sender_id":999,"sender_email":"self-bot@example.com","content":"hi"}},{"id":2,"type":"message","flags":["mentioned"],"message":{"stream_id":42,"subject":"x","sender_id":8,"sender_email":"other-bot@example.com","content":"yo"}}]}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[]}"#.into(),
+            },
+        ];
+        let base = spawn_mock(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let params = make_params(&["42"]);
+        let sink = Arc::new(RecordingSink::new());
+        let (tx, rx) = watch::channel(false);
+
+        let sink_clone = sink.clone();
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = tx.send(true);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("loop should exit within 5s")
+            .expect("task should join");
+        res.expect("loop should return Ok");
+
+        let log = sink.log.lock().unwrap();
+        assert!(
+            log.iter().any(|e| e.sender_id == "8"),
+            "external bot (sender_id=8) must be dispatched, got {log:?}"
+        );
+        assert!(
+            !log.iter().any(|e| e.sender_id == "999"),
+            "self message (sender_id=999) must NOT be dispatched, got {log:?}"
         );
     }
 
