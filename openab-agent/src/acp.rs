@@ -86,7 +86,7 @@ impl AcpServer {
 
             let output = match req.method.as_deref() {
                 Some("initialize") => vec![self.handle_initialize(id)],
-                Some("session/new") => vec![self.handle_session_new(id)],
+                Some("session/new") => vec![self.handle_session_new(id).await],
                 Some("session/prompt") => {
                     let params = req.params.unwrap_or(json!({}));
                     self.handle_session_prompt(id, &params).await
@@ -132,7 +132,7 @@ impl AcpServer {
         serde_json::to_string(&resp).unwrap()
     }
 
-    fn handle_session_new(&mut self, id: u64) -> String {
+    async fn handle_session_new(&mut self, id: u64) -> String {
         let session_id = Uuid::new_v4().to_string();
 
         // Use struct config if set, then env, then auto-detect
@@ -220,7 +220,7 @@ impl AcpServer {
                     "category": "model",
                     "type": "enum",
                     "currentValue": model_name,
-                    "options": Self::available_models()
+                    "options": Self::available_models().await
                 }]
             })),
             error: None,
@@ -229,19 +229,136 @@ impl AcpServer {
     }
 
     /// List available models based on configured credentials.
-    fn available_models() -> Vec<Value> {
+    /// Queries provider APIs when possible, falls back to known defaults.
+    async fn available_models() -> Vec<Value> {
         let mut models = Vec::new();
+
+        // Query Anthropic models if credentials are available
         if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-            models.push(json!({"value": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4"}));
-            models.push(json!({"value": "claude-haiku-4-20250514", "name": "Claude Haiku 4"}));
+            match Self::fetch_anthropic_models().await {
+                Ok(fetched) => models.extend(fetched),
+                Err(_) => {
+                    // Fallback to known defaults if API unreachable
+                    models.push(json!({"value": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4", "provider": "anthropic"}));
+                    models.push(json!({"value": "claude-haiku-4-20250514", "name": "Claude Haiku 4", "provider": "anthropic"}));
+                }
+            }
         }
+
+        // Query OpenAI models if credentials are available
         if crate::auth::load_tokens().is_ok() {
-            models.push(json!({"value": "gpt-4.1-nano", "name": "GPT-4.1 Nano"}));
-            models.push(json!({"value": "gpt-4.1-mini", "name": "GPT-4.1 Mini"}));
-            models.push(json!({"value": "o4-mini", "name": "o4-mini"}));
+            match Self::fetch_openai_models().await {
+                Ok(fetched) => models.extend(fetched),
+                Err(_) => {
+                    // Fallback to known defaults if API unreachable
+                    models.push(json!({"value": "gpt-4.1-nano", "name": "GPT-4.1 Nano", "provider": "openai"}));
+                    models.push(json!({"value": "gpt-4.1-mini", "name": "GPT-4.1 Mini", "provider": "openai"}));
+                    models.push(json!({"value": "o4-mini", "name": "o4-mini", "provider": "openai"}));
+                }
+            }
+        }
+
+        if models.is_empty() {
+            models.push(json!({"value": "none", "name": "No credentials configured", "provider": "none"}));
+        }
+        models
+    }
+
+    /// Fetch models from Anthropic /v1/models API.
+    async fn fetch_anthropic_models() -> Result<Vec<Value>, String> {
+        let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|e| e.to_string())?;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get("https://api.anthropic.com/v1/models")
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !resp.status().is_success() {
+            return Err(format!("Anthropic API returned {}", resp.status()));
+        }
+
+        let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+        let mut models = Vec::new();
+        if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+            for m in data {
+                if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
+                    // Only include chat models (claude-*)
+                    if id.starts_with("claude") {
+                        let display = m
+                            .get("display_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(id);
+                        models.push(json!({"value": id, "name": display, "provider": "anthropic"}));
+                    }
+                }
+            }
         }
         if models.is_empty() {
-            models.push(json!({"value": "none", "name": "No credentials configured"}));
+            return Err("No models returned from Anthropic API".to_string());
+        }
+        Ok(models)
+    }
+
+    /// Fetch models from OpenAI-compatible /models endpoint.
+    async fn fetch_openai_models() -> Result<Vec<Value>, String> {
+        let tokens = crate::auth::load_tokens().map_err(|e| e.to_string())?;
+        let base_url = std::env::var("OPENAB_AGENT_OPENAI_BASE_URL")
+            .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string());
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/models", base_url))
+            .bearer_auth(&tokens.access_token)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !resp.status().is_success() {
+            return Err(format!("OpenAI API returned {}", resp.status()));
+        }
+
+        let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+        let mut models = Vec::new();
+        // Handle both { "data": [...] } and [...] shapes
+        let items = body
+            .get("data")
+            .and_then(|d| d.as_array())
+            .or_else(|| body.as_array());
+        if let Some(data) = items {
+            for m in data {
+                if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
+                    let name = m
+                        .get("name")
+                        .or_else(|| m.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(id);
+                    models.push(json!({"value": id, "name": name, "provider": "openai"}));
+                }
+            }
+        }
+        if models.is_empty() {
+            return Err("No models returned from OpenAI API".to_string());
+        }
+        Ok(models)
+    }
+
+    /// Sync version for use in non-async contexts (e.g. set_config_option validation).
+    /// Uses credential detection with known defaults — the async version queries APIs.
+    fn available_models_sync() -> Vec<Value> {
+        let mut models = Vec::new();
+        if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            models.push(json!({"value": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4", "provider": "anthropic"}));
+            models.push(json!({"value": "claude-haiku-4-20250514", "name": "Claude Haiku 4", "provider": "anthropic"}));
+        }
+        if crate::auth::load_tokens().is_ok() {
+            models.push(json!({"value": "gpt-4.1-nano", "name": "GPT-4.1 Nano", "provider": "openai"}));
+            models.push(json!({"value": "gpt-4.1-mini", "name": "GPT-4.1 Mini", "provider": "openai"}));
+            models.push(json!({"value": "o4-mini", "name": "o4-mini", "provider": "openai"}));
+        }
+        if models.is_empty() {
+            models.push(json!({"value": "none", "name": "No credentials configured", "provider": "none"}));
         }
         models
     }
@@ -317,12 +434,12 @@ impl AcpServer {
             return self.error_response(id, -32602, "unsupported configId or empty value");
         }
 
-        // Validate model against available options
-        let models = Self::available_models();
-        let valid = models
+        // We need the cached model list; use sync fallback for validation
+        let models = Self::available_models_sync();
+        let matched = models
             .iter()
-            .any(|m| m.get("value").and_then(|v| v.as_str()) == Some(value));
-        if !valid {
+            .find(|m| m.get("value").and_then(|v| v.as_str()) == Some(value));
+        if matched.is_none() {
             return self.error_response(
                 id,
                 -32602,
@@ -330,12 +447,12 @@ impl AcpServer {
             );
         }
 
-        // Determine provider from model name
-        let provider_name = if value.starts_with("claude") {
-            "anthropic"
-        } else {
-            "openai"
-        };
+        // Determine provider from model metadata (not name prefix)
+        let provider_name = matched
+            .unwrap()
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("openai");
 
         // Store in struct (safe — no env mutation)
         self.active_model = Some(value.to_string());
@@ -419,12 +536,12 @@ mod tests {
         assert_eq!(resp["result"]["agentCapabilities"]["streaming"], false);
     }
 
-    #[test]
-    fn test_session_new() {
+    #[tokio::test]
+    async fn test_session_new() {
         // Set a fake key so from_env() succeeds in CI
         unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
         let mut server = AcpServer::new();
-        let resp_str = server.handle_session_new(2);
+        let resp_str = server.handle_session_new(2).await;
         let resp: Value = serde_json::from_str(&resp_str).unwrap();
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 2);
@@ -437,8 +554,8 @@ mod tests {
         assert!(!config_options[0]["options"].as_array().unwrap().is_empty());
     }
 
-    #[test]
-    fn test_session_new_missing_key() {
+    #[tokio::test]
+    async fn test_session_new_missing_key() {
         // Ensure no OAuth token exists either
         let auth_path =
             std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
@@ -446,7 +563,7 @@ mod tests {
         let _ = std::fs::remove_file(&auth_path);
         unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
         let mut server = AcpServer::new();
-        let resp_str = server.handle_session_new(3);
+        let resp_str = server.handle_session_new(3).await;
         let resp: Value = serde_json::from_str(&resp_str).unwrap();
         assert!(resp["error"].is_object());
         assert!(resp["error"]["message"]
