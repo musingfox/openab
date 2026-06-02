@@ -604,8 +604,8 @@ impl AdapterRouter {
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
                     // Flipped to true ONLY on the id-bearing-success path —
-                    // gates topic auto-resolve so EOF / timeout / errors /
-                    // /eom-cancel never trigger it.
+                    // gates topic auto-resolve so EOF / timeout / errors
+                    // never trigger it.
                     let mut natural_completion = false;
                     let prompt_start = tokio::time::Instant::now();
                     loop {
@@ -827,7 +827,7 @@ impl AdapterRouter {
 
 /// Invoke `adapter.resolve_topic` iff the agent requested it (`[[resolve]]`)
 /// AND the turn ended naturally (id-bearing-success). All other exit paths
-/// — EOF, hard timeout, dead process, id-bearing-error, /eom-cancel — leave
+/// — EOF, hard timeout, dead process, id-bearing-error — leave
 /// `natural_completion = false` and this becomes a no-op.
 ///
 /// Resolve failures are logged at `warn` and swallowed so the rename never

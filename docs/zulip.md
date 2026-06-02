@@ -151,7 +151,7 @@ The adapter re-registers its event queue cleanly.
 When the agent emits `[[resolve]]` as the **first line** of its final reply,
 the broker strips that line from the visible message and — only if the turn
 completed naturally (id-bearing-success notification, not EOF / timeout /
-error / `/eom`-cancel) — issues `PATCH /api/v1/messages/{id}` with
+error) — issues `PATCH /api/v1/messages/{id}` with
 `topic=✔ <original topic>` and `propagate_mode=change_all`. Zulip then
 renames the topic and visually collapses it under its resolved-topic UX.
 
@@ -206,49 +206,24 @@ Tracked here so they don't get rediscovered.
 
 Zulip does **not** expose any API for third-party bots to register slash
 commands in the compose-box autocomplete (`/me`, `/poll`, `/todo` etc. are
-hardcoded in the Zulip server). The text-prefix commands (`/eom` today,
-likely `/help` and `/reset` later) work but get no UI affordance — users
-must know to type them.
+hardcoded in the Zulip server). Any future text-prefix commands (e.g.
+`/help`, `/reset`) would work but get no UI affordance — users must know to
+type them.
 
 Workarounds, none ideal:
 
-1. Implement a `/help` text-prefix command (~20 LOC, same shape as `/eom`)
-   that returns a markdown list of available bot commands. Industry standard
-   for Zulip bots — `zulip_bots` framework defaults to this.
-2. Edit the bot's Zulip `full_name` to embed a hint, e.g.
-   `adam-bot (try /eom <task>)`. Visible on hover; cluttered in message list.
+1. Implement a `/help` text-prefix command (~20 LOC) that returns a markdown
+   list of available bot commands. Industry standard for Zulip bots —
+   `zulip_bots` framework defaults to this.
+2. Edit the bot's Zulip `full_name` to embed a hint. Visible on hover;
+   cluttered in message list.
 3. Bot posts an inline tip on first @mention per topic. Annoying on repeat.
-4. Zulip admin sets a linkifier to highlight `/eom` text — visual hint only,
+4. Zulip admin sets a linkifier to highlight command text — visual hint only,
    no autocomplete. Affects ALL messages, not bot-specific.
 5. Fork Zulip server itself. Only viable for self-hosted; massive effort;
    not pursued.
 
 If/when `/help` lands, link from here and from the Troubleshooting section.
-
-### `/eom` may stall the event loop (observed 2026-05-27)
-
-After invoking `/eom` against a thread whose ACP session had already
-naturally completed (so `pool.reset_session` errors with "no session
-for thread"), the Zulip event loop emitted the `reset_session failed`
-warn and then went completely silent — no further events processed,
-no queue re-register. Container stayed `healthy`. A `docker compose
-restart openab-bot1` fixed it; the new queue immediately resumed
-processing.
-
-Repro suggestion: send a /eom on an inactive thread, wait the
-`idle_queue_timeout_secs` (default ~600s), watch for whether
-`BAD_EVENT_QUEUE_ID` recovery fires. If it does not, the event loop
-task is dead — likely a panic or `.await` deadlock inside
-`handle_eom`'s `send_message` ack path. Suspects in priority order:
-(1) `adapter.send_message(...).await` panicked or hung;
-(2) `dispatcher.cancel_buffered_thread` did something unexpected
-   on a thread with no buffered messages;
-(3) panic uncaught by the event loop's outer `loop`.
-
-Mitigation until fixed: wrap the entire `handle_eom` body in a
-`tokio::spawn` so a failure cannot kill the event loop task, and add
-`catch_unwind` around the event loop's main `loop` so a panic
-re-registers instead of silently dying.
 
 ### Other deferred items
 

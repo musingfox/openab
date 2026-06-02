@@ -334,11 +334,8 @@ async fn main() -> anyhow::Result<()> {
             max_bot_turns: zulip_cfg.max_bot_turns,
             stt_config: cfg.stt.clone(),
         };
-        let sink: Arc<dyn zulip::ZulipMessageSink> = Arc::new(zulip::BrokerSink::new(
-            zulip_adapter.clone(),
-            zulip_dispatcher,
-            pool.clone(),
-        ));
+        let sink: Arc<dyn zulip::ZulipMessageSink> =
+            Arc::new(zulip::BrokerSink::new(zulip_adapter.clone(), zulip_dispatcher));
         let zulip_shutdown_rx = shutdown_rx.clone();
         Some(tokio::spawn(async move {
             if let Err(e) =
