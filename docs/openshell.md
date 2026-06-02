@@ -218,31 +218,21 @@ Each forwarded port creates a tunnel: `localhost:<port>` on the host → `127.0.
 
 ## BYOC (Custom Image)
 
-Build a custom sandbox image with OAB pre-installed:
-
-```dockerfile
-FROM ubuntu:24.04
-
-RUN groupadd -g 1000660000 sandbox && \
-    useradd -u 1000660000 -g sandbox -m sandbox
-
-RUN apt-get update && apt-get install -y \
-    curl git ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-
-ARG OAB_VERSION=openab-0.8.4-beta.10
-RUN curl -L "https://github.com/openabdev/openab/releases/download/${OAB_VERSION}/${OAB_VERSION}-linux-x64.tar.gz" | \
-    tar xz -C /usr/local/bin/
-
-USER sandbox
-WORKDIR /home/sandbox
-```
-
-Run it:
+A pre-built Dockerfile is provided at [`openshell/Dockerfile`](../openshell/Dockerfile) with OAB and the native agent pre-installed:
 
 ```bash
 openshell sandbox create --name oab \
-  --from ./Dockerfile \
+  --from openshell/Dockerfile \
+  --provider discord \
+  -- bash
+```
+
+To customize the OAB version:
+
+```bash
+docker build --build-arg OAB_VERSION=openab-0.8.4-beta.10 -t oab-sandbox openshell/
+openshell sandbox create --name oab \
+  --from oab-sandbox \
   --provider discord \
   -- bash
 ```
