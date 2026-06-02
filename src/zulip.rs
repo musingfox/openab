@@ -13,6 +13,7 @@
 //! - DMs: `zulip:dm:{sorted_csv_of_user_ids}`.
 
 use crate::adapter::{ChannelRef, ChatAdapter, MessageRef};
+use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -836,8 +837,13 @@ pub async fn run_zulip_adapter(
     };
 
     // Params still pending Zulip support; documented to silence dead-code.
-    // (max_bot_turns is reserved for the Group C BotTurnTracker.)
-    let _ = (params.max_bot_turns, &params.stt_config);
+    let _ = &params.stt_config;
+
+    // Per-thread consecutive-bot-turn cap (Group C). Single-task current_thread
+    // loop, so a plain mutable binding suffices — no Mutex. Lives outside the
+    // poll loop so counts accumulate across polls and reset only on a human
+    // message in the thread.
+    let mut tracker = BotTurnTracker::new(params.max_bot_turns);
 
     let mut backoff_idx: usize = 0;
     const BACKOFFS: &[u64] = &[1, 2, 5, 10];
@@ -957,6 +963,92 @@ pub async fn run_zulip_adapter(
                     .map(|i| i.to_string())
                     .unwrap_or_default();
 
+                // Thread key, hoisted above every gate so the BotTurnTracker
+                // (Group C) can count by thread *before* the user-allowlist
+                // gate. The dispatch sink below reuses this same `key`.
+                let key = if let Some(sid_str) = &stream_id {
+                    let sid: u64 = sid_str.parse().unwrap_or(0);
+                    thread_key_for_event(&ZulipEventKind::Stream {
+                        stream_id: sid,
+                        topic: &topic,
+                    })
+                } else {
+                    // DM: collect `display_recipient` user IDs.
+                    let ids: Vec<u64> = body
+                        .get("display_recipient")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|r| {
+                                    r.get("id").and_then(|v| v.as_i64()).map(|i| i as u64)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    thread_key_for_event(&ZulipEventKind::Dm { user_ids: &ids })
+                };
+
+                // --- Bot turn tracking (Group C) ---
+                // Counts BEFORE the self-skip and the user-allowlist gate so
+                // ALL bot messages (including this bot's own echoes) count
+                // toward the per-thread cap, and so the soft-limit warning fires
+                // even when the user allowlist would block dispatch. The warning
+                // is CHANNEL-only (gated by allowed_channels + self-skip), never
+                // by allow_all_users / allowed_users / trusted_bot_ids. Mirrors
+                // discord.rs / slack.rs counts-before-skip ordering.
+                if is_bot {
+                    match tracker.classify_bot_message(&key) {
+                        TurnAction::Continue => {}
+                        TurnAction::SilentStop => continue,
+                        TurnAction::WarnAndStop {
+                            severity,
+                            turns,
+                            user_message,
+                        } => {
+                            match severity {
+                                TurnSeverity::Hard => warn!(
+                                    sender_id = %sender_id, turns,
+                                    "zulip hard bot turn limit reached"
+                                ),
+                                TurnSeverity::Soft => info!(
+                                    sender_id = %sender_id, turns,
+                                    max = params.max_bot_turns,
+                                    "zulip soft bot turn limit reached"
+                                ),
+                            }
+                            // Channel-only warning gate. A DM (no stream_id)
+                            // has no channel allowlist to check, so it bypasses
+                            // the gate (mirrors allowlist_accepts DM handling);
+                            // no example exercises a DM warning.
+                            let channel_allowed = stream_id.is_none()
+                                || params.allow_all_channels
+                                || stream_id
+                                    .as_deref()
+                                    .is_some_and(|s| params.allowed_channels.contains(s));
+                            let is_self = sender_id == bot_user_id.to_string();
+                            if !is_self && channel_allowed {
+                                let warn_channel = ChannelRef {
+                                    platform: "zulip".into(),
+                                    channel_id: stream_id.clone().unwrap_or_default(),
+                                    thread_id: if topic.is_empty() {
+                                        None
+                                    } else {
+                                        Some(topic.clone())
+                                    },
+                                    parent_id: None,
+                                    origin_event_id: None,
+                                };
+                                let _ = adapter.send_message(&warn_channel, &user_message).await;
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    // A human message resets this thread's bot-turn counter so
+                    // bots may resume after human intervention.
+                    tracker.on_human_message(&key);
+                }
+
                 if !allowlist_accepts(
                     stream_id.as_deref(),
                     &sender_id,
@@ -1072,27 +1164,6 @@ pub async fn run_zulip_adapter(
                     }
                 }
 
-                let key = if let Some(sid_str) = &stream_id {
-                    let sid: u64 = sid_str.parse().unwrap_or(0);
-                    thread_key_for_event(&ZulipEventKind::Stream {
-                        stream_id: sid,
-                        topic: &topic,
-                    })
-                } else {
-                    // DM: collect `display_recipient` user IDs.
-                    let ids: Vec<u64> = body
-                        .get("display_recipient")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|r| {
-                                    r.get("id").and_then(|v| v.as_i64()).map(|i| i as u64)
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    thread_key_for_event(&ZulipEventKind::Dm { user_ids: &ids })
-                };
                 debug!(thread_key = %key, "zulip message dispatched");
                 sink.dispatch(ZulipDispatchedMessage {
                     thread_key: key,
@@ -2830,5 +2901,331 @@ mod tests {
         let adapter = ZulipAdapter::new(base, "b@x", "k");
         let err = adapter.start_typing(&stream_channel()).await.unwrap_err();
         assert!(err.to_string().contains("500"), "missing 500: {err}");
+    }
+
+    // ===================================================================
+    // Group C — BotTurnTracker wiring into the event loop.
+    // ===================================================================
+
+    /// `/register` canned reply (queue_id=q1, last_event_id=-1).
+    fn turn_register_200() -> Canned {
+        Canned {
+            status: 200,
+            headers: vec![("Content-Type", "application/json".into())],
+            body: r#"{"result":"success","queue_id":"q1","last_event_id":-1}"#.into(),
+        }
+    }
+
+    /// `/events` canned reply carrying the given raw event JSON array body.
+    fn turn_events(events_json: &str) -> Canned {
+        Canned {
+            status: 200,
+            headers: vec![("Content-Type", "application/json".into())],
+            body: format!(r#"{{"result":"success","events":{events_json}}}"#),
+        }
+    }
+
+    /// `/events` empty poll (the loop parks here until shutdown).
+    fn turn_events_empty() -> Canned {
+        turn_events("[]")
+    }
+
+    /// Canned 200 reply for the warning POST (`send_message`).
+    fn turn_warning_200() -> Canned {
+        Canned {
+            status: 200,
+            headers: vec![("Content-Type", "application/json".into())],
+            body: r#"{"result":"success","id":555}"#.into(),
+        }
+    }
+
+    /// Drive `run_zulip_adapter` to quiescence and return the joined result is Ok.
+    async fn drive_turn_loop(
+        adapter: Arc<ZulipAdapter>,
+        params: ZulipParams,
+        sink: Arc<RecordingSink>,
+    ) {
+        let (tx, rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink, rx).await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = tx.send(true);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("loop should exit within 5s")
+            .expect("task should join");
+        res.expect("loop should return Ok");
+    }
+
+    /// Count recorded warning POSTs (the only POST /api/v1/messages the mock
+    /// ever sees is a turn-limit warning sent via `send_message`).
+    fn warning_post_count(recorded: &Arc<Mutex<Vec<String>>>) -> usize {
+        recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.starts_with("POST /api/v1/messages")
+                    && r.contains("Bot+turn+limit+reached")
+            })
+            .count()
+    }
+
+    /// C1: max=2, one under-limit non-mention bot dispatches; no warning.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_bot_turn_under_limit_dispatches_and_no_warning() {
+        let canned = vec![
+            users_me_ok(),
+            turn_register_200(),
+            turn_events(
+                r#"[{"id":1,"type":"message","message":{"stream_id":42,"subject":"t","sender_id":7,"sender_email":"seven-bot@x.com","content":"hi"}}]"#,
+            ),
+            turn_events_empty(),
+        ];
+        let (base, recorded) = spawn_mock_recording(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let mut params = make_params(&["42"]);
+        params.allow_bot_messages = AllowBots::All;
+        params.max_bot_turns = 2;
+        let sink = Arc::new(RecordingSink::new());
+
+        drive_turn_loop(adapter, params, sink.clone()).await;
+
+        let log = sink.log.lock().unwrap();
+        assert_eq!(
+            log.iter().filter(|e| e.sender_id == "7").count(),
+            1,
+            "under-limit bot must dispatch exactly once"
+        );
+        assert_eq!(
+            warning_post_count(&recorded),
+            0,
+            "no warning below the limit"
+        );
+    }
+
+    /// C2: max=1, three non-mention bots in one poll → warn once, log empty.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_bot_turn_at_limit_one_warns_and_log_empty() {
+        let canned = vec![
+            users_me_ok(),
+            turn_register_200(),
+            turn_events(
+                r#"[
+                    {"id":1,"type":"message","message":{"stream_id":42,"subject":"t","sender_id":8,"sender_email":"eight-bot@x.com","content":"a"}},
+                    {"id":2,"type":"message","message":{"stream_id":42,"subject":"t","sender_id":8,"sender_email":"eight-bot@x.com","content":"b"}},
+                    {"id":3,"type":"message","message":{"stream_id":42,"subject":"t","sender_id":8,"sender_email":"eight-bot@x.com","content":"c"}}
+                ]"#,
+            ),
+            turn_warning_200(),
+            turn_events_empty(),
+        ];
+        let (base, recorded) = spawn_mock_recording(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let mut params = make_params(&["42"]);
+        params.allow_bot_messages = AllowBots::All;
+        params.max_bot_turns = 1;
+        let sink = Arc::new(RecordingSink::new());
+
+        drive_turn_loop(adapter, params, sink.clone()).await;
+
+        assert_eq!(
+            warning_post_count(&recorded),
+            1,
+            "warn exactly once at the limit"
+        );
+        assert!(
+            sink.log.lock().unwrap().is_empty(),
+            "no at/over-limit bot dispatches"
+        );
+    }
+
+    /// C4: max=2, bot/bot/human/bot on same thread → human resets, sender 7 twice.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_human_message_resets_bot_turn_counter() {
+        let canned = vec![
+            users_me_ok(),
+            turn_register_200(),
+            turn_events(
+                r#"[
+                    {"id":1,"type":"message","message":{"stream_id":42,"subject":"t","sender_id":7,"sender_email":"seven-bot@x.com","content":"a"}},
+                    {"id":2,"type":"message","message":{"stream_id":42,"subject":"t","sender_id":7,"sender_email":"seven-bot@x.com","content":"b"}},
+                    {"id":3,"type":"message","flags":["mentioned"],"message":{"stream_id":42,"subject":"t","sender_id":8,"sender_email":"alice@example.com","content":"c"}},
+                    {"id":4,"type":"message","message":{"stream_id":42,"subject":"t","sender_id":7,"sender_email":"seven-bot@x.com","content":"d"}}
+                ]"#,
+            ),
+            turn_warning_200(),
+            turn_events_empty(),
+        ];
+        let (base, _recorded) = spawn_mock_recording(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let mut params = make_params(&["42"]);
+        params.allow_bot_messages = AllowBots::All;
+        params.allow_all_users = true;
+        params.max_bot_turns = 2;
+        let sink = Arc::new(RecordingSink::new());
+
+        drive_turn_loop(adapter, params, sink.clone()).await;
+
+        let log = sink.log.lock().unwrap();
+        assert_eq!(
+            log.iter().filter(|e| e.sender_id == "7").count(),
+            2,
+            "ev1 + ev4 dispatch; without the human reset ev4 would SilentStop"
+        );
+    }
+
+    /// H5: max=2, self(999) then external(8) same thread → self counts before
+    /// skip, external hits limit; neither dispatched, exactly one warning.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_self_bot_counts_toward_turn_limit() {
+        let canned = vec![
+            users_me_ok(),
+            turn_register_200(),
+            turn_events(
+                r#"[
+                    {"id":1,"type":"message","message":{"stream_id":42,"subject":"t","sender_id":999,"sender_email":"self-bot@x.com","content":"a"}},
+                    {"id":2,"type":"message","message":{"stream_id":42,"subject":"t","sender_id":8,"sender_email":"other-bot@x.com","content":"b"}}
+                ]"#,
+            ),
+            turn_warning_200(),
+            turn_events_empty(),
+        ];
+        let (base, recorded) = spawn_mock_recording(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let mut params = make_params(&["42"]);
+        params.allow_bot_messages = AllowBots::All;
+        params.allow_all_users = true;
+        params.max_bot_turns = 2;
+        let sink = Arc::new(RecordingSink::new());
+
+        drive_turn_loop(adapter, params, sink.clone()).await;
+
+        let log = sink.log.lock().unwrap();
+        assert_eq!(
+            log.iter().filter(|e| e.sender_id == "999").count(),
+            0,
+            "self never dispatched"
+        );
+        assert_eq!(
+            log.iter().filter(|e| e.sender_id == "8").count(),
+            0,
+            "external bot hit the limit → not dispatched"
+        );
+        assert_eq!(
+            warning_post_count(&recorded),
+            1,
+            "exactly one warning (count-before-skip put ev2 at the limit)"
+        );
+    }
+
+    /// H6: max=1, single self event → counts but no warning posted (don't warn
+    /// on the bot's own message).
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_self_bot_at_limit_does_not_warn() {
+        let canned = vec![
+            users_me_ok(),
+            turn_register_200(),
+            turn_events(
+                r#"[{"id":1,"type":"message","message":{"stream_id":42,"subject":"t","sender_id":999,"sender_email":"self-bot@x.com","content":"a"}}]"#,
+            ),
+            turn_events_empty(),
+        ];
+        let (base, recorded) = spawn_mock_recording(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let mut params = make_params(&["42"]);
+        params.allow_bot_messages = AllowBots::All;
+        params.allow_all_users = true;
+        params.max_bot_turns = 1;
+        let sink = Arc::new(RecordingSink::new());
+
+        drive_turn_loop(adapter, params, sink.clone()).await;
+
+        assert_eq!(
+            warning_post_count(&recorded),
+            0,
+            "a self message at the limit must not post a warning"
+        );
+        assert_eq!(
+            sink.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.sender_id == "999")
+                .count(),
+            0,
+            "self never dispatched"
+        );
+    }
+
+    /// HOLE1: human path independent of allow_bot_messages / trusted_bot_ids /
+    /// turn cap — a mentioned human dispatches, classified human.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_human_unaffected_by_bot_turn_and_trust_config() {
+        let canned = vec![
+            users_me_ok(),
+            turn_register_200(),
+            turn_events(
+                r#"[{"id":1,"type":"message","flags":["mentioned"],"message":{"stream_id":42,"subject":"t","sender_id":8,"sender_email":"alice@example.com","content":"hi"}}]"#,
+            ),
+            turn_events_empty(),
+        ];
+        let base = spawn_mock(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let mut params = make_params(&["42"]);
+        params.allow_bot_messages = AllowBots::Off;
+        params.trusted_bot_ids = set(&["7"]);
+        params.allow_all_users = true;
+        params.max_bot_turns = 100;
+        let sink = Arc::new(RecordingSink::new());
+
+        drive_turn_loop(adapter, params, sink.clone()).await;
+
+        let log = sink.log.lock().unwrap();
+        let entry = log
+            .iter()
+            .find(|e| e.sender_id == "8")
+            .expect("mentioned human must dispatch");
+        assert!(!entry.is_bot, "human entry must be classified is_bot==false");
+    }
+
+    /// H4: count above the user allowlist + channel-only warning. allow_all_users
+    /// FALSE, allowed_users EMPTY, allowed_channels={42}, max=2; two same-thread
+    /// non-mention bots → exactly one channel-only warning, empty log.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_restrictive_user_allowlist_still_counts_and_warns_channel_only() {
+        let canned = vec![
+            users_me_ok(),
+            turn_register_200(),
+            turn_events(
+                r#"[
+                    {"id":1,"type":"message","message":{"stream_id":42,"subject":"t","sender_id":8,"sender_email":"eight-bot@x.com","content":"a"}},
+                    {"id":2,"type":"message","message":{"stream_id":42,"subject":"t","sender_id":8,"sender_email":"eight-bot@x.com","content":"b"}}
+                ]"#,
+            ),
+            turn_warning_200(),
+            turn_events_empty(),
+        ];
+        let (base, recorded) = spawn_mock_recording(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let mut params = make_params(&["42"]);
+        params.allow_bot_messages = AllowBots::All;
+        params.allow_all_users = false;
+        params.allowed_users = HashSet::new();
+        params.allowed_channels = set(&["42"]);
+        params.max_bot_turns = 2;
+        let sink = Arc::new(RecordingSink::new());
+
+        drive_turn_loop(adapter, params, sink.clone()).await;
+
+        assert_eq!(
+            warning_post_count(&recorded),
+            1,
+            "channel-only warning fires despite the empty user allowlist"
+        );
+        assert!(
+            sink.log.lock().unwrap().is_empty(),
+            "empty user allowlist blocks dispatch for both events"
+        );
     }
 }
