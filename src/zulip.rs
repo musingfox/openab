@@ -12,9 +12,11 @@
 //!   lowercased + trimmed). Topic rename forks the session — documented limit.
 //! - DMs: `zulip:dm:{sorted_csv_of_user_ids}`.
 
+use crate::acp::ContentBlock;
 use crate::adapter::{ChannelRef, ChatAdapter, MessageRef};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
+use crate::media;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -208,6 +210,78 @@ fn should_dispatch_user_message(
             involved && !other_bot_present && !directed_elsewhere
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Attachment ingestion (P3 — image + text files via a temp-URL hop)
+// ---------------------------------------------------------------------------
+
+/// A markdown upload link pointing at a Zulip-hosted file.
+///
+/// `filename` is the markdown bracket label (the `[label]` part) — it carries
+/// the extension used for MIME / text-file detection. `relative_path` is the
+/// `/user_uploads/...` path the link targets (the temp-URL hop's `path_id`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadLink {
+    pub filename: String,
+    pub relative_path: String,
+}
+
+/// Extract Zulip `[label](/user_uploads/...)` upload links from markdown
+/// `content`, preserving source order.
+///
+/// Only links whose target path begins with `/user_uploads/` are returned;
+/// external links (e.g. `https://...`) are filtered out. The bracket label is
+/// kept verbatim as `filename` (it carries the extension for type detection).
+pub fn extract_upload_links(content: &str) -> Vec<UploadLink> {
+    let mut links = Vec::new();
+    let mut rest = content;
+    while let Some(open) = rest.find('[') {
+        // Locate the matching `](` that closes the label and opens the target.
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find("](") else {
+            // No more well-formed markdown links beyond this `[`.
+            break;
+        };
+        let label = &after_open[..close];
+        let after_paren = &after_open[close + 2..];
+        let Some(end) = after_paren.find(')') else {
+            break;
+        };
+        let target = &after_paren[..end];
+        if target.starts_with("/user_uploads/") {
+            links.push(UploadLink {
+                filename: label.to_string(),
+                relative_path: target.to_string(),
+            });
+        }
+        // Advance past this link's closing paren.
+        let consumed = open + 1 + close + 2 + end + 1;
+        rest = &rest[consumed..];
+    }
+    links
+}
+
+/// Join the Zulip `site` base URL with a relative upload `relative_path`,
+/// producing exactly one slash at the join.
+///
+/// `site` is already normalized (no trailing slash, see `ZulipAdapter::new`) and
+/// `relative_path` always begins with `/`, so this is a plain concatenation —
+/// but the leading slash of `relative_path` is normalized defensively so neither
+/// a missing nor a doubled slash can occur.
+pub fn absolute_upload_url(site: &str, relative_path: &str) -> String {
+    let base = site.trim_end_matches('/');
+    let path = relative_path.trim_start_matches('/');
+    format!("{base}/{path}")
+}
+
+/// Build the authenticated temp-URL RESOLVE endpoint path for an upload
+/// `path_id` (a `/user_uploads/{realm}/{rest}` value).
+///
+/// The realm id and the rest of the path are carried through verbatim under the
+/// `/api/v1` prefix: `/user_uploads/2/ab/x.png` → `/api/v1/user_uploads/2/ab/x.png`.
+pub fn user_uploads_temp_url_endpoint(path_id: &str) -> String {
+    format!("/api/v1{path_id}")
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +527,101 @@ impl ZulipAdapter {
             }
         }
         (involved, other_bot_present)
+    }
+
+    /// Ingest image + text-file upload attachments referenced in a message's
+    /// markdown `content`, returning them as `ContentBlock`s (image-encoded or
+    /// inlined text).
+    ///
+    /// For each `[label](/user_uploads/...)` link this performs a temp-URL hop:
+    /// `GET /api/v1/user_uploads/{realm}/{rest}` (Basic-auth) returns a
+    /// short-lived RELATIVE `url`; that is joined onto `self.site` and downloaded
+    /// without auth (the temp URL is self-authorizing). Image and text files are
+    /// turned into blocks via the shared `media` pipeline; any other type, or any
+    /// resolve/download failure, is skipped (best-effort — never panics).
+    ///
+    /// Audio/STT is out of scope this turn (`stt_config` stays inert).
+    async fn ingest_upload_links(&self, content: &str) -> Vec<ContentBlock> {
+        // Caps mirror discord.rs / slack.rs: bound total text bytes + counts so a
+        // pathological message can't bloat the prompt.
+        const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB across all text files
+        const TEXT_FILE_COUNT_CAP: u32 = 5;
+        const IMAGE_COUNT_CAP: u32 = 10;
+
+        let mut blocks = Vec::new();
+        let mut text_file_bytes: u64 = 0;
+        let mut text_file_count: u32 = 0;
+        let mut image_count: u32 = 0;
+
+        for link in extract_upload_links(content) {
+            // Temp-URL RESOLVE: authenticated GET against /api/v1/user_uploads/...
+            // Bounded with a hard timeout (parity with topic_participation): this
+            // runs inside the event loop, so a stuck resolve must never freeze
+            // message processing — on timeout/error, skip the attachment.
+            let endpoint = user_uploads_temp_url_endpoint(&link.relative_path);
+            let resolve_fut = self.api_call(reqwest::Method::GET, &endpoint, None, None);
+            let resolved = match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                resolve_fut,
+            )
+            .await
+            {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    warn!(path = %link.relative_path, error = %e, "zulip temp-URL resolve failed; skipping attachment");
+                    continue;
+                }
+                Err(_) => {
+                    warn!(path = %link.relative_path, "zulip temp-URL resolve timed out (15s); skipping attachment");
+                    continue;
+                }
+            };
+            let Some(temp_url) = resolved.get("url").and_then(|v| v.as_str()) else {
+                warn!(path = %link.relative_path, "zulip temp-URL resolve missing url; skipping attachment");
+                continue;
+            };
+            let abs_url = absolute_upload_url(&self.site, temp_url);
+
+            // Size is unknown from a markdown link; pass 0 (the media pipeline's
+            // real limit check runs on the downloaded bytes).
+            if media::is_text_file(&link.filename, None) {
+                if text_file_count >= TEXT_FILE_COUNT_CAP {
+                    warn!(filename = %link.filename, "zulip text file count cap reached, skipping");
+                    continue;
+                }
+                if let Some((block, actual_bytes)) =
+                    media::download_and_read_text_file(&abs_url, &link.filename, 0, None).await
+                {
+                    if text_file_bytes + actual_bytes > TEXT_TOTAL_CAP {
+                        warn!(filename = %link.filename, "zulip text attachments exceed 1MB cap, skipping");
+                        continue;
+                    }
+                    text_file_bytes += actual_bytes;
+                    text_file_count += 1;
+                    blocks.push(block);
+                }
+            } else {
+                if image_count >= IMAGE_COUNT_CAP {
+                    warn!(filename = %link.filename, "zulip image count cap reached, skipping");
+                    continue;
+                }
+                match media::download_and_encode_image(&abs_url, None, &link.filename, 0, None).await
+                {
+                    Ok(block) => {
+                        image_count += 1;
+                        blocks.push(block);
+                    }
+                    Err(media::MediaFetchError::NotAnImage) => {
+                        // Not an image and not a text file (this turn): skip.
+                        debug!(filename = %link.filename, "zulip non-image / non-text upload, skipping");
+                    }
+                    Err(e) => {
+                        warn!(filename = %link.filename, error = %e, "zulip image attachment failed; skipping");
+                    }
+                }
+            }
+        }
+        blocks
     }
 }
 
@@ -705,6 +874,11 @@ pub struct ZulipDispatchedMessage {
     /// Whether the sender is a bot account, classified from `sender_email`
     /// in the event loop (`email_is_bot`). Threaded into the `SenderContext`.
     pub is_bot: bool,
+    /// Attachment content blocks (images, inlined text files) ingested from the
+    /// message's upload links. Computed IN THE EVENT LOOP (before the sink) so
+    /// the HTTP temp-URL hop runs outside `BrokerSink::dispatch_impl` and is
+    /// observable by a recording sink. Empty when the message has no uploads.
+    pub extra_blocks: Vec<ContentBlock>,
 }
 
 /// Trait surface for the dispatch side-effect: the event loop calls this for
@@ -779,12 +953,12 @@ fn build_dispatch_parts(
     );
     let resolved_name = sender.sender_name.clone();
     let sender_json = serde_json::to_string(&sender).unwrap_or_else(|_| "{}".into());
-    let estimated_tokens = crate::dispatch::estimate_tokens(&evt.content, &[]);
+    let estimated_tokens = crate::dispatch::estimate_tokens(&evt.content, &evt.extra_blocks);
     let buf = crate::dispatch::BufferedMessage {
         sender_json,
         sender_name: resolved_name,
         prompt: evt.content.clone(),
-        extra_blocks: Vec::new(),
+        extra_blocks: evt.extra_blocks,
         trigger_msg,
         arrived_at: std::time::Instant::now(),
         estimated_tokens,
@@ -1164,7 +1338,14 @@ pub async fn run_zulip_adapter(
                     }
                 }
 
-                debug!(thread_key = %key, "zulip message dispatched");
+                // Ingest image + text-file attachments referenced in the message
+                // body via the temp-URL hop. Done HERE (in the event loop, before
+                // the sink) so the HTTP work rides on the dispatched message and a
+                // recording sink can observe the resulting blocks. Best-effort:
+                // resolve/download failures skip the attachment, never panic.
+                let extra_blocks = adapter.ingest_upload_links(&content).await;
+
+                debug!(thread_key = %key, num_extra_blocks = extra_blocks.len(), "zulip message dispatched");
                 sink.dispatch(ZulipDispatchedMessage {
                     thread_key: key,
                     stream_id,
@@ -1174,6 +1355,7 @@ pub async fn run_zulip_adapter(
                     message_id,
                     content,
                     is_bot,
+                    extra_blocks,
                 })
                 .await;
             }
@@ -1548,6 +1730,7 @@ mod tests {
             message_id: "1".into(),
             content: "hi".into(),
             is_bot,
+            extra_blocks: Vec::new(),
         }
     }
 
@@ -1600,11 +1783,31 @@ mod tests {
 
     // --- HTTP test plumbing -------------------------------------------------
 
+    /// A canned response body. A newtype over `Vec<u8>` so canned bodies can be
+    /// raw binary (e.g. PNG fixtures) without lossy UTF-8 corruption, while
+    /// keeping the `body: "...".into()` ergonomics existing tests rely on.
+    struct Body(Vec<u8>);
+    impl From<&str> for Body {
+        fn from(s: &str) -> Self {
+            Body(s.as_bytes().to_vec())
+        }
+    }
+    impl From<String> for Body {
+        fn from(s: String) -> Self {
+            Body(s.into_bytes())
+        }
+    }
+    impl From<Vec<u8>> for Body {
+        fn from(b: Vec<u8>) -> Self {
+            Body(b)
+        }
+    }
+
     /// One canned HTTP response.
     struct Canned {
         status: u16,
         headers: Vec<(&'static str, String)>,
-        body: String,
+        body: Body,
     }
 
     /// Spin up a tiny TCP server that serves a queue of canned responses, one
@@ -1676,10 +1879,10 @@ mod tests {
                 for (k, v) in &c.headers {
                     resp.push_str(&format!("{k}: {v}\r\n"));
                 }
-                resp.push_str(&format!("Content-Length: {}\r\n", c.body.len()));
+                resp.push_str(&format!("Content-Length: {}\r\n", c.body.0.len()));
                 resp.push_str("Connection: close\r\n\r\n");
-                resp.push_str(&c.body);
                 let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.write_all(&c.body.0).await;
                 let _ = sock.shutdown().await;
             }
         });
@@ -2039,6 +2242,10 @@ mod tests {
         is_bot: bool,
         #[allow(dead_code)]
         content: String,
+        /// Attachment blocks ingested in the event loop (image / inlined text),
+        /// copied from the dispatched message so the harness can assert that the
+        /// temp-URL hop ran before the sink and produced the expected blocks.
+        extra_blocks: Vec<ContentBlock>,
     }
 
     /// Recording sink — records every dispatched event for assertions.
@@ -2078,6 +2285,7 @@ mod tests {
                 sender_name: ctx.sender_name,
                 is_bot: ctx.is_bot,
                 content: evt.content,
+                extra_blocks: evt.extra_blocks,
             });
         }
     }
@@ -2921,7 +3129,7 @@ mod tests {
         Canned {
             status: 200,
             headers: vec![("Content-Type", "application/json".into())],
-            body: format!(r#"{{"result":"success","events":{events_json}}}"#),
+            body: format!(r#"{{"result":"success","events":{events_json}}}"#).into(),
         }
     }
 
@@ -3226,6 +3434,285 @@ mod tests {
         assert!(
             sink.log.lock().unwrap().is_empty(),
             "empty user allowlist blocks dispatch for both events"
+        );
+    }
+
+    // --- P3: attachment ingestion (image + text via temp-URL hop) -----------
+
+    // === UNIT: pure link extraction ===
+
+    #[test]
+    fn extract_upload_links_single_png_link() {
+        let links = extract_upload_links("see [photo.png](/user_uploads/2/ab/xyz/photo.png)");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].filename, "photo.png");
+        assert_eq!(links[0].relative_path, "/user_uploads/2/ab/xyz/photo.png");
+    }
+
+    #[test]
+    fn extract_upload_links_preserves_source_order() {
+        let content =
+            "first [a.png](/user_uploads/1/aa/a.png) then [b.txt](/user_uploads/1/bb/b.txt)";
+        let links = extract_upload_links(content);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].filename, "a.png");
+        assert_eq!(links[1].filename, "b.txt");
+    }
+
+    #[test]
+    fn extract_upload_links_ignores_non_user_uploads() {
+        let links = extract_upload_links("[google](https://google.com)");
+        assert!(links.is_empty());
+    }
+
+    #[test]
+    fn extract_upload_links_filters_external_keeps_upload() {
+        let content = "[link](https://x.com) and [doc.pdf](/user_uploads/1/q/doc.pdf)";
+        let links = extract_upload_links(content);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].filename, "doc.pdf");
+    }
+
+    #[test]
+    fn absolute_upload_url_joins_with_single_slash() {
+        let url = absolute_upload_url("https://org.zulipchat.com", "/user_uploads/2/ab/x.png");
+        assert_eq!(url, "https://org.zulipchat.com/user_uploads/2/ab/x.png");
+    }
+
+    #[test]
+    fn user_uploads_temp_url_endpoint_path() {
+        let endpoint = user_uploads_temp_url_endpoint("/user_uploads/2/ab/x.png");
+        assert_eq!(endpoint, "/api/v1/user_uploads/2/ab/x.png");
+    }
+
+    // === HARNESS: event-loop ingestion via spawn_mock_recording ===
+
+    /// Build a PNG body (mirrors media.rs `make_png`) for canned image downloads.
+    fn make_png(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbImage::new(width, height);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    fn register_ok() -> Canned {
+        Canned {
+            status: 200,
+            headers: vec![("Content-Type", "application/json".into())],
+            body: r#"{"result":"success","queue_id":"q1","last_event_id":-1}"#.into(),
+        }
+    }
+
+    fn events_empty() -> Canned {
+        Canned {
+            status: 200,
+            headers: vec![("Content-Type", "application/json".into())],
+            body: r#"{"result":"success","events":[]}"#.into(),
+        }
+    }
+
+    /// One mentioned stream message event whose content is `content`.
+    fn events_message(content: &str) -> Canned {
+        let body = serde_json::json!({
+            "result": "success",
+            "events": [{
+                "id": 1,
+                "type": "message",
+                "flags": ["mentioned"],
+                "message": {
+                    "stream_id": 42,
+                    "subject": "x",
+                    "sender_id": 7,
+                    "content": content,
+                }
+            }]
+        });
+        Canned {
+            status: 200,
+            headers: vec![("Content-Type", "application/json".into())],
+            body: serde_json::to_string(&body).unwrap().into(),
+        }
+    }
+
+    /// Temp-URL RESOLVE reply carrying a RELATIVE url so the download retargets
+    /// back at the mock (`absolute_upload_url(site=mock, ..)`).
+    fn temp_url_resolve_ok() -> Canned {
+        Canned {
+            status: 200,
+            headers: vec![("Content-Type", "application/json".into())],
+            body: r#"{"result":"success","url":"/user_uploads/temporary/tmp/x"}"#.into(),
+        }
+    }
+
+    /// Drive register → one poll → empty poll → shutdown, returning the sink log.
+    async fn drive_ingest(canned: Vec<Canned>) -> Arc<RecordingSink> {
+        let base = spawn_mock(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let params = make_params(&["42"]);
+        let sink = Arc::new(RecordingSink::new());
+        let (tx, rx) = watch::channel(false);
+
+        let sink_clone = sink.clone();
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let _ = tx.send(true);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("loop should exit within 5s")
+            .expect("task should join");
+        res.expect("loop should return Ok");
+        sink
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_ingest_no_upload_links_empty_extra_blocks() {
+        let canned = vec![
+            users_me_ok(),
+            register_ok(),
+            events_message("just text, no links"),
+            events_empty(),
+        ];
+        let sink = drive_ingest(canned).await;
+        let log = sink.log.lock().unwrap();
+        assert_eq!(log.len(), 1, "expected 1 dispatched message");
+        assert!(
+            log[0].extra_blocks.is_empty(),
+            "no-link message must yield zero extra_blocks, got {:?}",
+            log[0].extra_blocks
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_ingest_image_upload_yields_image_block() {
+        let png = make_png(2, 2);
+        let canned = vec![
+            users_me_ok(),
+            register_ok(),
+            events_message("here [p.png](/user_uploads/2/ab/p.png)"),
+            temp_url_resolve_ok(),
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "image/png".into())],
+                body: png.clone().into(),
+            },
+            events_empty(),
+        ];
+        let sink = drive_ingest(canned).await;
+        let log = sink.log.lock().unwrap();
+        assert_eq!(log.len(), 1, "expected 1 dispatched message");
+        assert_eq!(
+            log[0].extra_blocks.len(),
+            1,
+            "expected exactly one ingested block, got {:?}",
+            log[0].extra_blocks
+        );
+        assert!(
+            matches!(log[0].extra_blocks[0], ContentBlock::Image { .. }),
+            "ingested block must be an Image, got {:?}",
+            log[0].extra_blocks[0]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_ingest_text_upload_yields_wrapped_text_block() {
+        let canned = vec![
+            users_me_ok(),
+            register_ok(),
+            events_message("here [notes.txt](/user_uploads/2/ab/notes.txt)"),
+            temp_url_resolve_ok(),
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "text/plain".into())],
+                body: "hello file contents".into(),
+            },
+            events_empty(),
+        ];
+        let sink = drive_ingest(canned).await;
+        let log = sink.log.lock().unwrap();
+        assert_eq!(log.len(), 1, "expected 1 dispatched message");
+        assert_eq!(
+            log[0].extra_blocks.len(),
+            1,
+            "expected exactly one ingested block, got {:?}",
+            log[0].extra_blocks
+        );
+        match &log[0].extra_blocks[0] {
+            ContentBlock::Text { text } => assert!(
+                text.contains("[File:"),
+                "text block must carry the [File: wrapper, got: {text}"
+            ),
+            other => panic!("expected Text block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_ingest_image_download_failure_is_skipped() {
+        let canned = vec![
+            users_me_ok(),
+            register_ok(),
+            events_message("here [p.png](/user_uploads/2/ab/p.png)"),
+            temp_url_resolve_ok(),
+            // Download fails with 404 -> attachment skipped.
+            Canned {
+                status: 404,
+                headers: vec![("Content-Type", "text/plain".into())],
+                body: "not found".into(),
+            },
+            events_empty(),
+        ];
+        // drive_ingest already asserts the loop returns Ok (no panic).
+        let sink = drive_ingest(canned).await;
+        let log = sink.log.lock().unwrap();
+        assert_eq!(log.len(), 1, "expected 1 dispatched message");
+        assert!(
+            log[0].extra_blocks.is_empty(),
+            "a 404 download must contribute no block, got {:?}",
+            log[0].extra_blocks
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_ingest_image_block_packs_after_prompt() {
+        let png = make_png(2, 2);
+        let prompt = "please look [p.png](/user_uploads/2/ab/p.png)";
+        let canned = vec![
+            users_me_ok(),
+            register_ok(),
+            events_message(prompt),
+            temp_url_resolve_ok(),
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "image/png".into())],
+                body: png.clone().into(),
+            },
+            events_empty(),
+        ];
+        let sink = drive_ingest(canned).await;
+        let log = sink.log.lock().unwrap();
+        assert_eq!(log.len(), 1, "expected 1 dispatched message");
+        // The Image must have come from ingestion (pre-build: extra_blocks empty).
+        let blocks = log[0].extra_blocks.clone();
+        assert!(
+            blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. })),
+            "ingestion must have produced an Image block, got {blocks:?}"
+        );
+
+        let sender_json = r#"{"schema":"openab.sender.v1"}"#;
+        let packed =
+            crate::adapter::AdapterRouter::pack_arrival_event(sender_json, prompt, blocks);
+        let prompt_idx = packed
+            .iter()
+            .position(|b| matches!(b, ContentBlock::Text { text } if text == prompt))
+            .expect("prompt Text must be present in packed output");
+        let image_idx = packed
+            .iter()
+            .position(|b| matches!(b, ContentBlock::Image { .. }))
+            .expect("Image block must be present in packed output");
+        assert!(
+            prompt_idx < image_idx,
+            "Image block (idx {image_idx}) must land AFTER the prompt Text (idx {prompt_idx})"
         );
     }
 }
