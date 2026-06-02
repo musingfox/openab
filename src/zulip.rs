@@ -285,6 +285,27 @@ pub fn extract_upload_links(content: &str) -> Vec<UploadLink> {
     links
 }
 
+/// Map an attachment `filename`'s extension to its canonical audio MIME type,
+/// or `None` for non-audio / extensionless names.
+///
+/// Matching is on the lowercased final `.`-suffix only. Every `Some(_)` result
+/// satisfies `media::is_audio_mime` (i.e. starts with `audio/`), so callers can
+/// route the link straight into the STT download/transcribe path.
+pub fn audio_ext_to_mime(filename: &str) -> Option<&'static str> {
+    if !filename.contains('.') {
+        return None;
+    }
+    match filename.rsplit('.').next()?.to_lowercase().as_str() {
+        "mp3" => Some("audio/mpeg"),
+        "m4a" => Some("audio/mp4"),
+        "ogg" | "oga" => Some("audio/ogg"),
+        "wav" => Some("audio/wav"),
+        "flac" => Some("audio/flac"),
+        "webm" => Some("audio/webm"),
+        _ => None,
+    }
+}
+
 /// Join the Zulip `site` base URL with a relative upload `relative_path`,
 /// producing exactly one slash at the join.
 ///
@@ -563,8 +584,15 @@ impl ZulipAdapter {
     /// turned into blocks via the shared `media` pipeline; any other type, or any
     /// resolve/download failure, is skipped (best-effort — never panics).
     ///
-    /// Audio/STT is out of scope this turn (`stt_config` stays inert).
-    async fn ingest_upload_links(&self, content: &str) -> Vec<ContentBlock> {
+    /// Audio links (`audio_ext_to_mime`) are downloaded and transcribed via the
+    /// configured STT provider when `stt_config.enabled`; the transcript is
+    /// prepended as a `ContentBlock::Text`. When STT is disabled the audio link
+    /// is skipped entirely (no download, no STT call).
+    async fn ingest_upload_links(
+        &self,
+        content: &str,
+        stt_config: &SttConfig,
+    ) -> Vec<ContentBlock> {
         // Caps mirror discord.rs / slack.rs: bound total text bytes + counts so a
         // pathological message can't bloat the prompt.
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB across all text files
@@ -612,7 +640,40 @@ impl ZulipAdapter {
 
             // Size is unknown from a markdown link; pass 0 (the media pipeline's
             // real limit check runs on the downloaded bytes).
-            if media::is_text_file(&link.filename, None) {
+            //
+            // Audio branch runs BEFORE text/image so an audio link never falls
+            // through to those paths. When STT is disabled the link is skipped
+            // outright (no download, no STT POST); a transcription failure
+            // (`download_and_transcribe` -> None) is swallowed (no block). The
+            // transcript is prepended via insert(0, ..) so it stays first,
+            // mirroring discord.rs / slack.rs.
+            if let Some(mime) = audio_ext_to_mime(&link.filename) {
+                if stt_config.enabled {
+                    if let Some(transcript) = media::download_and_transcribe(
+                        &abs_url,
+                        &link.filename,
+                        mime,
+                        0,
+                        stt_config,
+                        None,
+                    )
+                    .await
+                    {
+                        debug!(filename = %link.filename, chars = transcript.len(), "zulip voice transcript injected");
+                        blocks.insert(
+                            0,
+                            ContentBlock::Text {
+                                text: format!("[Voice message transcript]: {transcript}"),
+                            },
+                        );
+                    } else {
+                        warn!(filename = %link.filename, "zulip STT failed for voice attachment; skipping");
+                    }
+                } else {
+                    debug!(filename = %link.filename, "zulip audio attachment skipped (STT disabled)");
+                }
+                continue;
+            } else if media::is_text_file(&link.filename, None) {
                 if text_file_count >= TEXT_FILE_COUNT_CAP {
                     warn!(filename = %link.filename, "zulip text file count cap reached, skipping");
                     continue;
@@ -1038,9 +1099,6 @@ pub async fn run_zulip_adapter(
         }
     };
 
-    // Params still pending Zulip support; documented to silence dead-code.
-    let _ = &params.stt_config;
-
     // Per-thread consecutive-bot-turn cap (Group C). Single-task current_thread
     // loop, so a plain mutable binding suffices — no Mutex. Lives outside the
     // poll loop so counts accumulate across polls and reset only on a human
@@ -1371,7 +1429,9 @@ pub async fn run_zulip_adapter(
                 // the sink) so the HTTP work rides on the dispatched message and a
                 // recording sink can observe the resulting blocks. Best-effort:
                 // resolve/download failures skip the attachment, never panic.
-                let extra_blocks = adapter.ingest_upload_links(&content).await;
+                let extra_blocks = adapter
+                    .ingest_upload_links(&content, &params.stt_config)
+                    .await;
 
                 debug!(thread_key = %key, num_extra_blocks = extra_blocks.len(), "zulip message dispatched");
                 sink.dispatch(ZulipDispatchedMessage {
@@ -3831,7 +3891,9 @@ mod tests {
         let canned: Vec<Canned> = (0..14).map(|_| temp_url_resolve_500()).collect();
         let (base, recorded) = spawn_mock_recording(canned).await;
         let adapter = ZulipAdapter::new(base, "b@x", "k");
-        let blocks = adapter.ingest_upload_links(&content).await;
+        let blocks = adapter
+            .ingest_upload_links(&content, &SttConfig::default())
+            .await;
         assert!(blocks.is_empty(), "all resolves failed; expected no blocks");
         let n = count_resolve_gets(&recorded);
         assert!(n <= 10, "resolve GETs must be capped at 10, got {n}");
@@ -3847,7 +3909,10 @@ mod tests {
         let base = spawn_mock(canned).await;
         let adapter = ZulipAdapter::new(base, "b@x", "k");
         let blocks = adapter
-            .ingest_upload_links("here [p.png](/user_uploads/2/ab/p.png)")
+            .ingest_upload_links(
+                "here [p.png](/user_uploads/2/ab/p.png)",
+                &SttConfig::default(),
+            )
             .await;
         assert!(
             blocks.is_empty(),
@@ -3868,11 +3933,231 @@ mod tests {
         let base = spawn_mock(canned).await;
         let adapter = ZulipAdapter::new(base, "b@x", "k");
         let blocks = adapter
-            .ingest_upload_links("here [p.png](/user_uploads/2/ab/p.png)")
+            .ingest_upload_links(
+                "here [p.png](/user_uploads/2/ab/p.png)",
+                &SttConfig::default(),
+            )
             .await;
         assert!(
             blocks.is_empty(),
             "a missing-url resolve must contribute no block, got {blocks:?}"
+        );
+    }
+
+    // --- turn 8: audio / STT ingestion ------------------------------------
+
+    /// An `SttConfig` with STT ENABLED and `base_url` pointed at the mock so the
+    /// `/audio/transcriptions` POST lands on the canned queue.
+    fn stt_enabled(base: &str) -> SttConfig {
+        SttConfig {
+            enabled: true,
+            base_url: base.to_string(),
+            ..SttConfig::default()
+        }
+    }
+
+    /// Canned audio-download reply (any bytes; Content-Type audio/mpeg).
+    fn audio_bytes_ok() -> Canned {
+        Canned {
+            status: 200,
+            headers: vec![("Content-Type", "audio/mpeg".into())],
+            body: vec![0x49u8, 0x44, 0x33, 0x01, 0x02, 0x03, 0x04].into(),
+        }
+    }
+
+    /// Canned STT JSON reply carrying `{"text": <text>}`.
+    fn stt_json(text: &str) -> Canned {
+        let body = serde_json::json!({ "text": text });
+        Canned {
+            status: 200,
+            headers: vec![("Content-Type", "application/json".into())],
+            body: serde_json::to_string(&body).unwrap().into(),
+        }
+    }
+
+    #[test]
+    fn audio_ext_to_mime_known_extensions() {
+        let cases = [
+            ("song.mp3", "audio/mpeg"),
+            ("clip.m4a", "audio/mp4"),
+            ("a.ogg", "audio/ogg"),
+            ("a.oga", "audio/ogg"),
+            ("a.wav", "audio/wav"),
+            ("a.flac", "audio/flac"),
+            ("a.webm", "audio/webm"),
+        ];
+        for (name, mime) in cases {
+            let got = audio_ext_to_mime(name);
+            assert_eq!(got, Some(mime), "{name} must map to {mime}");
+            assert!(
+                media::is_audio_mime(got.unwrap()),
+                "{mime} must satisfy media::is_audio_mime"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_ext_to_mime_non_audio_none() {
+        assert_eq!(audio_ext_to_mime("photo.png"), None);
+        assert_eq!(audio_ext_to_mime("notes.txt"), None);
+        assert_eq!(audio_ext_to_mime("Dockerfile"), None);
+        assert_eq!(audio_ext_to_mime("noext"), None);
+    }
+
+    #[test]
+    fn audio_ext_to_mime_case_insensitive() {
+        assert_eq!(audio_ext_to_mime("VOICE.MP3"), Some("audio/mpeg"));
+        assert_eq!(audio_ext_to_mime("Clip.M4A"), Some("audio/mp4"));
+        assert!(media::is_audio_mime(audio_ext_to_mime("VOICE.MP3").unwrap()));
+        assert!(media::is_audio_mime(audio_ext_to_mime("Clip.M4A").unwrap()));
+    }
+
+    /// E4: STT enabled — an audio link is downloaded + transcribed, and the
+    /// transcript is prepended as a single Text block with the exact prefix.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_upload_links_audio_transcribes_when_enabled() {
+        let canned = vec![
+            temp_url_resolve_ok(),
+            audio_bytes_ok(),
+            stt_json("hello there"),
+        ];
+        let base = spawn_mock(canned).await;
+        let stt = stt_enabled(&base);
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        let blocks = adapter
+            .ingest_upload_links("voice [v.mp3](/user_uploads/2/ab/v.mp3)", &stt)
+            .await;
+        assert_eq!(
+            blocks.len(),
+            1,
+            "expected exactly one transcript block, got {blocks:?}"
+        );
+        match &blocks[0] {
+            ContentBlock::Text { text } => {
+                assert_eq!(text, "[Voice message transcript]: hello there");
+            }
+            other => panic!("expected Text transcript block, got {other:?}"),
+        }
+    }
+
+    /// E5: STT disabled — the audio link is skipped with NO STT POST recorded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_upload_links_audio_disabled_skips_no_stt() {
+        // Only the resolve is supplied; no audio-download, no STT canned.
+        let canned = vec![temp_url_resolve_ok()];
+        let (base, recorded) = spawn_mock_recording(canned).await;
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        let blocks = adapter
+            .ingest_upload_links(
+                "voice [v.mp3](/user_uploads/2/ab/v.mp3)",
+                &SttConfig::default(),
+            )
+            .await;
+        assert!(
+            blocks.is_empty(),
+            "STT disabled must contribute no block, got {blocks:?}"
+        );
+        let stt_posted = recorded.lock().unwrap().iter().any(|req| {
+            req.lines()
+                .next()
+                .map(|line| line.starts_with("POST /audio/transcriptions"))
+                .unwrap_or(false)
+        });
+        assert!(
+            !stt_posted,
+            "STT disabled must NOT POST /audio/transcriptions"
+        );
+    }
+
+    /// E6: STT enabled, audio download OK but STT POST returns 500 — degrade to
+    /// no block, no panic.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_upload_links_audio_stt_500_yields_empty() {
+        let canned = vec![
+            temp_url_resolve_ok(),
+            audio_bytes_ok(),
+            Canned {
+                status: 500,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"error":"boom"}"#.into(),
+            },
+        ];
+        let base = spawn_mock(canned).await;
+        let stt = stt_enabled(&base);
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        let blocks = adapter
+            .ingest_upload_links("voice [v.mp3](/user_uploads/2/ab/v.mp3)", &stt)
+            .await;
+        assert!(
+            blocks.is_empty(),
+            "an STT 500 must contribute no block, got {blocks:?}"
+        );
+    }
+
+    /// E7: a message carrying BOTH an audio link (FIRST) and an image link
+    /// yields two blocks — transcript at index 0 (insert(0,..)), image at 1.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_upload_links_audio_and_image_both_blocks() {
+        let png = make_png(2, 2);
+        let canned = vec![
+            temp_url_resolve_ok(),
+            audio_bytes_ok(),
+            stt_json("hi"),
+            temp_url_resolve_ok(),
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "image/png".into())],
+                body: png.into(),
+            },
+        ];
+        let base = spawn_mock(canned).await;
+        let stt = stt_enabled(&base);
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        let blocks = adapter
+            .ingest_upload_links(
+                "[v.mp3](/user_uploads/2/ab/v.mp3) [p.png](/user_uploads/2/ab/p.png)",
+                &stt,
+            )
+            .await;
+        assert_eq!(blocks.len(), 2, "expected transcript + image, got {blocks:?}");
+        match &blocks[0] {
+            ContentBlock::Text { text } => assert!(
+                text.contains("[Voice message transcript]: hi"),
+                "block[0] must be the transcript, got {text}"
+            ),
+            other => panic!("block[0] must be Text transcript, got {other:?}"),
+        }
+        assert!(
+            matches!(blocks[1], ContentBlock::Image { .. }),
+            "block[1] must be the Image, got {:?}",
+            blocks[1]
+        );
+    }
+
+    /// E8: regression guard — an image-only ingest still yields exactly one
+    /// Image block, unaffected by the new audio branch (STT enabled here).
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_upload_links_image_still_ingested() {
+        let png = make_png(2, 2);
+        let canned = vec![
+            temp_url_resolve_ok(),
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "image/png".into())],
+                body: png.into(),
+            },
+        ];
+        let base = spawn_mock(canned).await;
+        let stt = stt_enabled(&base);
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        let blocks = adapter
+            .ingest_upload_links("here [p.png](/user_uploads/2/ab/p.png)", &stt)
+            .await;
+        assert_eq!(blocks.len(), 1, "expected one image block, got {blocks:?}");
+        assert!(
+            matches!(blocks[0], ContentBlock::Image { .. }),
+            "block[0] must be an Image, got {:?}",
+            blocks[0]
         );
     }
 }
