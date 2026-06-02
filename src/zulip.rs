@@ -836,11 +836,8 @@ pub async fn run_zulip_adapter(
     };
 
     // Params still pending Zulip support; documented to silence dead-code.
-    let _ = (
-        &params.allow_bot_messages,
-        params.max_bot_turns,
-        &params.stt_config,
-    );
+    // (max_bot_turns is reserved for the Group C BotTurnTracker.)
+    let _ = (params.max_bot_turns, &params.stt_config);
 
     let mut backoff_idx: usize = 0;
     const BACKOFFS: &[u64] = &[1, 2, 5, 10];
@@ -985,58 +982,94 @@ pub async fn run_zulip_adapter(
                     continue;
                 }
 
-                // Dispatch-mode gate: mentions / involved / multibot-mentions.
                 // `flags` on the event carries "mentioned" when this bot was
                 // @-mentioned; DMs (no stream) count as an implicit mention.
+                // Hoisted above the bot/human split because both paths need it.
                 let is_dm = stream_id.is_none();
                 let is_mentioned = ev
                     .get("flags")
                     .and_then(|v| v.as_array())
                     .map(|fl| fl.iter().any(|f| f.as_str() == Some("mentioned")))
                     .unwrap_or(false);
-                let (involved, other_bot_present) = if !is_mentioned
-                    && !is_dm
-                    && matches!(
-                        params.allow_user_messages,
-                        AllowUsers::Involved | AllowUsers::MultibotMentions
-                    ) {
-                    match &stream_id {
-                        Some(sid) => {
-                            adapter
-                                .topic_participation(
-                                    sid,
-                                    &topic,
-                                    bot_user_id,
-                                    &params.trusted_bot_ids,
-                                )
-                                .await
+
+                if is_bot {
+                    // External-bot gate (this bot's own messages are already
+                    // filtered out by the self-skip above). Decided BEFORE the
+                    // involved/topic_participation fetch so a dropped bot never
+                    // triggers extra HTTP (precedent: the self-skip ordering).
+                    //
+                    // `is_bot` answers "is this a bot?"; `trusted_bot_ids`
+                    // answers "is this an *allowed* bot?" — independent gates.
+                    match params.allow_bot_messages {
+                        AllowBots::Off => {
+                            debug!(sender_id = %sender_id, "zulip allow_bot_messages=Off, dropping bot message");
+                            continue;
                         }
-                        None => (false, false),
+                        AllowBots::Mentions => {
+                            if !is_mentioned {
+                                debug!(sender_id = %sender_id, "zulip allow_bot_messages=Mentions, bot not @-mentioned, dropping");
+                                continue;
+                            }
+                        }
+                        AllowBots::All => {}
                     }
+                    // Non-empty trusted_bot_ids acts as an allowlist over bots;
+                    // an empty set imposes no bot filter (all bots pass).
+                    if !params.trusted_bot_ids.is_empty()
+                        && !params.trusted_bot_ids.contains(&sender_id)
+                    {
+                        debug!(sender_id = %sender_id, "zulip bot not in trusted_bot_ids, dropping");
+                        continue;
+                    }
+                    // Accepted bot falls through to the shared dispatch below —
+                    // it must NOT pass through should_dispatch_user_message.
                 } else {
-                    (false, false)
-                };
-                // An explicit @-mention of someone else (not us) means the
-                // message is directed — don't auto-follow it as topic incumbent.
-                let directed_elsewhere = !is_mentioned && mentions_specific_user(&content);
-                if !should_dispatch_user_message(
-                    params.allow_user_messages,
-                    is_mentioned,
-                    is_dm,
-                    involved,
-                    other_bot_present,
-                    directed_elsewhere,
-                ) {
-                    debug!(
-                        stream_id = ?stream_id,
-                        topic = %topic,
+                    // Human dispatch-mode gate: mentions / involved /
+                    // multibot-mentions. Unaffected by allow_bot_messages.
+                    let (involved, other_bot_present) = if !is_mentioned
+                        && !is_dm
+                        && matches!(
+                            params.allow_user_messages,
+                            AllowUsers::Involved | AllowUsers::MultibotMentions
+                        ) {
+                        match &stream_id {
+                            Some(sid) => {
+                                adapter
+                                    .topic_participation(
+                                        sid,
+                                        &topic,
+                                        bot_user_id,
+                                        &params.trusted_bot_ids,
+                                    )
+                                    .await
+                            }
+                            None => (false, false),
+                        }
+                    } else {
+                        (false, false)
+                    };
+                    // An explicit @-mention of someone else (not us) means the
+                    // message is directed — don't auto-follow it as incumbent.
+                    let directed_elsewhere = !is_mentioned && mentions_specific_user(&content);
+                    if !should_dispatch_user_message(
+                        params.allow_user_messages,
                         is_mentioned,
+                        is_dm,
                         involved,
                         other_bot_present,
                         directed_elsewhere,
-                        "zulip dispatch-mode gate: skip"
-                    );
-                    continue;
+                    ) {
+                        debug!(
+                            stream_id = ?stream_id,
+                            topic = %topic,
+                            is_mentioned,
+                            involved,
+                            other_bot_present,
+                            directed_elsewhere,
+                            "zulip dispatch-mode gate: skip"
+                        );
+                        continue;
+                    }
                 }
 
                 let key = if let Some(sid_str) = &stream_id {
@@ -2149,7 +2182,11 @@ mod tests {
         ];
         let base = spawn_mock(canned).await;
         let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
-        let params = make_params(&["42"]);
+        // allow_bot_messages=All so the bot fixture is admitted; this test's
+        // job is the is_bot classification (true for -bot, false for human),
+        // not the bot gate.
+        let mut params = make_params(&["42"]);
+        params.allow_bot_messages = AllowBots::All;
         let sink = Arc::new(RecordingSink::new());
         let (tx, rx) = watch::channel(false);
 
@@ -2205,7 +2242,11 @@ mod tests {
         ];
         let base = spawn_mock(canned).await;
         let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
-        let params = make_params(&["42"]);
+        // allow_bot_messages=All so the external bot is admitted; the self
+        // message (999) is dropped solely by the self-skip, which fires before
+        // the bot gate — exactly what this test verifies.
+        let mut params = make_params(&["42"]);
+        params.allow_bot_messages = AllowBots::All;
         let sink = Arc::new(RecordingSink::new());
         let (tx, rx) = watch::channel(false);
 
@@ -2229,6 +2270,285 @@ mod tests {
         assert!(
             !log.iter().any(|e| e.sender_id == "999"),
             "self message (sender_id=999) must NOT be dispatched, got {log:?}"
+        );
+    }
+
+    // --- Group B: allow_bot_messages gating + trusted_bot_ids separation ---
+
+    /// B1: allow_bot_messages=Off drops a non-@mention external bot. Paired with
+    /// B4 (identical input, All mode) to pin the Off-vs-All contrast.
+    /// Standard 3-response queue — a correctly-placed bot gate needs no
+    /// topic_participation fetch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_off_drops_non_mention_bot() {
+        let canned = vec![
+            users_me_ok(),
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","queue_id":"q1","last_event_id":-1}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[{"id":1,"type":"message","message":{"stream_id":42,"subject":"x","sender_id":7,"sender_email":"weather-bot@example.com","content":"hi"}}]}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[]}"#.into(),
+            },
+        ];
+        let base = spawn_mock(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let mut params = make_params(&["42"]);
+        params.allow_bot_messages = AllowBots::Off;
+        let sink = Arc::new(RecordingSink::new());
+        let (tx, rx) = watch::channel(false);
+
+        let sink_clone = sink.clone();
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+        let log = sink.log.lock().unwrap();
+        assert_eq!(log.len(), 0, "Off must drop the bot message, got {log:?}");
+    }
+
+    /// B2: allow_bot_messages=Off must not affect a human. A @mention human
+    /// reaches the sink (sender_id "8") and is classified is_bot==false.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_off_dispatches_mentioned_human() {
+        let canned = vec![
+            users_me_ok(),
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","queue_id":"q1","last_event_id":-1}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[{"id":1,"type":"message","flags":["mentioned"],"message":{"stream_id":42,"subject":"x","sender_id":8,"sender_email":"alice@example.com","content":"hi"}}]}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[]}"#.into(),
+            },
+        ];
+        let base = spawn_mock(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let mut params = make_params(&["42"]);
+        params.allow_bot_messages = AllowBots::Off;
+        let sink = Arc::new(RecordingSink::new());
+        let (tx, rx) = watch::channel(false);
+
+        let sink_clone = sink.clone();
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+        let log = sink.log.lock().unwrap();
+        let entry = log
+            .iter()
+            .find(|e| e.sender_id == "8")
+            .expect("mentioned human (sender_id=8) must be dispatched even under bot-Off");
+        assert!(!entry.is_bot, "alice@example.com must be is_bot==false");
+    }
+
+    /// B3: allow_bot_messages=Mentions dispatches only the @mentioned bot.
+    /// One poll, two bots: (a) mentioned sender_id=7, (b) not-mentioned
+    /// sender_id=8. The "no 8" assertion discriminates Mentions from All.
+    /// allow_all_users=true (make_params default) so the allowlist passes both.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_mentions_dispatches_mentioned_bot_only() {
+        let canned = vec![
+            users_me_ok(),
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","queue_id":"q1","last_event_id":-1}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[{"id":1,"type":"message","flags":["mentioned"],"message":{"stream_id":42,"subject":"x","sender_id":7,"sender_email":"a-bot@example.com","content":"hi"}},{"id":2,"type":"message","message":{"stream_id":42,"subject":"x","sender_id":8,"sender_email":"b-bot@example.com","content":"yo"}}]}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[]}"#.into(),
+            },
+        ];
+        let base = spawn_mock(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let mut params = make_params(&["42"]);
+        params.allow_bot_messages = AllowBots::Mentions;
+        let sink = Arc::new(RecordingSink::new());
+        let (tx, rx) = watch::channel(false);
+
+        let sink_clone = sink.clone();
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+        let log = sink.log.lock().unwrap();
+        assert!(
+            log.iter().any(|e| e.sender_id == "7"),
+            "mentioned bot (7) must dispatch, got {log:?}"
+        );
+        assert!(
+            !log.iter().any(|e| e.sender_id == "8"),
+            "non-mentioned bot (8) must NOT dispatch under Mentions, got {log:?}"
+        );
+    }
+
+    /// B4: allow_bot_messages=All dispatches a non-@mention bot. LOAD-BEARING
+    /// pair with B1 — identical input, opposite mode, opposite outcome.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_all_dispatches_non_mention_bot() {
+        let canned = vec![
+            users_me_ok(),
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","queue_id":"q1","last_event_id":-1}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[{"id":1,"type":"message","message":{"stream_id":42,"subject":"x","sender_id":7,"sender_email":"weather-bot@example.com","content":"hi"}}]}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[]}"#.into(),
+            },
+        ];
+        let base = spawn_mock(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let mut params = make_params(&["42"]);
+        params.allow_bot_messages = AllowBots::All;
+        let sink = Arc::new(RecordingSink::new());
+        let (tx, rx) = watch::channel(false);
+
+        let sink_clone = sink.clone();
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+        let log = sink.log.lock().unwrap();
+        assert!(
+            log.iter().any(|e| e.sender_id == "7"),
+            "All must dispatch the non-mentioned bot (7), got {log:?}"
+        );
+    }
+
+    /// B5: All + trusted_bot_ids={"7"} admits only the listed bot. Two
+    /// non-@mention bots (7, 8) → 7 dispatches, 8 is filtered out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_all_trusted_set_allows_only_listed_bot() {
+        let canned = vec![
+            users_me_ok(),
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","queue_id":"q1","last_event_id":-1}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[{"id":1,"type":"message","message":{"stream_id":42,"subject":"x","sender_id":7,"sender_email":"a-bot@example.com","content":"hi"}},{"id":2,"type":"message","message":{"stream_id":42,"subject":"x","sender_id":8,"sender_email":"b-bot@example.com","content":"yo"}}]}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[]}"#.into(),
+            },
+        ];
+        let base = spawn_mock(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let mut params = make_params(&["42"]);
+        params.allow_bot_messages = AllowBots::All;
+        params.trusted_bot_ids = set(&["7"]);
+        let sink = Arc::new(RecordingSink::new());
+        let (tx, rx) = watch::channel(false);
+
+        let sink_clone = sink.clone();
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+        let log = sink.log.lock().unwrap();
+        assert!(
+            log.iter().any(|e| e.sender_id == "7"),
+            "trusted bot (7) must dispatch, got {log:?}"
+        );
+        assert!(
+            !log.iter().any(|e| e.sender_id == "8"),
+            "untrusted bot (8) must NOT dispatch, got {log:?}"
+        );
+    }
+
+    /// B6: All + trusted_bot_ids={} (empty) imposes no bot filter — all bots
+    /// pass. A non-@mention bot (sender_id=8) reaches the sink. Paired with B5
+    /// to discriminate empty-set ("no filter") from a populated allowlist.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_all_empty_trusted_set_allows_all_bots() {
+        let canned = vec![
+            users_me_ok(),
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","queue_id":"q1","last_event_id":-1}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[{"id":1,"type":"message","message":{"stream_id":42,"subject":"x","sender_id":8,"sender_email":"weather-bot@example.com","content":"hi"}}]}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[]}"#.into(),
+            },
+        ];
+        let base = spawn_mock(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let mut params = make_params(&["42"]);
+        params.allow_bot_messages = AllowBots::All;
+        params.trusted_bot_ids = HashSet::new();
+        let sink = Arc::new(RecordingSink::new());
+        let (tx, rx) = watch::channel(false);
+
+        let sink_clone = sink.clone();
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+        let log = sink.log.lock().unwrap();
+        assert!(
+            log.iter().any(|e| e.sender_id == "8"),
+            "empty trusted set must allow all bots; bot (8) must dispatch, got {log:?}"
         );
     }
 
