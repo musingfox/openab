@@ -236,19 +236,42 @@ pub struct UploadLink {
 pub fn extract_upload_links(content: &str) -> Vec<UploadLink> {
     let mut links = Vec::new();
     let mut rest = content;
-    while let Some(open) = rest.find('[') {
-        // Locate the matching `](` that closes the label and opens the target.
-        let after_open = &rest[open + 1..];
-        let Some(close) = after_open.find("](") else {
-            // No more well-formed markdown links beyond this `[`.
+    while let Some(sep) = rest.find("](") {
+        // Anchor the label on the NEAREST `[` before this `](`, not the first one
+        // in the slice — a stray earlier `[` (e.g. `[stray] then [a.png](...)`)
+        // must not pollute the label.
+        let before = &rest[..sep];
+        let Some(open) = before.rfind('[') else {
+            // No `[` opens this `](`; skip past it and keep scanning.
+            rest = &rest[sep + 2..];
+            continue;
+        };
+        let label = &rest[open + 1..sep];
+
+        // Scan the target with paren-depth matching so a `)` inside the path
+        // (e.g. `photo (1).png`) does not truncate it; stop at the `)` that
+        // returns depth to zero.
+        let target_region = &rest[sep + 2..];
+        let mut depth: usize = 1;
+        let mut end: Option<usize> = None;
+        for (i, c) in target_region.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            // Unterminated target; nothing well-formed remains.
             break;
         };
-        let label = &after_open[..close];
-        let after_paren = &after_open[close + 2..];
-        let Some(end) = after_paren.find(')') else {
-            break;
-        };
-        let target = &after_paren[..end];
+        let target = &target_region[..end];
         if target.starts_with("/user_uploads/") {
             links.push(UploadLink {
                 filename: label.to_string(),
@@ -256,7 +279,7 @@ pub fn extract_upload_links(content: &str) -> Vec<UploadLink> {
             });
         }
         // Advance past this link's closing paren.
-        let consumed = open + 1 + close + 2 + end + 1;
+        let consumed = sep + 2 + end + 1;
         rest = &rest[consumed..];
     }
     links
@@ -547,13 +570,18 @@ impl ZulipAdapter {
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB across all text files
         const TEXT_FILE_COUNT_CAP: u32 = 5;
         const IMAGE_COUNT_CAP: u32 = 10;
+        // Hard per-attempt link cap: bound the number of temp-URL RESOLVE GETs
+        // fired regardless of resolve success/failure, so a message carrying an
+        // unbounded number of links cannot trigger an unbounded burst of
+        // authenticated requests (DoS). Applied BEFORE resolve.
+        const MAX_LINKS: usize = 10;
 
         let mut blocks = Vec::new();
         let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
         let mut image_count: u32 = 0;
 
-        for link in extract_upload_links(content) {
+        for link in extract_upload_links(content).into_iter().take(MAX_LINKS) {
             // Temp-URL RESOLVE: authenticated GET against /api/v1/user_uploads/...
             // Bounded with a hard timeout (parity with topic_participation): this
             // runs inside the event loop, so a stuck resolve must never freeze
@@ -1779,6 +1807,24 @@ mod tests {
         assert_ne!(buf.sender_name, "7");
         let v: serde_json::Value = serde_json::from_str(&buf.sender_json).unwrap();
         assert_eq!(v["display_name"].as_str(), Some("Alice Wu"));
+    }
+
+    /// HOLE1 (E1.1): build_dispatch_parts must FORWARD evt.extra_blocks verbatim
+    /// into the produced BufferedMessage (the :961 passthrough). Construct an event
+    /// carrying one Text "SENTINEL" block and assert it survives the hop with its
+    /// content intact — reverting :961 to `Vec::new()` makes this RED.
+    #[test]
+    fn dispatch_parts_forwards_extra_blocks_to_buffered_message() {
+        let mut evt = seam_evt("Alice Wu", "7", false);
+        evt.extra_blocks = vec![ContentBlock::Text {
+            text: "SENTINEL".into(),
+        }];
+        let (_thread_key, _channel, buf) = build_dispatch_parts(evt);
+        assert_eq!(buf.extra_blocks.len(), 1);
+        match &buf.extra_blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "SENTINEL"),
+            other => panic!("expected forwarded Text \"SENTINEL\" block, got {other:?}"),
+        }
     }
 
     // --- HTTP test plumbing -------------------------------------------------
@@ -3474,6 +3520,31 @@ mod tests {
     }
 
     #[test]
+    fn extract_upload_links_keeps_paren_in_filename_path() {
+        let links = extract_upload_links("[photo (1).png](/user_uploads/2/ab/photo (1).png)");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].relative_path, "/user_uploads/2/ab/photo (1).png");
+    }
+
+    #[test]
+    fn extract_upload_links_ignores_stray_open_bracket() {
+        let links = extract_upload_links("[stray] then [a.png](/user_uploads/2/ab/a.png)");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].filename, "a.png");
+        assert_eq!(links[0].relative_path, "/user_uploads/2/ab/a.png");
+    }
+
+    #[test]
+    fn extract_upload_links_three_links_in_source_order() {
+        let content = "[a.png](/user_uploads/1/aa/a.png) [b.txt](/user_uploads/1/bb/b.txt) [c.pdf](/user_uploads/1/cc/c.pdf)";
+        let links = extract_upload_links(content);
+        assert_eq!(links.len(), 3);
+        assert_eq!(links[0].filename, "a.png");
+        assert_eq!(links[1].filename, "b.txt");
+        assert_eq!(links[2].filename, "c.pdf");
+    }
+
+    #[test]
     fn absolute_upload_url_joins_with_single_slash() {
         let url = absolute_upload_url("https://org.zulipchat.com", "/user_uploads/2/ab/x.png");
         assert_eq!(url, "https://org.zulipchat.com/user_uploads/2/ab/x.png");
@@ -3713,6 +3784,95 @@ mod tests {
         assert!(
             prompt_idx < image_idx,
             "Image block (idx {image_idx}) must land AFTER the prompt Text (idx {prompt_idx})"
+        );
+    }
+
+    /// One canned temp-URL RESOLVE failure (HTTP 500 error envelope).
+    fn temp_url_resolve_500() -> Canned {
+        Canned {
+            status: 500,
+            headers: vec![("Content-Type", "application/json".into())],
+            body: r#"{"result":"error","code":"INTERNAL","msg":"boom"}"#.into(),
+        }
+    }
+
+    /// Count recorded connections whose first request line targets the temp-URL
+    /// RESOLVE endpoint (`GET /api/v1/user_uploads/...`). EXCLUDES the unauth
+    /// download hop (`GET /user_uploads/temporary/..`, no `/api/v1` prefix).
+    fn count_resolve_gets(recorded: &Arc<Mutex<Vec<String>>>) -> usize {
+        recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|req| {
+                req.lines()
+                    .next()
+                    .map(|line| line.starts_with("GET /api/v1/user_uploads/"))
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
+    /// HOLE2 (E2.1): a message carrying 12 distinct /user_uploads links must fire
+    /// at MOST MAX_LINKS(=10) temp-URL RESOLVE GETs, regardless of resolve outcome.
+    /// The mock over-supplies (14) HTTP-500 canned responses so a missing cap would
+    /// genuinely record all 12 (rather than stopping at connection-refused) — proving
+    /// the `<= 10 && < 12` bound is enforced by the impl, not by queue exhaustion.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_upload_links_caps_resolve_at_ten() {
+        let mut content = String::new();
+        for i in 0..12 {
+            content.push_str(&format!(
+                "[f{i}.png](/user_uploads/2/ab/f{i}.png) "
+            ));
+        }
+        // Over-supply: strictly more 500s than links, so the buggy 12-resolve impl
+        // would record all 12 instead of hitting connection-refused at 11/12.
+        let canned: Vec<Canned> = (0..14).map(|_| temp_url_resolve_500()).collect();
+        let (base, recorded) = spawn_mock_recording(canned).await;
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        let blocks = adapter.ingest_upload_links(&content).await;
+        assert!(blocks.is_empty(), "all resolves failed; expected no blocks");
+        let n = count_resolve_gets(&recorded);
+        assert!(n <= 10, "resolve GETs must be capped at 10, got {n}");
+        assert!(n < 12, "resolve GETs must be fewer than the 12 links, got {n}");
+    }
+
+    /// HOLE4 (E4.1): a temp-URL RESOLVE that returns HTTP 500 must skip the
+    /// attachment — yielding NO block and NEVER panicking (the await reaching the
+    /// assertion proves no unwrap explosion on the Err resolve).
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_upload_links_resolve_http_500_yields_empty() {
+        let canned = vec![temp_url_resolve_500()];
+        let base = spawn_mock(canned).await;
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        let blocks = adapter
+            .ingest_upload_links("here [p.png](/user_uploads/2/ab/p.png)")
+            .await;
+        assert!(
+            blocks.is_empty(),
+            "a 500 resolve must contribute no block, got {blocks:?}"
+        );
+    }
+
+    /// HOLE4 (E4.2): a temp-URL RESOLVE that returns HTTP 200 but OMITS the `url`
+    /// field must also skip the attachment — empty blocks, no panic. Distinct from
+    /// the HTTP-error path: a success envelope without a url must still degrade.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_upload_links_resolve_missing_url_yields_empty() {
+        let canned = vec![Canned {
+            status: 200,
+            headers: vec![("Content-Type", "application/json".into())],
+            body: r#"{"result":"success"}"#.into(),
+        }];
+        let base = spawn_mock(canned).await;
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        let blocks = adapter
+            .ingest_upload_links("here [p.png](/user_uploads/2/ab/p.png)")
+            .await;
+        assert!(
+            blocks.is_empty(),
+            "a missing-url resolve must contribute no block, got {blocks:?}"
         );
     }
 }
