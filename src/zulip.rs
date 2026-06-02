@@ -74,6 +74,7 @@ fn build_sender_context(
     channel_id: &str,
     thread_id: Option<&str>,
     message_id: &str,
+    is_bot: bool,
 ) -> crate::adapter::SenderContext {
     let name = full_name.filter(|s| !s.is_empty()).unwrap_or(sender_id);
     crate::adapter::SenderContext {
@@ -84,11 +85,21 @@ fn build_sender_context(
         channel: "zulip".into(),
         channel_id: channel_id.to_string(),
         thread_id: thread_id.map(|s| s.to_string()),
-        is_bot: false,
+        is_bot,
         timestamp: None,
         message_id: Some(message_id.to_string()),
         receiver_id: None,
     }
+}
+
+/// True if a Zulip `sender_email` belongs to a bot account.
+///
+/// Zulip bot accounts have an email whose local-part (the segment before `@`)
+/// ends in `-bot` (e.g. `weather-bot@example.com`). Only the local-part is
+/// inspected so a domain that merely contains `bot` (e.g. `alice@bot.example`)
+/// is never misclassified as a bot.
+fn email_is_bot(email: &str) -> bool {
+    email.split('@').next().unwrap_or("").ends_with("-bot")
 }
 
 /// Decide whether a Zulip event passes the allowlist gate.
@@ -676,6 +687,9 @@ pub struct ZulipDispatchedMessage {
     pub message_id: String,
     /// Verbatim message body.
     pub content: String,
+    /// Whether the sender is a bot account, classified from `sender_email`
+    /// in the event loop (`email_is_bot`). Threaded into the `SenderContext`.
+    pub is_bot: bool,
 }
 
 /// Trait surface for the dispatch side-effect: the event loop calls this for
@@ -710,54 +724,69 @@ impl ZulipMessageSink for BrokerSink {
     }
 }
 
+/// Pure build seam extracted from `BrokerSink::dispatch_impl`: turn a
+/// `ZulipDispatchedMessage` (plus its already-classified `is_bot`) into the
+/// `(thread_key, ChannelRef, BufferedMessage)` triple `Dispatcher::submit`
+/// needs. No `Dispatcher`, `SessionPool`, or HTTP — so the SenderContext
+/// construction (name resolution + `is_bot` flow) is unit-testable in isolation.
+fn build_dispatch_parts(
+    evt: ZulipDispatchedMessage,
+    is_bot: bool,
+) -> (String, ChannelRef, crate::dispatch::BufferedMessage) {
+    // Build the trigger MessageRef so reactions / streaming edits land on
+    // the originating Zulip message.
+    let channel_id = evt.stream_id.clone().unwrap_or_default();
+    let thread_id_opt = if evt.topic.is_empty() {
+        None
+    } else {
+        Some(evt.topic.clone())
+    };
+    let trigger_channel = ChannelRef {
+        platform: "zulip".into(),
+        channel_id: channel_id.clone(),
+        thread_id: thread_id_opt.clone(),
+        parent_id: None,
+        origin_event_id: None,
+    };
+    let trigger_msg = MessageRef {
+        channel: trigger_channel.clone(),
+        message_id: evt.message_id.clone(),
+    };
+
+    // Resolve the display name from `sender_full_name` (falls back to the
+    // numeric sender_id when missing/empty) via the pure seam.
+    let sender = build_sender_context(
+        evt.sender_full_name.as_deref(),
+        &evt.sender_id,
+        &channel_id,
+        thread_id_opt.as_deref(),
+        &evt.message_id,
+        is_bot,
+    );
+    let resolved_name = sender.sender_name.clone();
+    let sender_json = serde_json::to_string(&sender).unwrap_or_else(|_| "{}".into());
+    let estimated_tokens = crate::dispatch::estimate_tokens(&evt.content, &[]);
+    let buf = crate::dispatch::BufferedMessage {
+        sender_json,
+        sender_name: resolved_name,
+        prompt: evt.content.clone(),
+        extra_blocks: Vec::new(),
+        trigger_msg,
+        arrived_at: std::time::Instant::now(),
+        estimated_tokens,
+        other_bot_present: false,
+    };
+    (evt.thread_key.clone(), trigger_channel, buf)
+}
+
 impl BrokerSink {
     async fn dispatch_impl(&self, evt: ZulipDispatchedMessage) {
-        // Build the trigger MessageRef so reactions / streaming edits land on
-        // the originating Zulip message.
-        let channel_id = evt.stream_id.clone().unwrap_or_default();
-        let thread_id_opt = if evt.topic.is_empty() {
-            None
-        } else {
-            Some(evt.topic.clone())
-        };
-        let trigger_channel = ChannelRef {
-            platform: "zulip".into(),
-            channel_id: channel_id.clone(),
-            thread_id: thread_id_opt.clone(),
-            parent_id: None,
-            origin_event_id: None,
-        };
-        let trigger_msg = MessageRef {
-            channel: trigger_channel.clone(),
-            message_id: evt.message_id.clone(),
-        };
-
-        // Resolve the display name from `sender_full_name` (falls back to the
-        // numeric sender_id when missing/empty) via the pure seam.
-        let sender = build_sender_context(
-            evt.sender_full_name.as_deref(),
-            &evt.sender_id,
-            &channel_id,
-            thread_id_opt.as_deref(),
-            &evt.message_id,
-        );
-        let resolved_name = sender.sender_name.clone();
-        let sender_json = serde_json::to_string(&sender).unwrap_or_else(|_| "{}".into());
-        let estimated_tokens = crate::dispatch::estimate_tokens(&evt.content, &[]);
+        let is_bot = evt.is_bot;
         let adapter_dyn: Arc<dyn ChatAdapter> = self.adapter.clone();
-        let buf = crate::dispatch::BufferedMessage {
-            sender_json,
-            sender_name: resolved_name,
-            prompt: evt.content.clone(),
-            extra_blocks: Vec::new(),
-            trigger_msg,
-            arrived_at: std::time::Instant::now(),
-            estimated_tokens,
-            other_bot_present: false,
-        };
+        let (thread_key, trigger_channel, buf) = build_dispatch_parts(evt, is_bot);
         if let Err(e) = self
             .dispatcher
-            .submit(evt.thread_key, trigger_channel, adapter_dyn, buf)
+            .submit(thread_key, trigger_channel, adapter_dyn, buf)
             .await
         {
             warn!(error = %e, "zulip dispatcher submit failed");
@@ -903,6 +932,11 @@ pub async fn run_zulip_adapter(
                     .get("sender_full_name")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                let is_bot = body
+                    .get("sender_email")
+                    .and_then(|v| v.as_str())
+                    .map(email_is_bot)
+                    .unwrap_or(false);
                 let content = body
                     .get("content")
                     .and_then(|v| v.as_str())
@@ -1010,6 +1044,7 @@ pub async fn run_zulip_adapter(
                     sender_full_name,
                     message_id,
                     content,
+                    is_bot,
                 })
                 .await;
             }
@@ -1310,7 +1345,7 @@ mod tests {
 
     #[test]
     fn zulip_build_sender_context_resolves_display_name() {
-        let ctx = build_sender_context(Some("Alice Wu"), "7", "42", Some("x"), "1");
+        let ctx = build_sender_context(Some("Alice Wu"), "7", "42", Some("x"), "1", false);
         assert_eq!(ctx.display_name, "Alice Wu");
         assert_eq!(ctx.sender_name, "Alice Wu");
         assert_eq!(ctx.sender_id, "7");
@@ -1319,13 +1354,81 @@ mod tests {
     #[test]
     fn zulip_build_sender_context_falls_back_to_sender_id_when_name_missing() {
         // Missing field (None) falls back to the numeric sender_id.
-        let missing = build_sender_context(None, "7", "42", Some("x"), "1");
+        let missing = build_sender_context(None, "7", "42", Some("x"), "1", false);
         assert_eq!(missing.display_name, "7");
         assert_eq!(missing.sender_name, "7");
         // Empty string falls back too (never an empty display name).
-        let empty = build_sender_context(Some(""), "7", "42", Some("x"), "1");
+        let empty = build_sender_context(Some(""), "7", "42", Some("x"), "1", false);
         assert_eq!(empty.display_name, "7");
         assert_eq!(empty.sender_name, "7");
+    }
+
+    /// A1: `build_sender_context` propagates the `is_bot` argument into the
+    /// returned `SenderContext.is_bot` in both directions (so a hardcoded
+    /// constant cannot pass).
+    #[test]
+    fn zulip_build_sender_context_propagates_is_bot() {
+        let bot = build_sender_context(Some("Weather Bot"), "9", "42", Some("x"), "1", true);
+        assert!(bot.is_bot, "is_bot=true must yield ctx.is_bot == true");
+        let human = build_sender_context(Some("Alice Wu"), "7", "42", Some("x"), "1", false);
+        assert!(!human.is_bot, "is_bot=false must yield ctx.is_bot == false");
+    }
+
+    #[test]
+    fn email_is_bot_classifies_local_part_suffix() {
+        assert!(email_is_bot("weather-bot@example.com"));
+        assert!(!email_is_bot("alice@example.com"));
+        // Domain containing "bot" must NOT be misclassified — only local-part counts.
+        assert!(!email_is_bot("alice@bot.example.com"));
+        assert!(!email_is_bot(""));
+    }
+
+    // --- ZulipDispatchSeam (A3 + D1) --------------------------------------
+    // SenderContext is Serialize-only (no Deserialize), so test bodies parse
+    // the produced `sender_json` as a generic `serde_json::Value` and index it.
+
+    /// Build a `ZulipDispatchedMessage` for the seam tests.
+    fn seam_evt(sender_full_name: &str, sender_id: &str, is_bot: bool) -> ZulipDispatchedMessage {
+        ZulipDispatchedMessage {
+            thread_key: "zulip:stream:42:x".into(),
+            stream_id: Some("42".into()),
+            topic: "x".into(),
+            sender_id: sender_id.into(),
+            sender_full_name: Some(sender_full_name.into()),
+            message_id: "1".into(),
+            content: "hi".into(),
+            is_bot,
+        }
+    }
+
+    /// A3: a bot sender taken through the production build seam serializes to
+    /// `sender_json` with `is_bot == true` — proving is_bot reached production
+    /// SenderContext rather than the old hardcoded `false`.
+    #[test]
+    fn dispatch_impl_seam_serializes_is_bot_true_for_bot_sender() {
+        let evt = seam_evt("Weather Bot", "9", true);
+        let (_thread_key, _channel, buf) = build_dispatch_parts(evt, true);
+        let v: serde_json::Value = serde_json::from_str(&buf.sender_json).unwrap();
+        assert_eq!(
+            v["is_bot"].as_bool(),
+            Some(true),
+            "bot sender must serialize is_bot == true: {}",
+            buf.sender_json
+        );
+    }
+
+    /// D1 (HOLE1 regression guard): the seam preserves the resolved sender full
+    /// name. With sender_full_name="Alice Wu", sender_id="7", buf.sender_name
+    /// must be "Alice Wu" (not the id "7"), and the serialized display_name too.
+    /// Reverting sender_name back to sender_id makes this go RED.
+    #[test]
+    fn dispatch_impl_seam_preserves_resolved_sender_name() {
+        let evt = seam_evt("Alice Wu", "7", false);
+        let (_thread_key, _channel, buf) = build_dispatch_parts(evt, false);
+        assert_eq!(buf.sender_name, "Alice Wu");
+        assert_ne!(buf.sender_name, "7");
+        let v: serde_json::Value = serde_json::from_str(&buf.sender_json).unwrap();
+        assert_eq!(v["display_name"].as_str(), Some("Alice Wu"));
     }
 
     // --- HTTP test plumbing -------------------------------------------------
@@ -1764,6 +1867,9 @@ mod tests {
         /// Resolved sender name (from the seam) so tests can observe that the
         /// full name flowed through the dispatch path instead of the numeric id.
         sender_name: String,
+        /// Bot classification (from `email_is_bot`) observed at the sink so the
+        /// event loop's sender_email → is_bot path can be asserted end-to-end.
+        is_bot: bool,
         #[allow(dead_code)]
         content: String,
     }
@@ -1796,12 +1902,14 @@ mod tests {
                     Some(evt.topic.as_str())
                 },
                 &evt.message_id,
+                evt.is_bot,
             );
             self.log.lock().unwrap().push(DispatchedEvent {
                 thread_key: evt.thread_key,
                 stream_id: evt.stream_id,
                 sender_id: evt.sender_id,
                 sender_name: ctx.sender_name,
+                is_bot: ctx.is_bot,
                 content: evt.content,
             });
         }
@@ -1949,6 +2057,61 @@ mod tests {
         assert_eq!(log.len(), 1, "expected 1 dispatched message");
         assert_eq!(log[0].sender_name, "Alice Wu");
         assert_ne!(log[0].sender_name, "7");
+    }
+
+    /// A2: the event loop classifies a `sender_email` ending `-bot` as a bot
+    /// and a plain user email as a human. Two events in one poll → the bot
+    /// event records `is_bot == true`, the human event `is_bot == false`.
+    /// The human→false assertion blocks a hardcoded `true`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_classifies_bot_email_sender_as_bot() {
+        let canned = vec![
+            users_me_ok(),
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","queue_id":"q1","last_event_id":-1}"#.into(),
+            },
+            // One poll, two @-mention message events: a bot then a human.
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[{"id":1,"type":"message","flags":["mentioned"],"message":{"stream_id":42,"subject":"x","sender_id":7,"sender_email":"weather-bot@example.com","content":"hi"}},{"id":2,"type":"message","flags":["mentioned"],"message":{"stream_id":42,"subject":"x","sender_id":8,"sender_email":"alice@example.com","content":"yo"}}]}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[]}"#.into(),
+            },
+        ];
+        let base = spawn_mock(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let params = make_params(&["42"]);
+        let sink = Arc::new(RecordingSink::new());
+        let (tx, rx) = watch::channel(false);
+
+        let sink_clone = sink.clone();
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = tx.send(true);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("loop should exit within 5s")
+            .expect("task should join");
+        res.expect("loop should return Ok");
+
+        let log = sink.log.lock().unwrap();
+        assert_eq!(log.len(), 2, "expected 2 dispatched messages");
+        assert!(
+            log[0].is_bot,
+            "weather-bot@example.com must be classified as a bot"
+        );
+        assert!(
+            !log[1].is_bot,
+            "alice@example.com must be classified as a human"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
