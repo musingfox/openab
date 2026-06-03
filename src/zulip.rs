@@ -4666,4 +4666,272 @@ mod tests {
             "non-Zulip adapter must still fence the table in Code mode, got: {result:?}"
         );
     }
+
+    // ── E2E helpers shared by EX1 + EX2 ─────────────────────────────────────
+
+    /// Resolve the fake_acp_agent binary path. CARGO_BIN_EXE_fake_acp_agent is
+    /// set by cargo when building integration tests; for unit tests compiled via
+    /// `cargo test --bin openab` it may not be available, so we fall back to the
+    /// debug artifact next to CARGO_MANIFEST_DIR.
+    fn fake_agent_bin() -> String {
+        option_env!("CARGO_BIN_EXE_fake_acp_agent")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}/target/debug/fake_acp_agent",
+                    env!("CARGO_MANIFEST_DIR")
+                )
+            })
+    }
+
+    fn e2e_channel_ref() -> crate::adapter::ChannelRef {
+        crate::adapter::ChannelRef {
+            platform: "test".into(),
+            channel_id: "ch1".into(),
+            thread_id: Some("t1".into()),
+            parent_id: None,
+            origin_event_id: None,
+        }
+    }
+
+    fn e2e_message_ref() -> crate::adapter::MessageRef {
+        crate::adapter::MessageRef {
+            channel: e2e_channel_ref(),
+            message_id: "m1".into(),
+        }
+    }
+
+    fn e2e_content_blocks() -> Vec<crate::acp::ContentBlock> {
+        vec![crate::acp::ContentBlock::Text {
+            text: "hello".into(),
+        }]
+    }
+
+    fn e2e_agent_config(bin_path: &str) -> crate::config::AgentConfig {
+        crate::config::AgentConfig {
+            command: bin_path.to_string(),
+            args: vec![],
+            working_dir: "/tmp".to_string(),
+            env: Default::default(),
+            inherit_env: vec![],
+        }
+    }
+
+    /// Fake Zulip adapter for EX1: preferred_table_mode -> Some(TableMode::Off)
+    struct FakeZulipAdapter {
+        outbound: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeZulipAdapter {
+        fn new() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+            let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            (Self { outbound: buf.clone() }, buf)
+        }
+    }
+
+    #[async_trait]
+    impl crate::adapter::ChatAdapter for FakeZulipAdapter {
+        fn platform(&self) -> &'static str {
+            "fake_zulip"
+        }
+        fn message_limit(&self) -> usize {
+            2000
+        }
+        async fn send_message(
+            &self,
+            channel: &crate::adapter::ChannelRef,
+            content: &str,
+        ) -> anyhow::Result<crate::adapter::MessageRef> {
+            self.outbound.lock().unwrap().push(content.to_string());
+            Ok(crate::adapter::MessageRef {
+                channel: channel.clone(),
+                message_id: "fake-msg".into(),
+            })
+        }
+        async fn create_thread(
+            &self,
+            channel: &crate::adapter::ChannelRef,
+            _: &crate::adapter::MessageRef,
+            _: &str,
+        ) -> anyhow::Result<crate::adapter::ChannelRef> {
+            Ok(channel.clone())
+        }
+        async fn add_reaction(&self, _: &crate::adapter::MessageRef, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(&self, _: &crate::adapter::MessageRef, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn use_streaming(&self, _: bool) -> bool {
+            false
+        }
+        fn preferred_table_mode(&self) -> Option<crate::markdown::TableMode> {
+            Some(crate::markdown::TableMode::Off)
+        }
+    }
+
+    /// Fake default adapter for EX2: preferred_table_mode not overridden (returns None)
+    struct FakeDefaultAdapter {
+        outbound: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeDefaultAdapter {
+        fn new() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+            let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            (Self { outbound: buf.clone() }, buf)
+        }
+    }
+
+    #[async_trait]
+    impl crate::adapter::ChatAdapter for FakeDefaultAdapter {
+        fn platform(&self) -> &'static str {
+            "fake_default"
+        }
+        fn message_limit(&self) -> usize {
+            2000
+        }
+        async fn send_message(
+            &self,
+            channel: &crate::adapter::ChannelRef,
+            content: &str,
+        ) -> anyhow::Result<crate::adapter::MessageRef> {
+            self.outbound.lock().unwrap().push(content.to_string());
+            Ok(crate::adapter::MessageRef {
+                channel: channel.clone(),
+                message_id: "fake-msg".into(),
+            })
+        }
+        async fn create_thread(
+            &self,
+            channel: &crate::adapter::ChannelRef,
+            _: &crate::adapter::MessageRef,
+            _: &str,
+        ) -> anyhow::Result<crate::adapter::ChannelRef> {
+            Ok(channel.clone())
+        }
+        async fn add_reaction(&self, _: &crate::adapter::MessageRef, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(&self, _: &crate::adapter::MessageRef, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn use_streaming(&self, _: bool) -> bool {
+            false
+        }
+        // preferred_table_mode() not overridden -> returns None (default)
+    }
+
+    // ── EX1: true e2e — Zulip adapter Off mode preserves #**a>b** outbound ─
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn e2e_zulip_table_outbound_preserves_stream_topic_link() {
+        let bin = fake_agent_bin();
+        let config = e2e_agent_config(&bin);
+        let pool = std::sync::Arc::new(crate::acp::SessionPool::new(config, 1));
+
+        let (adapter_inner, captured) = FakeZulipAdapter::new();
+        let adapter: std::sync::Arc<dyn crate::adapter::ChatAdapter> =
+            std::sync::Arc::new(adapter_inner);
+
+        let reactions_cfg = crate::config::ReactionsConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let router = crate::adapter::AdapterRouter::new(
+            pool.clone(),
+            reactions_cfg,
+            crate::markdown::TableMode::Code,
+            60,
+            30,
+        );
+
+        let thread_key = "fake_zulip:t1";
+        pool.get_or_create(thread_key).await.expect("pool get_or_create");
+
+        let trigger = e2e_message_ref();
+        let reactions = std::sync::Arc::new(crate::reactions::StatusReactionController::new(
+            false,
+            adapter.clone(),
+            trigger.clone(),
+            Default::default(),
+            Default::default(),
+        ));
+
+        router
+            .stream_prompt_blocks(
+                &adapter,
+                thread_key,
+                e2e_content_blocks(),
+                &e2e_channel_ref(),
+                &trigger,
+                reactions,
+                false,
+            )
+            .await
+            .expect("stream_prompt_blocks");
+
+        let outbound = captured.lock().unwrap().join("\n");
+        assert!(
+            outbound.contains("#**a>b**"),
+            "Zulip Off mode must preserve #**a>b** in outbound, got: {outbound:?}"
+        );
+        assert!(
+            !outbound.contains("```"),
+            "Zulip Off mode must not add code fence, got: {outbound:?}"
+        );
+    }
+
+    // ── EX2: true e2e — default adapter Code mode mangles #**a>b** to #a>b ─
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn e2e_default_adapter_table_outbound_mangled_under_code() {
+        let bin = fake_agent_bin();
+        let config = e2e_agent_config(&bin);
+        let pool = std::sync::Arc::new(crate::acp::SessionPool::new(config, 1));
+
+        let (adapter_inner, captured) = FakeDefaultAdapter::new();
+        let adapter: std::sync::Arc<dyn crate::adapter::ChatAdapter> =
+            std::sync::Arc::new(adapter_inner);
+
+        let reactions_cfg = crate::config::ReactionsConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let router = crate::adapter::AdapterRouter::new(
+            pool.clone(),
+            reactions_cfg,
+            crate::markdown::TableMode::Code,
+            60,
+            30,
+        );
+
+        let thread_key = "fake_default:t1";
+        pool.get_or_create(thread_key).await.expect("pool get_or_create");
+
+        let trigger = e2e_message_ref();
+        let reactions = std::sync::Arc::new(crate::reactions::StatusReactionController::new(
+            false,
+            adapter.clone(),
+            trigger.clone(),
+            Default::default(),
+            Default::default(),
+        ));
+
+        router
+            .stream_prompt_blocks(
+                &adapter,
+                thread_key,
+                e2e_content_blocks(),
+                &e2e_channel_ref(),
+                &trigger,
+                reactions,
+                false,
+            )
+            .await
+            .expect("stream_prompt_blocks");
+
+        let outbound = captured.lock().unwrap().join("\n");
+        assert!(
+            outbound.contains("#a>b"),
+            "Code mode must mangle #**a>b** to #a>b in outbound, got: {outbound:?}"
+        );
+    }
 }
