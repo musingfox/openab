@@ -360,4 +360,22 @@ Some text after.
             "stream-topic link must survive Code mode, got: {result:?}"
         );
     }
+
+    // ── EX3: Code mode mangles #**a>b** inside a table cell ───────────────
+    #[test]
+    fn code_mode_mangles_stream_topic_link() {
+        // Inside a GFM table cell, pulldown-cmark parses **a>b** as Strong and
+        // emits only the inner text — stripping the ** markers. Code mode then
+        // wraps in a code fence, so the output contains #a>b (mangled) and ```.
+        let table_md = "| Link |\n|------|\n| #**a>b** |\n";
+        let result = convert_tables(table_md, TableMode::Code);
+        assert!(
+            result.contains("```"),
+            "Code mode must wrap table in a code fence, got: {result:?}"
+        );
+        assert!(
+            result.contains("#a>b"),
+            "Code mode must mangle #**a>b** to #a>b (Strong markers stripped), got: {result:?}"
+        );
+    }
 }

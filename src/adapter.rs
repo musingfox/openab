@@ -378,6 +378,16 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// not be detected until the next message. This is acceptable: the first
     /// response may stream, but subsequent ones will correctly use send-once.
     fn use_streaming(&self, other_bot_present: bool) -> bool;
+
+    /// Per-platform table rendering preference. When `Some`, overrides the
+    /// global `table_mode` configured on `AdapterRouter`. When `None`, the
+    /// global setting is used unchanged.
+    ///
+    /// Zulip overrides to `Some(TableMode::Off)` to preserve `#**stream>topic**`
+    /// cross-topic link syntax, which Code mode mangles by stripping Strong markers.
+    fn preferred_table_mode(&self) -> Option<crate::markdown::TableMode> {
+        None
+    }
 }
 
 // --- AdapterRouter ---
@@ -634,11 +644,15 @@ impl AdapterRouter {
         // Platforms that render Markdown tables natively (e.g. Slack Block Kit
         // `markdown` blocks / `markdown_text` stream chunks) skip the
         // table→code/bullets pre-pass so the raw table renders natively.
-        let table_mode = if adapter.renders_native_tables() {
-            TableMode::Off
-        } else {
-            self.table_mode
-        };
+        // An adapter's explicit preferred_table_mode() (e.g. Zulip → Off to
+        // preserve #**stream>topic** / @**user** syntax) takes precedence.
+        let table_mode = adapter.preferred_table_mode().unwrap_or(
+            if adapter.renders_native_tables() {
+                TableMode::Off
+            } else {
+                self.table_mode
+            },
+        );
         let tool_display = self.reactions_config.tool_display;
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
@@ -1643,6 +1657,51 @@ mod tests {
         )];
         let out = compose_display(&tools, "response text", false, ToolDisplay::None);
         assert_eq!(out, "response text");
+    }
+
+    // ── EX2: default preferred_table_mode returns None ─────────────────────
+    #[test]
+    fn default_preferred_table_mode_none() {
+        // A stub adapter that does NOT override preferred_table_mode() should
+        // return None, indicating it defers to the global AdapterRouter setting.
+        struct DefaultTableAdapter;
+
+        #[async_trait]
+        impl ChatAdapter for DefaultTableAdapter {
+            fn platform(&self) -> &'static str {
+                "test"
+            }
+            fn message_limit(&self) -> usize {
+                2000
+            }
+            async fn send_message(&self, _: &ChannelRef, _: &str) -> Result<MessageRef> {
+                unimplemented!()
+            }
+            async fn create_thread(
+                &self,
+                _: &ChannelRef,
+                _: &MessageRef,
+                _: &str,
+            ) -> Result<ChannelRef> {
+                unimplemented!()
+            }
+            async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn use_streaming(&self, _: bool) -> bool {
+                false
+            }
+        }
+
+        let adapter = DefaultTableAdapter;
+        assert_eq!(
+            adapter.preferred_table_mode(),
+            None,
+            "non-Zulip adapters must return None from preferred_table_mode()"
+        );
     }
 }
 
