@@ -41,3 +41,7 @@ secrets-aws = ["dep:aws-sdk-secretsmanager", "dep:aws-config"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[[bin]]
+name = "fake_acp_agent"
+path = "src/bin/fake_acp_agent.rs"
