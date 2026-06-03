@@ -196,6 +196,14 @@ pub async fn dispatch_line_reply(
     reply: &GatewayReply,
     api_base: &str,
 ) -> bool {
+    if matches!(
+        reply.command.as_deref(),
+        Some("add_reaction") | Some("remove_reaction") | Some("create_topic")
+    ) {
+        info!(command = ?reply.command.as_deref(), "line: ignoring unsupported command");
+        return false;
+    }
+
     // Extract token from cache (drop lock before HTTP call)
     let cached_token = {
         let mut cache = reply_cache.lock().unwrap_or_else(|e| e.into_inner());
