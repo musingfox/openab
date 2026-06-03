@@ -14,6 +14,7 @@
 
 use crate::acp::ContentBlock;
 use crate::adapter::{ChannelRef, ChatAdapter, MessageRef};
+use crate::markdown::TableMode;
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::stt::EchoEntry;
@@ -850,6 +851,13 @@ impl ChatAdapter for ZulipAdapter {
         !other_bot_present
     }
 
+    fn preferred_table_mode(&self) -> Option<crate::markdown::TableMode> {
+        // Zulip's Code mode strips Strong markers from table cells, mangling
+        // #**stream>topic** cross-topic links to #stream>topic. Use Off so the
+        // raw Zulip markdown syntax is passed through unchanged.
+        Some(TableMode::Off)
+    }
+
     async fn start_typing(&self, channel: &ChannelRef) -> Result<()> {
         let form = typing_form("start", channel);
         self.api_call(reqwest::Method::POST, "/api/v1/typing", Some(&form), None)
@@ -1502,6 +1510,7 @@ pub async fn run_zulip_adapter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markdown::convert_tables;
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -4524,6 +4533,137 @@ mod tests {
         assert!(
             warning_reaction,
             "expected a ⚠️ -> emoji_name=warning reaction; recorded={recs:?}"
+        );
+    }
+
+    // ── EX1: ZulipAdapter::preferred_table_mode() == Some(TableMode::Off) ─
+    #[test]
+    fn zulip_preferred_table_mode_off() {
+        let adapter = ZulipAdapter::new("https://test.zulipchat.com", "bot@test.com", "key");
+        assert_eq!(
+            adapter.preferred_table_mode(),
+            Some(TableMode::Off),
+            "ZulipAdapter must return Some(TableMode::Off) from preferred_table_mode()"
+        );
+    }
+
+    // ── EX4: Zulip effective mode Off preserves #**a>b** in table cells ───
+    #[test]
+    fn zulip_effective_off_preserves_stream_topic_link() {
+        // Effective mode is resolved via preferred_table_mode().unwrap_or(global),
+        // which for Zulip yields Off — so the raw Zulip markdown is passed through.
+        // Contrast: Code mode would mangle #**a>b** to #a>b (Strong stripped).
+        let zulip = ZulipAdapter::new("https://test.zulipchat.com", "bot@test.com", "key");
+        let global = TableMode::Code;
+        let table_md = "| Link |\n|------|\n| #**a>b** |\n";
+
+        // Code mode comparison (the mangle path): #a>b appears, #**a>b** does not survive.
+        let code_result = convert_tables(table_md, TableMode::Code);
+        assert!(
+            code_result.contains("#a>b"),
+            "Code path must mangle to #a>b, got: {code_result:?}"
+        );
+
+        // Effective Off path via preferred_table_mode().unwrap_or(global).
+        let effective_mode = zulip.preferred_table_mode().unwrap_or(global);
+        let off_result = convert_tables(table_md, effective_mode);
+        assert!(
+            off_result.contains("#**a>b**"),
+            "Off path must preserve literal #**a>b**, got: {off_result:?}"
+        );
+        assert!(
+            !off_result.contains("```"),
+            "Off path must NOT add a code fence, got: {off_result:?}"
+        );
+    }
+
+    // ── EX5: Zulip effective mode Off preserves @**user** in table cells ──
+    #[test]
+    fn zulip_effective_off_preserves_user_mention() {
+        // Same routing as EX4: preferred_table_mode().unwrap_or(global).
+        // Code mode mangles @**user** to @user; Off preserves it.
+        let zulip = ZulipAdapter::new("https://test.zulipchat.com", "bot@test.com", "key");
+        let global = TableMode::Code;
+        let table_md = "| Mention |\n|---------|\n| @**user** |\n";
+
+        // Code mode comparison (the mangle path): @user appears.
+        let code_result = convert_tables(table_md, TableMode::Code);
+        assert!(
+            code_result.contains("@user"),
+            "Code path must mangle @**user** to @user, got: {code_result:?}"
+        );
+
+        // Effective Off path via preferred_table_mode().unwrap_or(global).
+        let effective_mode = zulip.preferred_table_mode().unwrap_or(global);
+        let off_result = convert_tables(table_md, effective_mode);
+        assert!(
+            off_result.contains("@**user**"),
+            "Off path must preserve literal @**user**, got: {off_result:?}"
+        );
+    }
+
+    // ── EX6: non-Zulip adapter keeps table fenced (regression guard) ──────
+    #[test]
+    fn nonzulip_effective_code_fences_table() {
+        // A stub adapter that does NOT override preferred_table_mode() returns None.
+        // Effective mode = preferred_table_mode().unwrap_or(TableMode::Code) = Code.
+        // The table must still be wrapped in a code fence (no regression).
+        struct StubAdapter;
+
+        #[async_trait]
+        impl crate::adapter::ChatAdapter for StubAdapter {
+            fn platform(&self) -> &'static str {
+                "stub"
+            }
+            fn message_limit(&self) -> usize {
+                2000
+            }
+            async fn send_message(
+                &self,
+                _: &crate::adapter::ChannelRef,
+                _: &str,
+            ) -> anyhow::Result<crate::adapter::MessageRef> {
+                unimplemented!()
+            }
+            async fn create_thread(
+                &self,
+                _: &crate::adapter::ChannelRef,
+                _: &crate::adapter::MessageRef,
+                _: &str,
+            ) -> anyhow::Result<crate::adapter::ChannelRef> {
+                unimplemented!()
+            }
+            async fn add_reaction(
+                &self,
+                _: &crate::adapter::MessageRef,
+                _: &str,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn remove_reaction(
+                &self,
+                _: &crate::adapter::MessageRef,
+                _: &str,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn use_streaming(&self, _: bool) -> bool {
+                false
+            }
+            // preferred_table_mode() not overridden -> returns None (default)
+        }
+
+        let stub = StubAdapter;
+        let global = TableMode::Code;
+        let table_md = "| Col |\n|-----|\n| val |\n";
+
+        // Effective mode resolved via preferred_table_mode().unwrap_or(global Code).
+        let effective_mode = stub.preferred_table_mode().unwrap_or(global);
+        assert_eq!(effective_mode, TableMode::Code, "effective mode must be Code for non-Zulip");
+        let result = convert_tables(table_md, effective_mode);
+        assert!(
+            result.contains("```"),
+            "non-Zulip adapter must still fence the table in Code mode, got: {result:?}"
         );
     }
 }
