@@ -198,6 +198,33 @@ will start a fresh session. Since `[[resolve]]` is emitted at end-of-turn
 this is generally the intended outcome (the conversation is, after all,
 resolved); it is documented here so the behaviour is not surprising.
 
+## Cross-topic links (`#**stream>topic**` syntax)
+
+Zulip supports a native markdown link syntax for referencing another stream's
+topic: `#**stream>topic**`. When a message containing this literal is posted,
+the Zulip server renders it as a clickable link that navigates directly to that
+topic's conversation. No special adapter support is required — the text passes
+through the broker unchanged and Zulip handles rendering on the server side.
+
+The agent should use `#**stream>topic**` whenever it wants to point the user to
+a conversation in a different stream or topic — for example, to link back to a
+related issue in `#**ops>incident-2025-06-01**` or to hand off to a different
+team's stream.
+
+### Agent-side system-prompt snippet
+
+To teach the agent this syntax, include a snippet like the following in your
+agent's system prompt (or `opencode.json` instructions field):
+
+> When referring to a conversation in another Zulip stream or topic, use the
+> native link syntax `#**stream>topic**` — for example
+> `#**general>deploy**`. Zulip renders this as a clickable link on the server;
+> no extra formatting is needed.
+
+Paste this into the agent's system prompt via your operator config (e.g. the
+`instructions` field in `opencode.json`) for it to take effect. Without that
+human-in-the-loop injection the agent will not know to use the syntax.
+
 ## Known gaps for v1.1
 
 Tracked here so they don't get rediscovered.
