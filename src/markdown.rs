@@ -346,4 +346,18 @@ Some text after.
             "backticks should be kept in bullets mode"
         );
     }
+
+    #[test]
+    fn convert_tables_preserves_stream_topic_link() {
+        let result = convert_tables("Ping #**a>b** now", TableMode::Bullets);
+        assert!(
+            result.contains("#**a>b**"),
+            "stream-topic link must survive Bullets mode, got: {result:?}"
+        );
+        let result = convert_tables("Ping #**a>b** now", TableMode::Code);
+        assert!(
+            result.contains("#**a>b**"),
+            "stream-topic link must survive Code mode, got: {result:?}"
+        );
+    }
 }

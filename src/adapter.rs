@@ -1652,17 +1652,12 @@ mod directive_tests {
 
     #[test]
     fn zulip_outbound_preserves_stream_topic_link() {
-        // #** does not start with [[, so the directive parser breaks immediately
-        // at the else branch and returns the full input unchanged.
-        let input = "#**general>deploy** See this thread for context.";
-        let (_directives, content) = parse_output_directives(input);
+        let input = "[[resolve]] See #**general>deploy** for context.";
+        let (directives, content) = parse_output_directives(input);
+        assert!(directives.resolve, "resolve directive must be set");
         assert!(
-            content.contains("#**"),
-            "stream-topic link prefix must survive directive strip, got: {content:?}"
-        );
-        assert!(
-            content.contains("general>deploy"),
-            "stream>topic name must survive directive strip, got: {content:?}"
+            content.contains("#**general>deploy**"),
+            "stream-topic link must survive directive strip, got: {content:?}"
         );
     }
 
