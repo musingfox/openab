@@ -1,4 +1,4 @@
-name: "E2E: agy-acp"
+name: "CI: agy-acp"
 
 on:
   pull_request:
@@ -8,12 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  AGY_VERSION: "1.0.4"
 
 jobs:
-  e2e:
+  ci:
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v6
 
@@ -33,23 +31,6 @@ jobs:
         working-directory: agy-acp
         run: cargo build --release
 
-      - name: Install agy CLI
-        run: |
-          gh release download "$AGY_VERSION" \
-            --repo google-antigravity/antigravity-cli \
-            --pattern "agy_cli_linux_x64.tar.gz" \
-            --dir /tmp
-          tar -xzf /tmp/agy_cli_linux_x64.tar.gz -C /usr/local/bin/
-          ln -sf /usr/local/bin/antigravity /usr/local/bin/agy
-          agy --version
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      - name: Run E2E test
+      - name: Run tests
         working-directory: agy-acp
-        run: |
-          mkdir -p ~/.gemini
-          echo "GEMINI_API_KEY=${GEMINI_API_KEY}" > ~/.gemini/.env
-          cargo test e2e -- --ignored --nocapture
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: cargo test -- --include-ignored --skip e2e
