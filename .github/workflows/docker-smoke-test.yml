@@ -72,29 +72,26 @@ jobs:
           DF="${{ matrix.variant.dockerfile }}"
 
           if grep -q "FROM rust" "$DF"; then
-            # Remove ALL 'FROM rust' stages, keep only the final runtime stage
-            awk '
-              /^FROM rust/ { skip=1; next }
-              /^FROM / && !/^FROM rust/ { skip=0 }
-              !skip { print }
-            ' "$DF" > Dockerfile.ci
+            # Create fake builder context with pre-built binary at the expected path
+            mkdir -p .fake-builder/build/target/release
+            cp .pre-built/openab .fake-builder/build/target/release/openab
 
-            # Prepend stub builder stages that just provide the pre-built binaries
-            {
-              echo "FROM debian:bookworm-slim AS builder"
-              echo "RUN mkdir -p /build/target/release"
-              echo "COPY .pre-built/openab /build/target/release/openab"
-              # Handle additional build stages (e.g. adapter-builder)
-              grep -i '^FROM rust' "$DF" | grep -oE 'AS [a-zA-Z0-9_-]+' | awk '{print $2}' | grep -v '^builder$' | while read stage; do
-                echo "FROM debian:bookworm-slim AS $stage"
-                echo "RUN mkdir -p /build/target/release"
-                echo "COPY .pre-built/* /build/target/release/"
-              done
-              cat Dockerfile.ci
-            } > Dockerfile.final
-            docker build -t openab-test${{ matrix.variant.suffix }} -f Dockerfile.final .
+            BUILD_CONTEXTS="--build-context builder=.fake-builder"
+
+            # Handle additional named Rust stages (e.g. adapter-builder)
+            grep -i '^FROM rust' "$DF" | sed -n 's/.*AS \([a-zA-Z0-9_-]*\).*/\1/p' | grep -v '^builder$' | while read stage; do
+              mkdir -p ".fake-${stage}/build/target/release"
+              cp .pre-built/* ".fake-${stage}/build/target/release/"
+              echo "--build-context ${stage}=.fake-${stage}"
+            done > /tmp/extra-contexts.txt
+
+            if [ -s /tmp/extra-contexts.txt ]; then
+              BUILD_CONTEXTS="$BUILD_CONTEXTS $(cat /tmp/extra-contexts.txt | tr '\n' ' ')"
+            fi
+
+            docker buildx build $BUILD_CONTEXTS -t openab-test${{ matrix.variant.suffix }} -f "$DF" .
           else
-            docker build -t openab-test${{ matrix.variant.suffix }} -f "$DF" .
+            docker buildx build -t openab-test${{ matrix.variant.suffix }} -f "$DF" .
           fi
 
       - name: Verify openab CMD does not crash
