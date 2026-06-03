@@ -16,6 +16,7 @@ use crate::acp::ContentBlock;
 use crate::adapter::{ChannelRef, ChatAdapter, MessageRef};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
+use crate::stt::EchoEntry;
 use crate::media;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -381,6 +382,7 @@ fn unicode_to_zulip_emoji(unicode: &str) -> &str {
         "❌" => "x",
         "🔧" => "wrench",
         "🎤" => "microphone",
+        "⚠\u{fe0f}" => "warning",
         _ => "question",
     }
 }
@@ -592,7 +594,8 @@ impl ZulipAdapter {
         &self,
         content: &str,
         stt_config: &SttConfig,
-    ) -> Vec<ContentBlock> {
+        trigger: &MessageRef,
+    ) -> (Vec<ContentBlock>, Vec<EchoEntry>) {
         // Caps mirror discord.rs / slack.rs: bound total text bytes + counts so a
         // pathological message can't bloat the prompt.
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB across all text files
@@ -605,6 +608,7 @@ impl ZulipAdapter {
         const MAX_LINKS: usize = 10;
 
         let mut blocks = Vec::new();
+        let mut entries: Vec<EchoEntry> = Vec::new();
         let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
         let mut image_count: u32 = 0;
@@ -666,11 +670,19 @@ impl ZulipAdapter {
                                 text: format!("[Voice message transcript]: {transcript}"),
                             },
                         );
+                        entries.push(EchoEntry::Success(transcript));
                     } else {
-                        warn!(filename = %link.filename, "zulip STT failed for voice attachment; skipping");
+                        warn!(filename = %link.filename, "zulip STT failed for voice attachment");
+                        entries.push(EchoEntry::Failed);
                     }
                 } else {
-                    debug!(filename = %link.filename, "zulip audio attachment skipped (STT disabled)");
+                    // STT disabled: acknowledge the voice attachment with a 🎤
+                    // reaction on the trigger (best-effort) instead of
+                    // downloading/transcribing. No echo entry is emitted.
+                    debug!(filename = %link.filename, "zulip audio attachment skipped (STT disabled), adding 🎤 ack");
+                    if let Err(e) = self.add_reaction(trigger, "🎤").await {
+                        debug!(error = %e, "zulip STT-disabled 🎤 ack reaction failed");
+                    }
                 }
                 continue;
             } else if media::is_text_file(&link.filename, None) {
@@ -710,7 +722,7 @@ impl ZulipAdapter {
                 }
             }
         }
-        blocks
+        (blocks, entries)
     }
 }
 
@@ -1429,9 +1441,41 @@ pub async fn run_zulip_adapter(
                 // the sink) so the HTTP work rides on the dispatched message and a
                 // recording sink can observe the resulting blocks. Best-effort:
                 // resolve/download failures skip the attachment, never panic.
-                let extra_blocks = adapter
-                    .ingest_upload_links(&content, &params.stt_config)
+                // Build the trigger / thread refs from the same fields the sink
+                // will move into ZulipDispatchedMessage below (cloned here so the
+                // refs outlive the move). Mirrors build_dispatch_parts.
+                let trigger_channel = ChannelRef {
+                    platform: "zulip".into(),
+                    channel_id: stream_id.clone().unwrap_or_default(),
+                    thread_id: if topic.is_empty() {
+                        None
+                    } else {
+                        Some(topic.clone())
+                    },
+                    parent_id: None,
+                    origin_event_id: None,
+                };
+                let trigger_msg = MessageRef {
+                    channel: trigger_channel.clone(),
+                    message_id: message_id.clone(),
+                };
+
+                let (extra_blocks, echo_entries) = adapter
+                    .ingest_upload_links(&content, &params.stt_config, &trigger_msg)
                     .await;
+
+                // Surface each transcription outcome to the thread (echo + ⚠️ on
+                // failure). post_echo no-ops when echo_transcript is off or the
+                // entries are empty.
+                let adapter_dyn: Arc<dyn ChatAdapter> = adapter.clone();
+                crate::stt::post_echo(
+                    &adapter_dyn,
+                    &trigger_channel,
+                    &trigger_msg,
+                    &echo_entries,
+                    &params.stt_config,
+                )
+                .await;
 
                 debug!(thread_key = %key, num_extra_blocks = extra_blocks.len(), "zulip message dispatched");
                 sink.dispatch(ZulipDispatchedMessage {
@@ -3847,6 +3891,22 @@ mod tests {
         );
     }
 
+    /// A trigger MessageRef for the direct `ingest_upload_links` tests (the
+    /// echo/reaction path needs one). The message_id drives the reaction path
+    /// (`/api/v1/messages/{id}/reactions`).
+    fn ingest_trigger() -> MessageRef {
+        MessageRef {
+            channel: ChannelRef {
+                platform: "zulip".into(),
+                channel_id: "42".into(),
+                thread_id: Some("x".into()),
+                parent_id: None,
+                origin_event_id: None,
+            },
+            message_id: "100".into(),
+        }
+    }
+
     /// One canned temp-URL RESOLVE failure (HTTP 500 error envelope).
     fn temp_url_resolve_500() -> Canned {
         Canned {
@@ -3891,8 +3951,8 @@ mod tests {
         let canned: Vec<Canned> = (0..14).map(|_| temp_url_resolve_500()).collect();
         let (base, recorded) = spawn_mock_recording(canned).await;
         let adapter = ZulipAdapter::new(base, "b@x", "k");
-        let blocks = adapter
-            .ingest_upload_links(&content, &SttConfig::default())
+        let (blocks, _entries) = adapter
+            .ingest_upload_links(&content, &SttConfig::default(), &ingest_trigger())
             .await;
         assert!(blocks.is_empty(), "all resolves failed; expected no blocks");
         let n = count_resolve_gets(&recorded);
@@ -3908,10 +3968,11 @@ mod tests {
         let canned = vec![temp_url_resolve_500()];
         let base = spawn_mock(canned).await;
         let adapter = ZulipAdapter::new(base, "b@x", "k");
-        let blocks = adapter
+        let (blocks, _entries) = adapter
             .ingest_upload_links(
                 "here [p.png](/user_uploads/2/ab/p.png)",
                 &SttConfig::default(),
+                &ingest_trigger(),
             )
             .await;
         assert!(
@@ -3932,10 +3993,11 @@ mod tests {
         }];
         let base = spawn_mock(canned).await;
         let adapter = ZulipAdapter::new(base, "b@x", "k");
-        let blocks = adapter
+        let (blocks, _entries) = adapter
             .ingest_upload_links(
                 "here [p.png](/user_uploads/2/ab/p.png)",
                 &SttConfig::default(),
+                &ingest_trigger(),
             )
             .await;
         assert!(
@@ -4024,8 +4086,12 @@ mod tests {
         let base = spawn_mock(canned).await;
         let stt = stt_enabled(&base);
         let adapter = ZulipAdapter::new(base, "b@x", "k");
-        let blocks = adapter
-            .ingest_upload_links("voice [v.mp3](/user_uploads/2/ab/v.mp3)", &stt)
+        let (blocks, _entries) = adapter
+            .ingest_upload_links(
+                "voice [v.mp3](/user_uploads/2/ab/v.mp3)",
+                &stt,
+                &ingest_trigger(),
+            )
             .await;
         assert_eq!(
             blocks.len(),
@@ -4043,14 +4109,16 @@ mod tests {
     /// E5: STT disabled — the audio link is skipped with NO STT POST recorded.
     #[tokio::test(flavor = "current_thread")]
     async fn ingest_upload_links_audio_disabled_skips_no_stt() {
-        // Only the resolve is supplied; no audio-download, no STT canned.
-        let canned = vec![temp_url_resolve_ok()];
+        // Resolve + the 🎤-ack reaction POST (STT-disabled audio acknowledges the
+        // attachment); no audio-download, no STT canned.
+        let canned = vec![temp_url_resolve_ok(), reaction_ok()];
         let (base, recorded) = spawn_mock_recording(canned).await;
         let adapter = ZulipAdapter::new(base, "b@x", "k");
-        let blocks = adapter
+        let (blocks, _entries) = adapter
             .ingest_upload_links(
                 "voice [v.mp3](/user_uploads/2/ab/v.mp3)",
                 &SttConfig::default(),
+                &ingest_trigger(),
             )
             .await;
         assert!(
@@ -4085,8 +4153,12 @@ mod tests {
         let base = spawn_mock(canned).await;
         let stt = stt_enabled(&base);
         let adapter = ZulipAdapter::new(base, "b@x", "k");
-        let blocks = adapter
-            .ingest_upload_links("voice [v.mp3](/user_uploads/2/ab/v.mp3)", &stt)
+        let (blocks, _entries) = adapter
+            .ingest_upload_links(
+                "voice [v.mp3](/user_uploads/2/ab/v.mp3)",
+                &stt,
+                &ingest_trigger(),
+            )
             .await;
         assert!(
             blocks.is_empty(),
@@ -4113,10 +4185,11 @@ mod tests {
         let base = spawn_mock(canned).await;
         let stt = stt_enabled(&base);
         let adapter = ZulipAdapter::new(base, "b@x", "k");
-        let blocks = adapter
+        let (blocks, _entries) = adapter
             .ingest_upload_links(
                 "[v.mp3](/user_uploads/2/ab/v.mp3) [p.png](/user_uploads/2/ab/p.png)",
                 &stt,
+                &ingest_trigger(),
             )
             .await;
         assert_eq!(blocks.len(), 2, "expected transcript + image, got {blocks:?}");
@@ -4150,14 +4223,307 @@ mod tests {
         let base = spawn_mock(canned).await;
         let stt = stt_enabled(&base);
         let adapter = ZulipAdapter::new(base, "b@x", "k");
-        let blocks = adapter
-            .ingest_upload_links("here [p.png](/user_uploads/2/ab/p.png)", &stt)
+        let (blocks, entries) = adapter
+            .ingest_upload_links(
+                "here [p.png](/user_uploads/2/ab/p.png)",
+                &stt,
+                &ingest_trigger(),
+            )
             .await;
         assert_eq!(blocks.len(), 1, "expected one image block, got {blocks:?}");
         assert!(
             matches!(blocks[0], ContentBlock::Image { .. }),
             "block[0] must be an Image, got {:?}",
             blocks[0]
+        );
+        assert!(
+            entries.is_empty(),
+            "a pure image must emit no echo entry, got {entries:?}"
+        );
+    }
+
+    // --- turn 9: echo-transcript + 🎤/⚠️ reaction --------------------------
+
+    /// Canned reaction POST reply (HTTP 200 success envelope).
+    fn reaction_ok() -> Canned {
+        Canned {
+            status: 200,
+            headers: vec![("Content-Type", "application/json".into())],
+            body: r#"{"result":"success"}"#.into(),
+        }
+    }
+
+    /// An `SttConfig` with STT enabled AND echo_transcript on, `base_url` -> mock.
+    fn stt_echo_enabled(base: &str) -> SttConfig {
+        SttConfig {
+            enabled: true,
+            echo_transcript: true,
+            base_url: base.to_string(),
+            ..SttConfig::default()
+        }
+    }
+
+    /// E8: ⚠️ maps to the Zulip emoji name "warning" (not the "question" default).
+    #[test]
+    fn unicode_to_zulip_emoji_warning() {
+        assert_eq!(unicode_to_zulip_emoji("⚠\u{fe0f}"), "warning");
+    }
+
+    /// E1: STT enabled, audio transcribes — BOTH outputs populated.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_upload_links_echo_success_entry() {
+        let canned = vec![
+            temp_url_resolve_ok(),
+            audio_bytes_ok(),
+            stt_json("hello there"),
+        ];
+        let base = spawn_mock(canned).await;
+        let stt = stt_enabled(&base);
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        let (blocks, entries) = adapter
+            .ingest_upload_links(
+                "voice [v.mp3](/user_uploads/2/ab/v.mp3)",
+                &stt,
+                &ingest_trigger(),
+            )
+            .await;
+        assert_eq!(entries, vec![EchoEntry::Success("hello there".into())]);
+        assert!(!blocks.is_empty(), "expected a transcript block");
+        match &blocks[0] {
+            ContentBlock::Text { text } => {
+                assert_eq!(text, "[Voice message transcript]: hello there");
+            }
+            other => panic!("block[0] must be the transcript Text, got {other:?}"),
+        }
+    }
+
+    /// E2: STT enabled, audio OK but STT 500 — Failed entry, no block.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_upload_links_echo_failed_entry_on_stt_500() {
+        let canned = vec![
+            temp_url_resolve_ok(),
+            audio_bytes_ok(),
+            Canned {
+                status: 500,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"error":"boom"}"#.into(),
+            },
+        ];
+        let base = spawn_mock(canned).await;
+        let stt = stt_enabled(&base);
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        let (blocks, entries) = adapter
+            .ingest_upload_links(
+                "voice [v.mp3](/user_uploads/2/ab/v.mp3)",
+                &stt,
+                &ingest_trigger(),
+            )
+            .await;
+        assert_eq!(entries, vec![EchoEntry::Failed]);
+        assert!(
+            blocks.is_empty(),
+            "a 500 transcription contributes no block, got {blocks:?}"
+        );
+    }
+
+    /// E3: STT disabled + audio — no transcript, no echo, but a 🎤 reaction is
+    /// added to the trigger.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_upload_links_disabled_reaction_only_no_echo() {
+        let canned = vec![temp_url_resolve_ok(), reaction_ok()];
+        let (base, recorded) = spawn_mock_recording(canned).await;
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        let (blocks, entries) = adapter
+            .ingest_upload_links(
+                "voice [v.mp3](/user_uploads/2/ab/v.mp3)",
+                &SttConfig::default(),
+                &ingest_trigger(),
+            )
+            .await;
+        assert!(entries.is_empty(), "STT off must emit no echo entry");
+        assert!(blocks.is_empty(), "STT off must contribute no block");
+        let reaction = recorded.lock().unwrap().iter().any(|req| {
+            let first = req.lines().next().unwrap_or("");
+            first.starts_with("POST /api/v1/messages/")
+                && first.contains("/reactions")
+                && req.contains("emoji_name=microphone")
+        });
+        assert!(
+            reaction,
+            "STT-disabled audio must POST a 🎤 (microphone) reaction; recorded={:?}",
+            recorded.lock().unwrap()
+        );
+    }
+
+    /// E4: STT disabled + pure image — one Image block, NO reaction.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_upload_links_image_only_no_echo_no_reaction() {
+        let png = make_png(2, 2);
+        let canned = vec![
+            temp_url_resolve_ok(),
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "image/png".into())],
+                body: png.into(),
+            },
+        ];
+        let (base, recorded) = spawn_mock_recording(canned).await;
+        let adapter = ZulipAdapter::new(base, "b@x", "k");
+        let (blocks, entries) = adapter
+            .ingest_upload_links(
+                "here [p.png](/user_uploads/2/ab/p.png)",
+                &SttConfig::default(),
+                &ingest_trigger(),
+            )
+            .await;
+        assert_eq!(blocks.len(), 1, "expected one image block, got {blocks:?}");
+        assert!(
+            matches!(blocks[0], ContentBlock::Image { .. }),
+            "block[0] must be an Image, got {:?}",
+            blocks[0]
+        );
+        assert!(entries.is_empty(), "an image emits no echo entry");
+        let has_reaction = recorded.lock().unwrap().iter().any(|req| {
+            req.lines()
+                .next()
+                .is_some_and(|l| l.contains("/reactions"))
+        });
+        assert!(
+            !has_reaction,
+            "an image attachment must NOT trigger a reaction; recorded={:?}",
+            recorded.lock().unwrap()
+        );
+    }
+
+    /// Build params with the given stt_config (make_params hardcodes a disabled
+    /// SttConfig, so E5-E7 need a fresh build pointed at the mock).
+    fn make_params_with_stt(channels: &[&str], stt_config: SttConfig) -> ZulipParams {
+        ZulipParams {
+            stt_config,
+            ..make_params(channels)
+        }
+    }
+
+    /// Drive register → one poll → empty poll → shutdown against a recording mock.
+    /// `echo_transcript` selects whether params enable the echo path; the STT
+    /// base_url is pointed at the freshly-bound mock so the STT POST lands on it.
+    async fn drive_recording(canned: Vec<Canned>, echo_transcript: bool) -> Arc<Mutex<Vec<String>>> {
+        let (base, recorded) = spawn_mock_recording(canned).await;
+        let stt_config = if echo_transcript {
+            stt_echo_enabled(&base)
+        } else {
+            stt_enabled(&base)
+        };
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let params = make_params_with_stt(&["42"], stt_config);
+        let sink = Arc::new(RecordingSink::new());
+        let (tx, rx) = watch::channel(false);
+
+        let sink_clone = sink.clone();
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let _ = tx.send(true);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("loop should exit within 5s")
+            .expect("task should join");
+        res.expect("loop should return Ok");
+        recorded
+    }
+
+    /// E5: event loop, echo_transcript=true & enabled — transcript echoed to thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_echoes_transcript_to_thread() {
+        let canned = vec![
+            users_me_ok(),
+            register_ok(),
+            events_message("[v.mp3](/user_uploads/2/ab/v.mp3)"),
+            temp_url_resolve_ok(),
+            audio_bytes_ok(),
+            stt_json("hi there"),
+            reaction_ok(), // echo send 200 (id-less id field tolerated)
+            events_empty(),
+        ];
+        let recorded = drive_recording(canned, true).await;
+        let echoed = recorded.lock().unwrap().iter().any(|req| {
+            let first = req.lines().next().unwrap_or("");
+            first.starts_with("POST /api/v1/messages")
+                && !first.contains("/reactions")
+                && req.contains("hi+there")
+                && req.contains("%F0%9F%8E%A4")
+        });
+        assert!(
+            echoed,
+            "expected an echo /messages POST carrying 'hi+there' and 🎤; recorded={:?}",
+            recorded.lock().unwrap()
+        );
+    }
+
+    /// E6: event loop, echo_transcript=false (STT enabled) — NO echo message.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_no_echo_when_disabled() {
+        let canned = vec![
+            users_me_ok(),
+            register_ok(),
+            events_message("[v.mp3](/user_uploads/2/ab/v.mp3)"),
+            temp_url_resolve_ok(),
+            audio_bytes_ok(),
+            stt_json("hi there"),
+            events_empty(),
+        ];
+        let recorded = drive_recording(canned, false).await;
+        let echoed = recorded.lock().unwrap().iter().any(|req| {
+            let first = req.lines().next().unwrap_or("");
+            first.starts_with("POST /api/v1/messages") && req.contains("%F0%9F%8E%A4")
+        });
+        assert!(
+            !echoed,
+            "echo_transcript=false must NOT POST a 🎤 echo body; recorded={:?}",
+            recorded.lock().unwrap()
+        );
+    }
+
+    /// E7: event loop, STT 500 with echo on — failure echo + ⚠️->"warning" reaction.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_echo_warning_reaction_on_stt_failure() {
+        let canned = vec![
+            users_me_ok(),
+            register_ok(),
+            events_message("[v.mp3](/user_uploads/2/ab/v.mp3)"),
+            temp_url_resolve_ok(),
+            audio_bytes_ok(),
+            Canned {
+                status: 500,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"error":"boom"}"#.into(),
+            },
+            reaction_ok(), // echo send 200
+            reaction_ok(), // ⚠️ reaction 200
+            events_empty(),
+        ];
+        let recorded = drive_recording(canned, true).await;
+        let recs = recorded.lock().unwrap();
+        let failure_echo = recs.iter().any(|req| {
+            let first = req.lines().next().unwrap_or("");
+            first.starts_with("POST /api/v1/messages")
+                && !first.contains("/reactions")
+                && req.contains("%28transcription+failed%29")
+        });
+        assert!(
+            failure_echo,
+            "expected a failure echo body '(transcription failed)'; recorded={recs:?}"
+        );
+        let warning_reaction = recs.iter().any(|req| {
+            let first = req.lines().next().unwrap_or("");
+            first.starts_with("POST /api/v1/messages/")
+                && first.contains("/reactions")
+                && req.contains("emoji_name=warning")
+        });
+        assert!(
+            warning_reaction,
+            "expected a ⚠️ -> emoji_name=warning reaction; recorded={recs:?}"
         );
     }
 }
