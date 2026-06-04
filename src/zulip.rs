@@ -4669,19 +4669,18 @@ mod tests {
 
     // ── E2E helpers shared by EX1 + EX2 ─────────────────────────────────────
 
-    /// Resolve the fake_acp_agent binary path. CARGO_BIN_EXE_fake_acp_agent is
-    /// set by cargo when building integration tests; for unit tests compiled via
-    /// `cargo test --bin openab` it may not be available, so we fall back to the
-    /// debug artifact next to CARGO_MANIFEST_DIR.
+    /// Build the fake_acp_agent binary at test time via escargot and return its
+    /// path. Uses OnceLock so the build runs at most once per test process.
     fn fake_agent_bin() -> String {
-        option_env!("CARGO_BIN_EXE_fake_acp_agent")
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                format!(
-                    "{}/target/debug/fake_acp_agent",
-                    env!("CARGO_MANIFEST_DIR")
-                )
-            })
+        static BIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        BIN.get_or_init(|| {
+            let run = escargot::CargoBuild::new()
+                .bin("fake_acp_agent")
+                .run()
+                .expect("build fake_acp_agent fixture");
+            run.path().to_str().expect("fixture path utf8").to_string()
+        })
+        .clone()
     }
 
     fn e2e_channel_ref() -> crate::adapter::ChannelRef {
