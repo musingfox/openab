@@ -13,6 +13,13 @@ use crate::reactions::StatusReactionController;
 
 // --- Output directive parsing ---
 
+/// Topic visibility policy set via `[[follow]]` / `[[mute]]` directives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopicVisibility {
+    Follow,
+    Mute,
+}
+
 /// Parsed directives from agent output header block.
 /// Consecutive `[[key:value]]` lines at the start of output are directives.
 /// Bare `[[resolve]]` (no colon) is also recognized and signals that the
@@ -23,6 +30,8 @@ pub struct OutputDirectives {
     pub reply_to: Option<String>,
     /// Agent requests that the conversation topic be marked resolved.
     pub resolve: bool,
+    /// Agent requests a topic visibility change (Follow or Mute).
+    pub topic_visibility: Option<TopicVisibility>,
 }
 
 /// Parse `[[key:value]]` directives from the beginning of agent output.
@@ -79,11 +88,26 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                         content_start += 1;
                     }
                 } else {
-                    // [[X]] without colon — only `[[resolve]]` is recognized
-                    // as a bare keyword directive; everything else falls
+                    // [[X]] without colon — recognized bare keywords:
+                    // `resolve`, `follow`, `mute`. Everything else falls
                     // through to break (preserved as content).
-                    if inner.trim() == "resolve" {
-                        directives.resolve = true;
+                    let kw = inner.trim();
+                    let recognized = match kw {
+                        "resolve" => {
+                            directives.resolve = true;
+                            true
+                        }
+                        "follow" => {
+                            directives.topic_visibility = Some(TopicVisibility::Follow);
+                            true
+                        }
+                        "mute" => {
+                            directives.topic_visibility = Some(TopicVisibility::Mute);
+                            true
+                        }
+                        _ => false,
+                    };
+                    if recognized {
                         // Check for trailing content after ]] (mirror colon branch).
                         let remainder = after_open[close_pos + 2..].trim();
                         if !remainder.is_empty() {
@@ -367,6 +391,17 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// Invoked when the agent emits `[[resolve]]` and the turn completes naturally.
     /// Default: no-op (adapters without topic-resolution semantics silently succeed).
     async fn resolve_topic(&self, _channel: &ChannelRef, _trigger_msg: &MessageRef) -> Result<()> {
+        Ok(())
+    }
+
+    /// Set the topic visibility policy (Follow or Mute) on the underlying platform.
+    /// Invoked unconditionally when the agent emits `[[follow]]` or `[[mute]]`.
+    /// Default: no-op (non-Zulip adapters silently succeed).
+    async fn set_topic_visibility(
+        &self,
+        _channel: &ChannelRef,
+        _policy: TopicVisibility,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -1048,6 +1083,14 @@ impl AdapterRouter {
                     )
                     .await;
 
+                    maybe_set_topic_visibility(
+                        &adapter,
+                        &thread_channel,
+                        &directives,
+                        natural_completion,
+                    )
+                    .await;
+
                     Ok(())
                 })
             })
@@ -1074,6 +1117,28 @@ pub(crate) async fn maybe_resolve_topic(
     }
     if let Err(e) = adapter.resolve_topic(channel, trigger_msg).await {
         tracing::warn!(error = ?e, "resolve_topic failed; continuing turn");
+    }
+}
+
+/// Invoke `adapter.set_topic_visibility` iff the agent requested it
+/// (`[[follow]]` or `[[mute]]`). Unlike `maybe_resolve_topic`, this fires
+/// UNCONDITIONALLY on directive presence — `natural_completion` is accepted
+/// for signature parity but is deliberately ignored (human adjudication: the
+/// directive alone is authoritative).
+///
+/// Errors are logged at `warn` and swallowed so a visibility failure never
+/// regresses the turn outcome.
+pub(crate) async fn maybe_set_topic_visibility(
+    adapter: &Arc<dyn ChatAdapter>,
+    channel: &ChannelRef,
+    directives: &OutputDirectives,
+    _natural_completion: bool,
+) {
+    let Some(policy) = directives.topic_visibility else {
+        return;
+    };
+    if let Err(e) = adapter.set_topic_visibility(channel, policy).await {
+        tracing::warn!(error = ?e, "set_topic_visibility failed; continuing turn");
     }
 }
 
@@ -1492,6 +1557,170 @@ mod tests {
         assert!(adapter.resolve_topic(&ch, &msg).await.is_ok());
     }
 
+    // ── TopicVisibility recording adapter ────────────────────────────────────
+
+    /// Records `set_topic_visibility` invocations + optional error injection.
+    #[derive(Default)]
+    struct VisibilityRecordingAdapter {
+        visibility_calls: Mutex<Vec<(ChannelRef, TopicVisibility)>>,
+        visibility_err: Mutex<Option<String>>,
+    }
+
+    impl VisibilityRecordingAdapter {
+        fn calls(&self) -> Vec<(ChannelRef, TopicVisibility)> {
+            self.visibility_calls.lock().unwrap().clone()
+        }
+        fn fail_with(msg: &str) -> Self {
+            Self {
+                visibility_calls: Mutex::new(Vec::new()),
+                visibility_err: Mutex::new(Some(msg.to_string())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ChatAdapter for VisibilityRecordingAdapter {
+        fn platform(&self) -> &'static str {
+            "vis_rec"
+        }
+        fn message_limit(&self) -> usize {
+            2000
+        }
+        async fn send_message(&self, _: &ChannelRef, _: &str) -> Result<MessageRef> {
+            unimplemented!()
+        }
+        async fn create_thread(
+            &self,
+            _: &ChannelRef,
+            _: &MessageRef,
+            _: &str,
+        ) -> Result<ChannelRef> {
+            unimplemented!()
+        }
+        async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn use_streaming(&self, _: bool) -> bool {
+            false
+        }
+        async fn set_topic_visibility(
+            &self,
+            channel: &ChannelRef,
+            policy: TopicVisibility,
+        ) -> Result<()> {
+            self.visibility_calls
+                .lock()
+                .unwrap()
+                .push((channel.clone(), policy));
+            if let Some(e) = self.visibility_err.lock().unwrap().take() {
+                return Err(anyhow::anyhow!(e));
+            }
+            Ok(())
+        }
+    }
+
+    fn visibility_test_channel() -> ChannelRef {
+        ChannelRef {
+            platform: "vis_rec".into(),
+            channel_id: "c1".into(),
+            thread_id: Some("topic".into()),
+            parent_id: None,
+            origin_event_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn maybe_set_topic_visibility_fires_even_without_natural_completion() {
+        // Unconditional: natural_completion=false must still fire exactly once.
+        let rec = Arc::new(VisibilityRecordingAdapter::default());
+        let adapter: Arc<dyn ChatAdapter> = rec.clone();
+        let directives = OutputDirectives {
+            topic_visibility: Some(TopicVisibility::Follow),
+            ..Default::default()
+        };
+        maybe_set_topic_visibility(&adapter, &visibility_test_channel(), &directives, false).await;
+        assert_eq!(rec.calls().len(), 1);
+        assert_eq!(rec.calls()[0].1, TopicVisibility::Follow);
+    }
+
+    #[tokio::test]
+    async fn maybe_set_topic_visibility_no_op_without_intent() {
+        let rec = Arc::new(VisibilityRecordingAdapter::default());
+        let adapter: Arc<dyn ChatAdapter> = rec.clone();
+        let directives = OutputDirectives::default();
+        maybe_set_topic_visibility(&adapter, &visibility_test_channel(), &directives, true).await;
+        assert!(rec.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn maybe_set_topic_visibility_swallows_error() {
+        // Err from set_topic_visibility must NOT propagate.
+        let rec = Arc::new(VisibilityRecordingAdapter::fail_with("forbidden"));
+        let adapter: Arc<dyn ChatAdapter> = rec.clone();
+        let directives = OutputDirectives {
+            topic_visibility: Some(TopicVisibility::Mute),
+            ..Default::default()
+        };
+        // No panic, infallible by signature.
+        maybe_set_topic_visibility(&adapter, &visibility_test_channel(), &directives, true).await;
+        // Still recorded the attempt despite error.
+        assert_eq!(rec.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_topic_visibility_trait_default_impl_is_ok_noop() {
+        struct StubAdapter;
+
+        #[async_trait]
+        impl ChatAdapter for StubAdapter {
+            fn platform(&self) -> &'static str {
+                "stub"
+            }
+            fn message_limit(&self) -> usize {
+                2000
+            }
+            async fn send_message(&self, _: &ChannelRef, _: &str) -> Result<MessageRef> {
+                unimplemented!()
+            }
+            async fn create_thread(
+                &self,
+                _: &ChannelRef,
+                _: &MessageRef,
+                _: &str,
+            ) -> Result<ChannelRef> {
+                unimplemented!()
+            }
+            async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn use_streaming(&self, _: bool) -> bool {
+                false
+            }
+        }
+
+        let adapter = StubAdapter;
+        let ch = ChannelRef {
+            platform: "stub".into(),
+            channel_id: "c1".into(),
+            thread_id: Some("topic".into()),
+            parent_id: None,
+            origin_event_id: None,
+        };
+        // Default impl returns Ok(()) — no override needed.
+        assert!(
+            adapter
+                .set_topic_visibility(&ch, TopicVisibility::Follow)
+                .await
+                .is_ok()
+        );
+    }
+
     #[tokio::test]
     async fn typing_trait_default_impls_noop() {
         // Stub adapter with no override of start_typing/stop_typing — defaults
@@ -1707,7 +1936,7 @@ mod tests {
 
 #[cfg(test)]
 mod directive_tests {
-    use super::parse_output_directives;
+    use super::{parse_output_directives, TopicVisibility};
 
     #[test]
     fn parse_reply_to_directive() {
@@ -1956,5 +2185,76 @@ mod directive_tests {
                 "stripped body must not contain literal directive, got: {body:?}"
             );
         }
+    }
+
+    // ── follow/mute parse tests ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_follow_bare_sets_follow() {
+        let input = "[[follow]]\nbody";
+        let (d, content) = parse_output_directives(input);
+        assert_eq!(d.topic_visibility, Some(TopicVisibility::Follow));
+        assert_eq!(content, "body");
+    }
+
+    #[test]
+    fn parse_mute_bare_sets_mute() {
+        let input = "[[mute]]\nbody";
+        let (d, content) = parse_output_directives(input);
+        assert_eq!(d.topic_visibility, Some(TopicVisibility::Mute));
+        assert_eq!(content, "body");
+    }
+
+    #[test]
+    fn parse_follow_inline_content() {
+        let input = "[[follow]]  inline body";
+        let (d, content) = parse_output_directives(input);
+        assert_eq!(d.topic_visibility, Some(TopicVisibility::Follow));
+        assert_eq!(content, "inline body");
+    }
+
+    #[test]
+    fn parse_follow_crlf_line_ending() {
+        let input = "[[follow]]\r\nbody";
+        let (d, content) = parse_output_directives(input);
+        assert_eq!(d.topic_visibility, Some(TopicVisibility::Follow));
+        assert_eq!(content, "body");
+    }
+
+    #[test]
+    fn parse_follow_only_first_line_recognized() {
+        // [[follow]] not in directive header position — preserved as content
+        let input = "Hello\n[[follow]]";
+        let (d, content) = parse_output_directives(input);
+        assert_eq!(d.topic_visibility, None);
+        assert_eq!(content, input);
+    }
+
+    #[test]
+    fn parse_unknown_bare_fume_preserved() {
+        // `[[fume]]` is not a recognized keyword — preserved as content
+        let input = "[[fume]]\nbody";
+        let (d, content) = parse_output_directives(input);
+        assert_eq!(d.topic_visibility, None);
+        assert_eq!(content, input);
+    }
+
+    #[test]
+    fn parse_follow_then_mute_last_wins() {
+        // Last directive wins: [[follow]] then [[mute]] → Mute
+        let input = "[[follow]]\n[[mute]]\nbody";
+        let (d, content) = parse_output_directives(input);
+        assert_eq!(d.topic_visibility, Some(TopicVisibility::Mute));
+        assert_eq!(content, "body");
+    }
+
+    #[test]
+    fn parse_resolve_and_follow_coexist() {
+        // [[resolve]] + [[follow]] → both set simultaneously
+        let input = "[[resolve]]\n[[follow]]\nbody";
+        let (d, content) = parse_output_directives(input);
+        assert!(d.resolve, "resolve must be set");
+        assert_eq!(d.topic_visibility, Some(TopicVisibility::Follow));
+        assert_eq!(content, "body");
     }
 }

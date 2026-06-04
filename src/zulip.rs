@@ -13,7 +13,7 @@
 //! - DMs: `zulip:dm:{sorted_csv_of_user_ids}`.
 
 use crate::acp::ContentBlock;
-use crate::adapter::{ChannelRef, ChatAdapter, MessageRef};
+use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, TopicVisibility};
 use crate::markdown::TableMode;
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
@@ -354,6 +354,29 @@ fn typing_form(op: &str, channel: &ChannelRef) -> Vec<(&'static str, String)> {
         form.push(("to", channel.channel_id.clone()));
     }
     form
+}
+
+/// Build the form body for a `/api/v1/user_topics` request.
+///
+/// Zulip visibility_policy values:
+/// - 3 = Follow (receive all notifications, pinned in left sidebar)
+/// - 1 = Mute   (suppress notifications, hidden by default)
+///
+/// DM channels (no thread_id) have no Zulip topic, so the caller should
+/// early-return before calling this function.
+fn user_topic_form(channel: &ChannelRef, policy: TopicVisibility) -> Vec<(&'static str, String)> {
+    let visibility_policy = match policy {
+        TopicVisibility::Follow => "3",
+        TopicVisibility::Mute => "1",
+    };
+    vec![
+        ("stream_id", channel.channel_id.clone()),
+        (
+            "topic",
+            channel.thread_id.clone().unwrap_or_default(),
+        ),
+        ("visibility_policy", visibility_policy.to_string()),
+    ]
 }
 
 /// Maps the default `[reactions.emojis]` unicode codepoints to Zulip emoji
@@ -844,6 +867,26 @@ impl ChatAdapter for ZulipAdapter {
         let path = format!("/api/v1/messages/{}", trigger_msg.message_id);
         self.api_call(reqwest::Method::PATCH, &path, Some(&form), None)
             .await?;
+        Ok(())
+    }
+
+    async fn set_topic_visibility(
+        &self,
+        channel: &ChannelRef,
+        policy: TopicVisibility,
+    ) -> Result<()> {
+        if channel.thread_id.is_none() {
+            // DM — no topic, nothing to set.
+            return Ok(());
+        }
+        let form = user_topic_form(channel, policy);
+        self.api_call(
+            reqwest::Method::POST,
+            "/api/v1/user_topics",
+            Some(&form),
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1510,6 +1553,7 @@ pub async fn run_zulip_adapter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::TopicVisibility;
     use crate::markdown::convert_tables;
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -4932,5 +4976,62 @@ mod tests {
             outbound.contains("#a>b"),
             "Code mode must mangle #**a>b** to #a>b in outbound, got: {outbound:?}"
         );
+    }
+
+    // ── user_topic_form tests ─────────────────────────────────────────────────
+
+    fn topic_channel() -> crate::adapter::ChannelRef {
+        crate::adapter::ChannelRef {
+            platform: "zulip".into(),
+            channel_id: "42".into(),
+            thread_id: Some("deploy".into()),
+            parent_id: None,
+            origin_event_id: None,
+        }
+    }
+
+    #[test]
+    fn user_topic_form_follow_policy_3() {
+        let channel = topic_channel();
+        let form = user_topic_form(&channel, TopicVisibility::Follow);
+        let stream_id = form.iter().find(|(k, _)| *k == "stream_id").map(|(_, v)| v.as_str());
+        let topic = form.iter().find(|(k, _)| *k == "topic").map(|(_, v)| v.as_str());
+        let visibility_policy = form.iter().find(|(k, _)| *k == "visibility_policy").map(|(_, v)| v.as_str());
+        assert_eq!(stream_id, Some("42"), "stream_id must match channel_id");
+        assert_eq!(topic, Some("deploy"), "topic must match thread_id");
+        assert_eq!(visibility_policy, Some("3"), "Follow must map to visibility_policy == Some(\"3\")");
+    }
+
+    #[test]
+    fn user_topic_form_mute_policy_1() {
+        let channel = topic_channel();
+        let form = user_topic_form(&channel, TopicVisibility::Mute);
+        let visibility_policy = form.iter().find(|(k, _)| *k == "visibility_policy").map(|(_, v)| v.as_str());
+        assert_eq!(visibility_policy, Some("1"), "Mute must map to visibility_policy == Some(\"1\")");
+    }
+
+    #[tokio::test]
+    async fn set_topic_visibility_dm_no_topic_early_return_ok() {
+        // DM channel (thread_id = None) must return Ok(()) without calling any API.
+        // We construct a ZulipAdapter pointing at a non-existent server; if it
+        // were to call api_call it would error on the network, proving the
+        // early-return path is taken.
+        let adapter = ZulipAdapter::new(
+            "http://localhost:19999",
+            "bot@example.com",
+            "fake_key",
+        );
+        let dm_channel = crate::adapter::ChannelRef {
+            platform: "zulip".into(),
+            channel_id: "99".into(),
+            thread_id: None, // DM — no topic
+            parent_id: None,
+            origin_event_id: None,
+        };
+        // Early return Ok(()) without making any HTTP call.
+        let result = adapter
+            .set_topic_visibility(&dm_channel, TopicVisibility::Follow)
+            .await;
+        assert!(result.is_ok(), "DM set_topic_visibility must be Ok(()): {result:?}");
     }
 }
