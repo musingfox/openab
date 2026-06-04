@@ -198,6 +198,54 @@ will start a fresh session. Since `[[resolve]]` is emitted at end-of-turn
 this is generally the intended outcome (the conversation is, after all,
 resolved); it is documented here so the behaviour is not surprising.
 
+## Topic follow/mute (`[[follow]]` / `[[mute]]` directives)
+
+When the agent emits `[[follow]]` or `[[mute]]` as the **first line** of its
+reply, the broker strips that line from the visible message and immediately
+sets the bot user's Zulip topic visibility policy via
+`POST /api/v1/user_topics` (`visibility_policy`: 3 = Follow, 1 = Mute).
+
+Unlike `[[resolve]]`, these directives fire **unconditionally** — they are
+not gated on natural turn completion. If the directive is present, the API
+call is made regardless of how the turn ended.
+
+### Agent-side system-prompt snippet
+
+To opt the agent into topic visibility control, include a line like these in
+your agent's system prompt (or `opencode.json` instructions):
+
+> When starting a long-running task that will span multiple turns, emit
+> `[[follow]]` as the first line of your first reply to follow the topic and
+> ensure notifications are delivered.
+
+> When a noisy topic should be silenced, emit `[[mute]]` as the first line of
+> your reply to mute the topic for the bot user.
+
+The directives are orthogonal and can coexist with `[[resolve]]` — for
+example `[[resolve]]` on one line and `[[follow]]` on the next sets both.
+Last directive wins if `[[follow]]` and `[[mute]]` both appear (e.g.
+`[[follow]]` then `[[mute]]` → Mute).
+
+### Required Zulip permission
+
+The bot user must be able to call `POST /api/v1/user_topics`. This endpoint
+controls per-user topic preferences and is available to all authenticated
+users by default — no special group membership is required.
+
+### Failure mode
+
+If the API call fails (network, unexpected server error, etc.) the broker
+logs a `warn` with the underlying error and the turn **completes normally** —
+the agent's reply is still posted. The visibility policy is left unchanged.
+Only operators tailing the broker log see the failure. Retry by prompting the
+agent to emit the directive again on its next reply.
+
+### Platform scope
+
+`[[follow]]` and `[[mute]]` are Zulip-only directives. On Discord, Slack, and
+other platforms the `set_topic_visibility` trait method is a default no-op —
+the directive is silently ignored.
+
 ## Cross-topic links (`#**stream>topic**` syntax)
 
 Zulip supports a native markdown link syntax for referencing another stream's
