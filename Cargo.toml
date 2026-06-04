@@ -39,3 +39,6 @@ libc = "0.2"
 [[bin]]
 name = "fake_acp_agent"
 path = "src/bin/fake_acp_agent.rs"
+
+[dev-dependencies]
+escargot = "0.5.15"
