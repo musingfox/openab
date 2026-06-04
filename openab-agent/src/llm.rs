@@ -265,7 +265,7 @@ impl OpenAiProvider {
                 .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string()),
             model: std::env::var("OPENAB_AGENT_OPENAI_MODEL")
                 .or_else(|_| std::env::var("OPENAB_AGENT_MODEL"))
-                .unwrap_or_else(|_| "gpt-4.1-nano".to_string()),
+                .unwrap_or_else(|_| "gpt-5.4-mini".to_string()),
             max_tokens: std::env::var("OPENAB_AGENT_MAX_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
