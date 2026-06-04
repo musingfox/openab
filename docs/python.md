@@ -101,27 +101,50 @@ Resolution order:
 
 If no suitable interpreter exists, `uv` downloads one automatically.
 
-## Example: Skill Script
+## Example: Skill with Python Scripts
 
-A typical OAB skill script using Python:
+A typical skill directory structure:
 
-```bash
-#!/bin/bash
-# my-skill/scripts/run.sh
-uv run /home/agent/.kiro/skills/my-skill/scripts/main.py "$@"
+```
+twitter/
+├── scripts/
+│   ├── collect_timeline.py
+│   ├── collect_comments.py
+│   ├── filter_candidates.py
+│   └── upload.py
+└── SKILL.md
 ```
 
-The Python script can use inline dependencies:
+In your `SKILL.md`, instruct the agent to run scripts using `uv run` with the skill directory as the base path:
+
+```markdown
+## Execution
+
+- **SKILL_DIR** = the directory containing this SKILL.md file.
+  Resolve all `scripts/` paths relative to it.
+
+To upload, run:
+
+    uv run ${SKILL_DIR}/scripts/upload.py
+
+To collect timeline:
+
+    uv run ${SKILL_DIR}/scripts/collect_timeline.py
+```
+
+The agent resolves `${SKILL_DIR}` to the actual skill path (e.g. `~/.kiro/skills/twitter/`) and runs the script directly. Each Python script can declare its own dependencies inline:
 
 ```python
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["tweepy"]
+# dependencies = ["tweepy", "httpx"]
 # ///
 
 import tweepy
 # ... skill logic
 ```
+
+No virtualenv setup, no `pip install` — `uv run` handles everything.
 
 ## Tips
 
