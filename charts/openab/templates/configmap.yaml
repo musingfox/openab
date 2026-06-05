@@ -246,6 +246,42 @@ data:
     {{- end }}
     {{- end }}
     {{- end }}
+    {{- if ($cfg.hooks).preBoot }}
+
+    [hooks.pre_boot]
+    {{- if ($cfg.hooks).preBoot.script }}
+    script = {{ ($cfg.hooks).preBoot.script | toJson }}
+    {{- end }}
+    {{- if ($cfg.hooks).preBoot.inline }}
+    inline = {{ ($cfg.hooks).preBoot.inline | toJson }}
+    {{- end }}
+    {{- if ($cfg.hooks).preBoot.url }}
+    url = {{ ($cfg.hooks).preBoot.url | toJson }}
+    {{- end }}
+    {{- if ($cfg.hooks).preBoot.sha256 }}
+    sha256 = {{ ($cfg.hooks).preBoot.sha256 | toJson }}
+    {{- end }}
+    timeout_seconds = {{ ($cfg.hooks).preBoot.timeoutSeconds | default 60 }}
+    on_failure = {{ ($cfg.hooks).preBoot.onFailure | default "abort" | toJson }}
+    {{- end }}
+    {{- if ($cfg.hooks).preShutdown }}
+
+    [hooks.pre_shutdown]
+    {{- if ($cfg.hooks).preShutdown.script }}
+    script = {{ ($cfg.hooks).preShutdown.script | toJson }}
+    {{- end }}
+    {{- if ($cfg.hooks).preShutdown.inline }}
+    inline = {{ ($cfg.hooks).preShutdown.inline | toJson }}
+    {{- end }}
+    {{- if ($cfg.hooks).preShutdown.url }}
+    url = {{ ($cfg.hooks).preShutdown.url | toJson }}
+    {{- end }}
+    {{- if ($cfg.hooks).preShutdown.sha256 }}
+    sha256 = {{ ($cfg.hooks).preShutdown.sha256 | toJson }}
+    {{- end }}
+    timeout_seconds = {{ ($cfg.hooks).preShutdown.timeoutSeconds | default 60 }}
+    on_failure = {{ ($cfg.hooks).preShutdown.onFailure | default "abort" | toJson }}
+    {{- end }}
   {{- if $cfg.agentsMd }}
   AGENTS.md: |
     {{- $cfg.agentsMd | nindent 4 }}
