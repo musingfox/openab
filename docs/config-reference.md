@@ -93,11 +93,13 @@ Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Googl
 
 The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 
+> **This entire section is optional.** If omitted, `command` defaults to `$OPENAB_AGENT_COMMAND` (or `"openab-agent"`) and `working_dir` defaults to `$HOME`. Each Docker image sets these env vars so you typically don't need an `[agent]` block unless you want to customize `env` or `args`.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `command` | string | *required* | Agent binary (e.g. `kiro-cli`, `claude-agent-acp`, `codex`, `gemini`, `copilot`, `opencode`, `pi-acp`, `cursor-agent`). |
+| `command` | string | `$OPENAB_AGENT_COMMAND` or `"openab-agent"` | Agent binary. Optional — defaults from image env var. |
 | `args` | string[] | `[]` | CLI arguments passed to the agent. |
-| `working_dir` | string | `"/tmp"` | Working directory for the agent process. |
+| `working_dir` | string | `$HOME` | Working directory for the agent process. Optional — defaults to container's `$HOME`. |
 | `env` | map | `{}` | Extra environment variables (e.g. `{ OPENAI_API_KEY = "${OPENAI_API_KEY}" }`). |
 | `inherit_env` | string[] | `[]` | Env var names to inherit from the OAB process (e.g. vars injected via K8s `envFrom`). Keys in `env` take precedence. |
 
