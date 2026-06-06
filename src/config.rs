@@ -530,9 +530,7 @@ pub struct ReactionTiming {
 // --- defaults ---
 
 fn default_working_dir() -> String {
-    std::env::var("OPENAB_AGENT_WORKING_DIR")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_else(|_| "/tmp".into())
+    std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
 }
 fn default_agent_command() -> String {
     std::env::var("OPENAB_AGENT_COMMAND").unwrap_or_else(|_| "openab-agent".into())
