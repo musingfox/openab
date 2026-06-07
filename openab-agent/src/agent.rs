@@ -23,7 +23,7 @@ const MAX_CONTEXT_MESSAGES: usize = 100;
 
 pub struct Agent {
     provider: Box<dyn LlmProvider>,
-    messages: Vec<Message>,
+    pub(crate) messages: Vec<Message>,
     working_dir: PathBuf,
     system_prompt: String,
     tools: Vec<ToolDef>,
@@ -56,6 +56,12 @@ impl Agent {
     /// Replace the LLM provider while preserving conversation history.
     pub fn swap_provider(&mut self, provider: Box<dyn LlmProvider>) {
         self.provider = provider;
+    }
+
+    /// Number of messages in the conversation (test helper).
+    #[cfg(test)]
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
     }
 
     /// Run the agent with a user prompt, executing tool calls until completion.

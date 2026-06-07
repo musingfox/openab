@@ -661,4 +661,111 @@ mod tests {
             .unwrap()
             .contains("unknown model"));
     }
+
+    #[tokio::test]
+    async fn test_model_switch_preserves_session_history() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
+        let mut server = AcpServer::new();
+
+        // Create a session
+        let resp_str = server.handle_session_new(10).await;
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+        let session_id = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+        // Simulate conversation history by pushing a message into the agent
+        let agent = server.sessions.get_mut(&session_id).unwrap();
+        agent.messages.push(crate::llm::Message {
+            role: "user".to_string(),
+            content: vec![crate::llm::ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        });
+        assert_eq!(agent.message_count(), 1);
+
+        // Switch model (same provider — should succeed with test-key)
+        server.model_options = vec![
+            ModelOption::new("claude-sonnet-4-20250514", "Claude Sonnet 4", "anthropic"),
+            ModelOption::new("claude-haiku-4-20250514", "Claude Haiku 4", "anthropic"),
+        ];
+        let resp_str = server.handle_set_config_option(
+            11,
+            &json!({
+                "configId": "model",
+                "value": "claude-haiku-4-20250514",
+                "sessionId": session_id,
+            }),
+        );
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+        assert!(resp["error"].is_null(), "switch should succeed");
+
+        // Verify conversation history is preserved
+        let agent = server.sessions.get(&session_id).unwrap();
+        assert_eq!(
+            agent.message_count(),
+            1,
+            "messages must survive model switch"
+        );
+    }
+
+    #[test]
+    fn test_failed_switch_does_not_update_state() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut server = AcpServer::new();
+        server.model_options = vec![ModelOption::new("gpt-4.1-nano", "GPT-4.1 Nano", "openai")];
+
+        // No OpenAI credentials → rebuild will fail
+        let resp_str = server.handle_set_config_option(
+            12,
+            &json!({
+                "configId": "model",
+                "value": "gpt-4.1-nano",
+                "sessionId": "nonexistent-session",
+            }),
+        );
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+
+        // No session exists so it skips rebuild, state still updates
+        // (the guard only fires when session exists)
+        assert!(resp["error"].is_null());
+
+        // Now test with a real session that will fail on rebuild
+        // Reset state
+        server.active_model = None;
+        server.active_provider = None;
+
+        // Insert a dummy session using anthropic key
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
+        let provider = AnthropicProvider::from_env_with_model("claude-sonnet-4-20250514").unwrap();
+        let agent = Agent::new_boxed(Box::new(provider), "/tmp".to_string());
+        server.sessions.insert("test-session".to_string(), agent);
+
+        // Remove anthropic key and try to switch to anthropic model → should fail
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+        server.model_options = vec![ModelOption::new(
+            "claude-opus-4-20250514",
+            "Claude Opus 4",
+            "anthropic",
+        )];
+        let resp_str = server.handle_set_config_option(
+            13,
+            &json!({
+                "configId": "model",
+                "value": "claude-opus-4-20250514",
+                "sessionId": "test-session",
+            }),
+        );
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+
+        assert!(resp["error"].is_object(), "rebuild should fail");
+        // State should NOT have been updated
+        assert_eq!(
+            server.active_model, None,
+            "active_model must not change on failure"
+        );
+        assert_eq!(
+            server.active_provider, None,
+            "active_provider must not change on failure"
+        );
+    }
 }
