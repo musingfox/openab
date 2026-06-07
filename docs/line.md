@@ -95,7 +95,10 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 
 - **Threads** — LINE has no thread/topic concept. All messages in a chat share one agent session.
 - **Reactions** — LINE Bot API does not support message reactions.
-- **@mention gating** — Supported. Set `LINE_BOT_USER_ID` to your bot's LINE user ID (found via `GET /v2/bot/info`). When set, the gateway only forwards group/room messages where the bot is explicitly @-mentioned; 1:1 DMs are always forwarded. Without `LINE_BOT_USER_ID`, the bot responds to all group messages.
+- **@mention gating** — Supported (zero-config). In group/room chats the gateway only forwards messages where the bot is explicitly @-mentioned (LINE's native `mentionees[].isSelf` signal). 1:1 DMs are always forwarded. No env var is needed.
+  - *Limitation — non-text messages*: LINE only attaches mention data to text messages. Images, videos, stickers, files, and location messages in groups are silently dropped because they cannot carry an @-mention.
+  - *Limitation — `@All`*: A group-wide `@All` mention does **not** trigger the bot; only a direct `@BotName` mention does.
+  - *Breaking change*: This gating is always active. Deployments that previously relied on the bot responding to all group messages will need to @-mention the bot after upgrading.
 - **Markdown rendering** — LINE uses its own text formatting. Agent replies are sent as plain text.
 - **External-content images** — LINE image messages backed by `contentProvider.type = "external"` are not downloaded yet.
 
@@ -105,7 +108,6 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 |---|---|---|
 | `LINE_CHANNEL_SECRET` | Yes | Channel secret for webhook signature validation |
 | `LINE_CHANNEL_ACCESS_TOKEN` | Yes | Channel access token for Reply/Push Message API and LINE-hosted image downloads |
-| `LINE_BOT_USER_ID` | No | Bot's LINE user ID for @mention gating in groups. Find it via `GET https://api.line.me/v2/bot/info`. When set, only group/room messages that @mention the bot are forwarded. |
 
 ## Troubleshooting
 
