@@ -13,11 +13,23 @@
 
 A single OAB bot instance may serve multiple projects, each with its own steering files, skills, and workspace context. Today, there is no mechanism for a user to specify session-level parameters (working directory, model) when initiating a conversation. The bot always starts with its default configuration, requiring manual reconfiguration or separate bot instances per project.
 
-### 1.2 Existing Pattern
+### 1.2 Why Workspace Selection Matters
+
+Specifying a workspace at session start eliminates the manual warm-up cost. Without it, users spend the first several messages orienting the agent. With `[[ws:...]]`, the agent gains full project context immediately:
+
+- **Steering rules** — `AGENTS.md` and `.kiro/steering/` load automatically (coding style, architecture decisions, naming conventions). The agent knows how this project does things.
+- **Skills** — `.kiro/skills/` activate project-specific capabilities (e.g., review workflows, deployment helpers).
+- **File scope** — the agent's working directory is the project root; reads, searches, and writes target the correct codebase.
+- **Git context** — branch, remote, and commit history are correct for PR review, diff, and blame operations.
+- **Session isolation** — multiple projects served by one bot instance never leak context between sessions.
+
+In short: one directive replaces 3–5 round trips of "here's the repo, here's how we work, here's what I need."
+
+### 1.3 Existing Pattern
 
 OAB already has **output directives** — `[[key:value]]` syntax that agents prepend to their responses to control delivery behavior (e.g., `[[reply_to:...]]`). This pattern is well-understood, parsed reliably, and invisible to end users after processing.
 
-### 1.3 Opportunity
+### 1.4 Opportunity
 
 Extend the `[[key:value]]` convention to **input** (user → bot) messages, creating **control directives** that configure the session at creation time. This unifies the directive syntax across both directions and gives users declarative control over session initialization without requiring new slash commands or config files.
 
