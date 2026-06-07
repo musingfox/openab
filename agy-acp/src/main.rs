@@ -267,7 +267,38 @@ impl Adapter {
             }
             return None;
         }
-        Some((response_parts.join("\n"), max_idx))
+        let filtered = Self::filter_narration(&response_parts);
+        Some((filtered, max_idx))
+    }
+
+    /// Filter out leading narration ("I will ...") from response parts based on
+    /// the OPENAB_TOOL_DISPLAY environment variable.
+    /// - "full" / unset: return all parts joined (no filtering, preserves existing behavior)
+    /// - "compact" / "none": drop leading narration-only parts
+    fn filter_narration(parts: &[String]) -> String {
+        let should_filter = std::env::var("OPENAB_TOOL_DISPLAY")
+            .map(|v| {
+                let lower = v.to_lowercase();
+                lower == "compact" || lower == "none" || lower == "off"
+            })
+            .unwrap_or(false);
+
+        if !should_filter || parts.len() <= 1 {
+            return parts.join("\n");
+        }
+
+        // Find the first part that is NOT pure narration. Keep it and everything after.
+        let first_content = parts.iter().position(|p| !Self::is_narration(p)).unwrap_or(parts.len() - 1);
+        parts[first_content..].join("\n")
+    }
+
+    /// A part is considered narration if every non-empty line starts with "I will".
+    fn is_narration(text: &str) -> bool {
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.is_empty() {
+            return false;
+        }
+        lines.iter().all(|l| l.trim_start().starts_with("I will"))
     }
 
     fn evict_if_needed(&mut self) {
@@ -480,7 +511,9 @@ impl Adapter {
                     }
                 } else {
                     eprintln!("[agy-acp] WARN: could not bind conversation ID; single-turn mode");
-                    (Some(full_text.clone()), -1i64)
+                    let parts: Vec<String> = full_text.split("\n\n").map(String::from).collect();
+                    let filtered = Self::filter_narration(&parts);
+                    (Some(filtered), -1i64)
                 };
 
                 // Persist session state
@@ -1253,5 +1286,88 @@ mod tests {
         assert_eq!(result, None);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_is_narration_true() {
+        assert!(Adapter::is_narration("I will fetch the latest commits."));
+        assert!(Adapter::is_narration("I will fetch the latest commits.\nI will check the diff."));
+        assert!(Adapter::is_narration("I will read the file.\n\nI will analyze the output."));
+    }
+
+    #[test]
+    fn test_is_narration_false() {
+        assert!(!Adapter::is_narration("Here is the result."));
+        assert!(!Adapter::is_narration("I will fetch the commits.\nHere is the result."));
+        assert!(!Adapter::is_narration(""));
+    }
+
+    #[test]
+    fn test_filter_narration_drops_leading_narration() {
+        std::env::set_var("OPENAB_TOOL_DISPLAY", "compact");
+        let parts = vec![
+            "I will fetch the latest commits.\nI will check the diff.".to_string(),
+            "I will read the file.".to_string(),
+            "The fix is confirmed! LGTM ✅".to_string(),
+        ];
+        let result = Adapter::filter_narration(&parts);
+        assert_eq!(result, "The fix is confirmed! LGTM ✅");
+        std::env::remove_var("OPENAB_TOOL_DISPLAY");
+    }
+
+    #[test]
+    fn test_filter_narration_preserves_content_after_first_non_narration() {
+        std::env::set_var("OPENAB_TOOL_DISPLAY", "none");
+        let parts = vec![
+            "I will check things.".to_string(),
+            "Here is my analysis.".to_string(),
+            "I will also note this is fine.".to_string(),
+        ];
+        let result = Adapter::filter_narration(&parts);
+        assert_eq!(result, "Here is my analysis.\nI will also note this is fine.");
+        std::env::remove_var("OPENAB_TOOL_DISPLAY");
+    }
+
+    #[test]
+    fn test_filter_narration_full_mode() {
+        std::env::set_var("OPENAB_TOOL_DISPLAY", "full");
+        let parts = vec![
+            "I will fetch commits.".to_string(),
+            "Final answer here.".to_string(),
+        ];
+        let result = Adapter::filter_narration(&parts);
+        assert_eq!(result, "I will fetch commits.\nFinal answer here.");
+        std::env::remove_var("OPENAB_TOOL_DISPLAY");
+    }
+
+    #[test]
+    fn test_filter_narration_unset_defaults_to_full() {
+        std::env::remove_var("OPENAB_TOOL_DISPLAY");
+        let parts = vec![
+            "I will fetch commits.".to_string(),
+            "Final answer here.".to_string(),
+        ];
+        let result = Adapter::filter_narration(&parts);
+        assert_eq!(result, "I will fetch commits.\nFinal answer here.");
+    }
+
+    #[test]
+    fn test_filter_narration_single_part_unchanged() {
+        let parts = vec!["I will do something.".to_string()];
+        let result = Adapter::filter_narration(&parts);
+        assert_eq!(result, "I will do something.");
+    }
+
+    #[test]
+    fn test_filter_narration_all_narration_keeps_last() {
+        std::env::set_var("OPENAB_TOOL_DISPLAY", "compact");
+        let parts = vec![
+            "I will fetch the file.".to_string(),
+            "I will check the output.".to_string(),
+            "I will verify the fix.".to_string(),
+        ];
+        let result = Adapter::filter_narration(&parts);
+        assert_eq!(result, "I will verify the fix.");
+        std::env::remove_var("OPENAB_TOOL_DISPLAY");
     }
 }
