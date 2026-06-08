@@ -152,7 +152,7 @@ aws-sm://<secret-id>#<json-key>
 ```
 exec://<script-path> <key> <attribute>
 ```
-- `<script-path>` — absolute or relative path to executable (relative to `working_dir`)
+- `<script-path>` — absolute path to executable
 - `<key>` — first argument: which secret to fetch
 - `<attribute>` — second argument: which field/attribute within that secret
 - Script must output the secret value to stdout (single line, no trailing newline)

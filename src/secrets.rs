@@ -112,6 +112,7 @@ async fn resolve_exec(key: &str, uri: &str, cfg: &SecretsConfig) -> anyhow::Resu
     }
 
     let mut cmd = tokio::process::Command::new(script);
+    cmd.kill_on_drop(true);
     // Pass remaining parts as arguments (key, attribute)
     for arg in parts_iter {
         if !arg.is_empty() {
