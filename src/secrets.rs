@@ -418,4 +418,26 @@ mod tests {
         assert_eq!(id, "my#secret");
         assert_eq!(key, "api_key");
     }
+
+    #[tokio::test]
+    async fn resolve_exec_sanitized_env() {
+        use crate::config::{AwsSecretsConfig, ExecSecretsConfig, SecretsConfig};
+        // Set a dummy env var that should NOT be visible to the exec script
+        std::env::set_var("OPENAB_TEST_LEAKED_SECRET", "should_not_leak");
+        let cfg = SecretsConfig {
+            aws: AwsSecretsConfig::default(),
+            exec: ExecSecretsConfig { timeout_seconds: 5 },
+            refs: HashMap::new(),
+        };
+        // /usr/bin/env prints all env vars; grep for our dummy var
+        let result = resolve_exec("test", "exec:///usr/bin/env", &cfg).await.unwrap();
+        assert!(
+            !result.contains("OPENAB_TEST_LEAKED_SECRET"),
+            "exec script should not see unrelated env vars"
+        );
+        // HOME and PATH should still be present
+        assert!(result.contains("HOME="), "HOME should be in sanitized env");
+        assert!(result.contains("PATH="), "PATH should be in sanitized env");
+        std::env::remove_var("OPENAB_TEST_LEAKED_SECRET");
+    }
 }
