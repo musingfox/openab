@@ -8,13 +8,13 @@ RUN touch src/main.rs && cargo build --release
 
 # --- Runtime stage ---
 FROM node:22-bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git procps ripgrep tini bubblewrap socat unzip && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git procps ripgrep tini bubblewrap socat unzip jq fd-find && rm -rf /var/lib/apt/lists/*
 
 # Install pi-acp adapter and Pi coding agent CLI.
 # The Pi coding agent npm package was renamed from @mariozechner/pi-coding-agent to @earendil-works/pi-coding-agent.
 ARG PI_ACP_VERSION=0.0.27
 ARG PI_CODING_AGENT_VERSION=0.78.0
-RUN npm install -g pi-acp@${PI_ACP_VERSION} @earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION} --retry 3
+RUN npm install -g pi-acp@${PI_ACP_VERSION} @earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION} bun --retry 3
 
 # Install gh CLI (matches other Dockerfiles)
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -23,6 +23,14 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       > /etc/apt/sources.list.d/github-cli.list && \
     apt-get update && apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
+
+# Extra CLIs for agents: fd (Debian ships the binary as fdfind), yq (mikefarah),
+# uv (Astral). bun is added to the global npm install above.
+RUN ln -s "$(command -v fdfind)" /usr/local/bin/fd && \
+    ARCH="$(dpkg --print-architecture)" && \
+    curl -fsSL "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${ARCH}" -o /usr/local/bin/yq && \
+    chmod +x /usr/local/bin/yq
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 ENV HOME=/home/node
 WORKDIR /home/node
