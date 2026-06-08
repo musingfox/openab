@@ -4,11 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-
-const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
@@ -235,7 +232,7 @@ impl AcpServer {
                 if active_provider == "anthropic" {
                     "claude-sonnet-4-20250514".to_string()
                 } else {
-                    "gpt-4.1-nano".to_string()
+                    "gpt-5.4-mini".to_string()
                 }
             });
         self.model_options = Self::available_models().await;
@@ -260,135 +257,18 @@ impl AcpServer {
     }
 
     /// List available models based on configured credentials.
-    /// Queries provider APIs when possible, falls back to known defaults.
+    /// Uses static model lists (same approach as Pi coding agent).
     async fn available_models() -> Vec<ModelOption> {
-        let has_anthropic = std::env::var("ANTHROPIC_API_KEY").is_ok();
-        let has_openai = crate::auth::load_tokens().is_ok();
-
-        let (anthropic_models, openai_models) = tokio::join!(
-            async {
-                if has_anthropic {
-                    Self::fetch_anthropic_models()
-                        .await
-                        .unwrap_or_else(|_| Self::fallback_anthropic_models())
-                } else {
-                    Vec::new()
-                }
-            },
-            async {
-                if has_openai {
-                    Self::fetch_openai_models()
-                        .await
-                        .unwrap_or_else(|_| Self::fallback_openai_models())
-                } else {
-                    Vec::new()
-                }
-            },
-        );
-
-        let mut models = anthropic_models;
-        models.extend(openai_models);
-
-        if models.is_empty() {
-            models.push(ModelOption::new(
-                "none",
-                "No credentials configured",
-                "none",
-            ));
-        }
-        models
+        Self::static_available_models()
     }
 
-    /// Fetch models from Anthropic /v1/models API.
-    async fn fetch_anthropic_models() -> Result<Vec<ModelOption>, String> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|e| e.to_string())?;
-        let client = reqwest::Client::builder()
-            .timeout(MODEL_DISCOVERY_TIMEOUT)
-            .build()
-            .map_err(|e| e.to_string())?;
-        let resp = client
-            .get("https://api.anthropic.com/v1/models")
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if !resp.status().is_success() {
-            return Err(format!("Anthropic API returned {}", resp.status()));
-        }
-
-        let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-        let mut models = Vec::new();
-        if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
-            for m in data {
-                if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
-                    // Only include chat models (claude-*)
-                    if id.starts_with("claude") {
-                        let display = m.get("display_name").and_then(|v| v.as_str()).unwrap_or(id);
-                        models.push(ModelOption::new(id, display, "anthropic"));
-                    }
-                }
-            }
-        }
-        if models.is_empty() {
-            return Err("No models returned from Anthropic API".to_string());
-        }
-        Ok(models)
-    }
-
-    /// Fetch models from OpenAI-compatible /models endpoint.
-    async fn fetch_openai_models() -> Result<Vec<ModelOption>, String> {
-        let tokens = crate::auth::load_tokens().map_err(|e| e.to_string())?;
-        let base_url = std::env::var("OPENAB_AGENT_OPENAI_BASE_URL")
-            .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string());
-        let client = reqwest::Client::builder()
-            .timeout(MODEL_DISCOVERY_TIMEOUT)
-            .build()
-            .map_err(|e| e.to_string())?;
-        let resp = client
-            .get(format!("{}/models", base_url))
-            .bearer_auth(&tokens.access_token)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if !resp.status().is_success() {
-            return Err(format!("OpenAI API returned {}", resp.status()));
-        }
-
-        let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-        let mut models = Vec::new();
-        // Handle both { "data": [...] } and [...] shapes
-        let items = body
-            .get("data")
-            .and_then(|d| d.as_array())
-            .or_else(|| body.as_array());
-        if let Some(data) = items {
-            for m in data {
-                if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
-                    let name = m
-                        .get("name")
-                        .or_else(|| m.get("id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(id);
-                    models.push(ModelOption::new(id, name, "openai"));
-                }
-            }
-        }
-        if models.is_empty() {
-            return Err("No models returned from OpenAI API".to_string());
-        }
-        Ok(models)
-    }
-
-    fn fallback_available_models() -> Vec<ModelOption> {
+    fn static_available_models() -> Vec<ModelOption> {
         let mut models = Vec::new();
         if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-            models.extend(Self::fallback_anthropic_models());
+            models.extend(Self::static_anthropic_models());
         }
         if crate::auth::load_tokens().is_ok() {
-            models.extend(Self::fallback_openai_models());
+            models.extend(Self::static_openai_models());
         }
         if models.is_empty() {
             models.push(ModelOption::new(
@@ -400,18 +280,36 @@ impl AcpServer {
         models
     }
 
-    fn fallback_anthropic_models() -> Vec<ModelOption> {
+    fn static_anthropic_models() -> Vec<ModelOption> {
+        // From models.dev/api.json — Anthropic models with tool_call support.
+        // Dated versions used for deterministic pinning.
         vec![
+            ModelOption::new("claude-haiku-4-5-20251001", "Claude Haiku 4.5", "anthropic"),
             ModelOption::new("claude-sonnet-4-20250514", "Claude Sonnet 4", "anthropic"),
-            ModelOption::new("claude-haiku-4-20250514", "Claude Haiku 4", "anthropic"),
+            ModelOption::new(
+                "claude-sonnet-4-5-20250929",
+                "Claude Sonnet 4.5",
+                "anthropic",
+            ),
+            ModelOption::new("claude-sonnet-4-6", "Claude Sonnet 4.6", "anthropic"),
+            ModelOption::new("claude-opus-4-20250514", "Claude Opus 4", "anthropic"),
+            ModelOption::new("claude-opus-4-1-20250805", "Claude Opus 4.1", "anthropic"),
+            ModelOption::new("claude-opus-4-5-20251101", "Claude Opus 4.5", "anthropic"),
+            ModelOption::new("claude-opus-4-6", "Claude Opus 4.6", "anthropic"),
+            ModelOption::new("claude-opus-4-7", "Claude Opus 4.7", "anthropic"),
+            ModelOption::new("claude-opus-4-8", "Claude Opus 4.8", "anthropic"),
         ]
     }
 
-    fn fallback_openai_models() -> Vec<ModelOption> {
+    fn static_openai_models() -> Vec<ModelOption> {
+        // Static list matching Pi's openai-codex provider models.
+        // chatgpt.com/backend-api/models does not support standard model listing,
+        // so we maintain this list explicitly (same approach as Pi coding agent).
         vec![
-            ModelOption::new("gpt-4.1-nano", "GPT-4.1 Nano", "openai"),
-            ModelOption::new("gpt-4.1-mini", "GPT-4.1 Mini", "openai"),
-            ModelOption::new("o4-mini", "o4-mini", "openai"),
+            ModelOption::new("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark", "openai"),
+            ModelOption::new("gpt-5.4", "GPT-5.4", "openai"),
+            ModelOption::new("gpt-5.4-mini", "GPT-5.4 mini", "openai"),
+            ModelOption::new("gpt-5.5", "GPT-5.5", "openai"),
         ]
     }
 
@@ -487,7 +385,7 @@ impl AcpServer {
         }
 
         let models = if self.model_options.is_empty() {
-            Self::fallback_available_models()
+            Self::static_available_models()
         } else {
             self.model_options.clone()
         };
