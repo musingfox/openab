@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 # Install pi-acp adapter and Pi coding agent CLI.
 # The Pi coding agent npm package was renamed from @mariozechner/pi-coding-agent to @earendil-works/pi-coding-agent.
 ARG PI_ACP_VERSION=0.0.27
-ARG PI_CODING_AGENT_VERSION=0.75.5
+ARG PI_CODING_AGENT_VERSION=0.78.1
 RUN npm install -g pi-acp@${PI_ACP_VERSION} @earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION} --retry 3
 
 # Install gh CLI (matches other Dockerfiles)
