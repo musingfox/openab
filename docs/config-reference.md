@@ -500,6 +500,7 @@ Key mapping (`values.yaml` → `config.toml`):
 | `agents.<name>.slack.*` | `[slack] *` (same pattern) |
 | `agents.<name>.pool.maxSessions` | `[pool] max_sessions` |
 | `agents.<name>.pool.sessionTtlHours` | `[pool] session_ttl_hours` |
+| `agents.<name>.workspace.aliases.<alias>` | `[workspace.aliases] <alias>` |
 | `agents.<name>.reactions.enabled` | `[reactions] enabled` |
 | `agents.<name>.reactions.toolDisplay` | `[reactions] tool_display` |
 | `agents.<name>.workspace.aliases.<alias>` | `[workspace.aliases] <alias>` |

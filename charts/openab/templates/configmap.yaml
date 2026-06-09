@@ -173,19 +173,6 @@ data:
     {{- end }}
     tool_display = {{ ($cfg.reactions).toolDisplay | toJson }}
     {{- end }}
-    {{- if ($cfg.workspace).aliases }}
-    {{- if not (kindIs "map" ($cfg.workspace).aliases) }}
-    {{- fail (printf "agents.%s.workspace.aliases must be a map — got: %T" $name ($cfg.workspace).aliases) }}
-    {{- end }}
-
-    [workspace.aliases]
-    {{- range $alias, $path := ($cfg.workspace).aliases }}
-    {{- if not (kindIs "string" $path) }}
-    {{- fail (printf "agents.%s.workspace.aliases.%s value must be a string — got: %v" $name $alias $path) }}
-    {{- end }}
-    {{ $alias | toJson }} = {{ $path | toJson }}
-    {{- end }}
-    {{- end }}
     {{- if ($cfg.stt).enabled }}
     {{- if not ($cfg.stt).apiKey }}
     {{ fail (printf "agents.%s.stt.apiKey is required when stt.enabled=true" $name) }}
@@ -327,6 +314,19 @@ data:
     {{- end }}
     timeout_seconds = {{ $ps.timeoutSeconds | default 60 }}
     on_failure = {{ $ps.onFailure | default "abort" | toJson }}
+    {{- end }}
+    {{- if and ($cfg.workspace) (not (kindIs "map" $cfg.workspace)) }}
+    {{- fail (printf "agents.%s.workspace must be a map — got: %v" $name $cfg.workspace) }}
+    {{- end }}
+    {{- if ($cfg.workspace).aliases }}
+
+    [workspace.aliases]
+    {{- range $alias, $path := ($cfg.workspace).aliases }}
+    {{- if not (kindIs "string" $path) }}
+    {{- fail (printf "agents.%s.workspace.aliases.%s value must be a string — got: %v" $name $alias $path) }}
+    {{- end }}
+    {{ $alias | toJson }} = {{ $path | toJson }}
+    {{- end }}
     {{- end }}
   {{- if $cfg.agentsMd }}
   AGENTS.md: |

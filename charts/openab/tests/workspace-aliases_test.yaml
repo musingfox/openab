@@ -40,3 +40,10 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "value must be a string"
+
+  - it: rejects workspace as non-map type
+    set:
+      agents.kiro.workspace: "not-a-map"
+    asserts:
+      - failedTemplate:
+          errorPattern: "workspace must be a map"
