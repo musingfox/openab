@@ -63,6 +63,8 @@ docker pull ghcr.io/openabdev/openab-agentcore:latest
 
 ## Deploying a Kiro Runtime
 
+> **Note:** AWS does not currently offer a pre-built managed Kiro runtime. You build and deploy the container yourself. This applies to all coding agents (Claude Code, Codex, Cursor, etc.) — AgentCore hosts your container, it doesn't provide one. This may change as AgentCore evolves.
+
 ### 1. Build the container (arm64 required)
 
 ```dockerfile
