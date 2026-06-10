@@ -20,7 +20,7 @@ This means:
 - **Pod-bound lifecycle.** If the pod restarts, the agent process (and any in-flight work) dies with it.
 - **Resource coupling.** The agent shares CPU/memory/disk with OpenAB — a 90-minute refactor starves the broker.
 
-AWS recently launched **Amazon Bedrock AgentCore Runtime**, which hosts coding agents (Kiro, Claude Code, Codex, etc.) in isolated Firecracker microVMs with persistent filesystems, session management, and streaming invoke APIs. This creates an opportunity: OpenAB can route messages to remote AgentCore sessions via SDK instead of local subprocesses, decoupling the agent lifecycle from the broker.
+AWS recently launched **Amazon Bedrock AgentCore Runtime**, which hosts coding agents (Kiro, Claude Code, Codex, etc.) in isolated Firecracker microVMs with persistent filesystems, session management, and streaming invoke APIs. This creates an opportunity: OpenAB can route messages to remote AgentCore sessions, decoupling the agent lifecycle from the broker.
 
 ### What this unlocks
 
@@ -31,232 +31,264 @@ AWS recently launched **Amazon Bedrock AgentCore Runtime**, which hosts coding a
 
 ---
 
-## 2. Design
+## 2. Integration Approaches
 
-### Architecture Overview
+Two viable approaches exist. We recommend **Option B**.
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│  OpenAB (Rust, always-on pod)                                      │
-│                                                                    │
-│  Discord/Slack ──► Dispatch ──┬── backend=acp ──► local subprocess │
-│                               │                                    │
-│                               └── backend=agentcore ──► AWS SDK    │
-│                                         │                          │
-└─────────────────────────────────────────┼──────────────────────────┘
-                                          │
-                              ┌────────────▼────────────────┐
-                              │  AgentCore Runtime (AWS)     │
-                              │                             │
-                              │  ┌─────────────────────┐    │
-                              │  │ microVM (Kiro)      │    │
-                              │  │ /mnt/workspace      │    │
-                              │  │ session: oab-thread1│    │
-                              │  └─────────────────────┘    │
-                              │                             │
-                              │  ┌─────────────────────┐    │
-                              │  │ microVM (Claude)    │    │
-                              │  │ /mnt/workspace      │    │
-                              │  │ session: oab-thread2│    │
-                              │  └─────────────────────┘    │
-                              └─────────────────────────────┘
-```
+### Option A: OAB native SDK backend
 
-### Message Flow
+Add a new `backend = "agentcore"` inside OAB that calls `InvokeAgentRuntime` directly via the AWS SDK.
 
 ```
-Inbound:
-  1. User sends message in Discord thread
-  2. OpenAB dispatch selects backend based on config (or @mention routing)
-  3. If backend=agentcore:
-     a. Build runtimeSessionId from thread key (≥33 chars)
-     b. Serialize prompt + sender context into JSON payload
-     c. Call InvokeAgentRuntime (streaming)
-  4. Stream response chunks back to Discord (same edit loop as ACP)
-
-Session Lifecycle:
-  - Discord thread ID → runtimeSessionId (deterministic mapping)
-  - First invoke on new session → cold start (microVM boot, ~5-15s)
-  - Subsequent invokes → reuse existing microVM (idle timer reset)
-  - Idle 15min (configurable) → microVM terminates, filesystem persists
-  - Next invoke → new microVM mounts same filesystem, agent resumes
+Discord → OAB ──AWS SDK──► AgentCore Runtime (microVM)
 ```
 
-### Two Invoke APIs
+### Option B: `agentcore-acp` adapter (recommended)
 
-AgentCore provides two complementary APIs. OpenAB uses primarily `InvokeAgentRuntime`:
-
-| API | Purpose | Response | OpenAB Use |
-|-----|---------|----------|------------|
-| `InvokeAgentRuntime` | Send prompt, get agent reasoning output | Streaming `text/event-stream` | Primary: Discord msg → agent → streaming reply |
-| `InvokeAgentRuntimeCommand` | Run shell command in same microVM | Streaming stdout/stderr events | Optional: deterministic ops (git push, npm test) |
-
-### Streaming Response Handling
-
-`InvokeAgentRuntime` returns `text/event-stream` with `data:` lines:
+Write a standalone ACP-compatible adapter binary that bridges ACP stdio to AgentCore SDK calls. OAB treats it like any other coding CLI — zero OAB changes.
 
 ```
-data: Starting analysis of the code...
-data: I can see the issue is in line 42...
-data: Here's my proposed fix:
-data: ```rust
-data: fn main() { ... }
-data: ```
+Discord → OAB ──ACP stdio──► agentcore-acp ──AWS SDK──► AgentCore Runtime (microVM)
 ```
 
-OpenAB consumes this identically to ACP streaming — progressive Discord message edits via the existing `AdapterRouter::edit_message` path.
+### Why Option B wins
+
+| Dimension | A. OAB native SDK | B. agentcore-acp adapter |
+|-----------|-------------------|--------------------------|
+| OAB code changes | Large — new trait, new backend, AWS SDK dep | **Zero** |
+| Thin bridge philosophy | Violated — OAB learns AWS specifics | **Preserved** — OAB only speaks ACP |
+| Onboarding pattern | New pattern for operators | **Same as kiro/claude/codex** |
+| Independent dev/test | Coupled to OAB release cycle | **Standalone binary**, own repo/release |
+| Language flexibility | Must be Rust (inside OAB) | **Any language** — Python PoC in hours |
+| Multi-runtime routing | Requires OAB routing logic | Multiple OAB instances or adapter-level routing |
+| Deployment | OAB pod needs IRSA for AgentCore | Adapter subprocess needs IRSA (same pod, same SA) |
+| Streaming fidelity | Direct event-stream consumption | Adapter translates to ACP notifications (tiny overhead) |
+
+Option A remains viable for future consideration if we find the ACP translation layer adds unacceptable latency or loses information. But given that every other agent integration (kiro-cli, claude-agent-acp, codex --acp, gemini --acp, opencode acp) follows the adapter pattern, Option B is the natural extension.
 
 ---
 
-## 3. Configuration
+## 3. Design: `agentcore-acp`
 
-### Single agent (simple)
-
-```toml
-[agent]
-backend = "agentcore"
-runtime_arn = "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/kiro-agent"
-region = "us-west-2"
-```
-
-### Multi-agent routing
-
-```toml
-[agent]
-backend = "agentcore"
-runtime_arn = "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/kiro-agent"
-region = "us-west-2"
-
-# Future: route by @mention to different runtimes
-# [agent.routes]
-# kiro = "arn:aws:...:runtime/kiro-agent"
-# claude = "arn:aws:...:runtime/claude-agent"
-# codex = "arn:aws:...:runtime/codex-agent"
-```
-
-### Hybrid (ACP + AgentCore coexist)
-
-In a future multi-agent config, some agents could be local ACP while others are remote AgentCore. This ADR focuses on the single-agent case first.
-
----
-
-## 4. Session ID Mapping
-
-AgentCore requires `runtimeSessionId` ≥ 33 characters. OpenAB thread keys are platform-specific (Discord: 18-20 digit snowflake, Slack: channel.thread_ts).
-
-**Strategy:** Prefix with `oab-` and pad/hash to guarantee length:
+### Architecture
 
 ```
-Discord thread 1514294613853208667
+┌─ agentcore-acp (subprocess, started by OAB) ─────────────────────┐
+│                                                                   │
+│  stdin ◄── ACP JSON-RPC from OAB                                  │
+│  stdout ──► ACP JSON-RPC notifications to OAB                     │
+│                                                                   │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │  ACP Server Layer                                           │  │
+│  │  - session/new → create/resume AgentCore session            │  │
+│  │  - session/prompt → InvokeAgentRuntime (streaming)          │  │
+│  │  - cancel → StopRuntimeSession (best-effort)               │  │
+│  └──────────────────────┬──────────────────────────────────────┘  │
+│                         │                                         │
+│  ┌──────────────────────▼──────────────────────────────────────┐  │
+│  │  AgentCore Client                                           │  │
+│  │  - boto3 / aws-sdk-rust / JS SDK                            │  │
+│  │  - invoke_agent_runtime(runtimeArn, sessionId, payload)     │  │
+│  │  - Stream text/event-stream → ACP content notifications     │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                                                                   │
+└───────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                ┌──────────────────────────┐
+                │  AgentCore Runtime (AWS)  │
+                │  ┌────────────────────┐  │
+                │  │ microVM            │  │
+                │  │ Kiro / Claude /    │  │
+                │  │ Codex / etc.       │  │
+                │  │ /mnt/workspace     │  │
+                │  └────────────────────┘  │
+                └──────────────────────────┘
+```
+
+### ACP Protocol Mapping
+
+| ACP Method (from OAB) | agentcore-acp Action |
+|------------------------|---------------------|
+| `session/new` | Generate `runtimeSessionId` from thread key, return session_id |
+| `session/prompt` | `invoke_agent_runtime(payload={"prompt": text})` → stream response → emit ACP `notifications/content` blocks on stdout |
+| `session/load` | Resume with same `runtimeSessionId` (AgentCore auto-mounts filesystem) |
+| `cancel` | Best-effort: no direct cancel API; can `stop_runtime_session` if needed |
+
+### Streaming Translation
+
+AgentCore returns `text/event-stream`:
+```
+data: I'll analyze the code...
+data: The issue is in line 42...
+data: Here's my fix:
+```
+
+`agentcore-acp` translates each chunk to ACP JSON-RPC notification:
+```json
+{"jsonrpc":"2.0","method":"notifications/content","params":{"type":"text","text":"I'll analyze the code..."}}
+{"jsonrpc":"2.0","method":"notifications/content","params":{"type":"text","text":"The issue is in line 42..."}}
+```
+
+This is the same format OAB already consumes from kiro-cli, claude-agent-acp, etc. — zero changes needed in OAB's streaming/edit logic.
+
+### Session ID Mapping
+
+AgentCore requires `runtimeSessionId` ≥ 33 characters. The adapter builds this deterministically from the ACP session context:
+
+```
+ACP session for Discord thread 1514294613853208667
   → runtimeSessionId = "oab-discord-1514294613853208667"  (34 chars ✓)
 
-Slack thread C0123456789.1234567890.123456
+ACP session for Slack thread C0123456789.1234567890.123456
   → runtimeSessionId = "oab-slack-C0123456789-1234567890-123456"  (43 chars ✓)
 ```
 
-The mapping is deterministic (no persistent state needed). Same thread always maps to same session. This enables:
-- Resume after OpenAB restart (no `thread_map.json` needed for AgentCore backend)
-- Multiple OpenAB replicas sharing the same AgentCore sessions
+Deterministic mapping means:
+- No persistent state file needed in the adapter
+- Resume works automatically after adapter restart
+- Multiple adapter instances can share the same AgentCore sessions
 
 ---
 
-## 5. Implementation Plan
+## 4. Configuration
 
-### Phase 1: Minimal viable backend
+From the OAB operator's perspective, `agentcore-acp` is just another agent command:
 
-1. Add `backend` field to `AgentConfig` (`"acp"` default, `"agentcore"` new)
-2. Define `AgentBackend` trait:
-   ```rust
-   #[async_trait]
-   trait AgentBackend: Send + Sync {
-       /// Send a prompt and stream response blocks back.
-       async fn stream_prompt(
-           &self,
-           session_key: &str,
-           prompt: &str,
-           extra_blocks: &[ContentBlock],
-           tx: mpsc::Sender<ContentBlock>,
-       ) -> Result<()>;
+```toml
+[agent]
+command = "agentcore-acp"
+args = ["--runtime-arn", "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/kiro-agent", "--region", "us-west-2"]
+working_dir = "/home/agent"
+# IAM credentials come from pod's service account (IRSA) — no env vars needed
+```
 
-       /// Cancel an in-flight turn (best-effort).
-       async fn cancel(&self, session_key: &str) -> Result<()>;
-   }
-   ```
-3. Implement `AcpBackend` (wraps existing `SessionPool` logic)
-4. Implement `AgentCoreBackend`:
-   - Uses `aws-sdk-bedrockagentcore` crate
-   - `stream_prompt` → `invoke_agent_runtime` with streaming response
-   - Parses `text/event-stream` lines into `ContentBlock::Text`
-   - Maps session_key → runtimeSessionId with prefix scheme
-5. Wire into dispatcher — replace direct `SessionPool` usage with `dyn AgentBackend`
+For multi-agent setups, deploy multiple OAB instances each pointing to a different runtime:
 
-### Phase 2: Cold start UX
+```toml
+# Instance 1: Kiro
+[agent]
+command = "agentcore-acp"
+args = ["--runtime-arn", "arn:aws:...:runtime/kiro-agent"]
 
-- Detect first-invoke latency (no streaming data for >3s)
-- Show ⏳ or "Starting agent environment..." reaction
-- Once streaming begins, switch to normal 🤔 thinking reaction
+# Instance 2: Claude Code
+[agent]
+command = "agentcore-acp"
+args = ["--runtime-arn", "arn:aws:...:runtime/claude-agent"]
+```
 
-### Phase 3: Multi-runtime routing (future)
-
-- Config-driven routing table (per @mention, per channel, per pattern)
-- Parallel invoke to multiple runtimes (race mode)
+Or, if the adapter supports it, a single adapter could route based on hints in the prompt/sender context (future enhancement).
 
 ---
 
-## 6. Differences from ACP Backend
+## 5. AgentCore Runtime Characteristics
 
-| Concern | ACP (current) | AgentCore (proposed) |
-|---------|--------------|---------------------|
+Key properties that the adapter must handle:
+
+| Property | Value | Implication |
+|----------|-------|-------------|
+| Session idle timeout | 15 min (configurable, up to 8hr) | Each invoke resets the timer; long gaps = cold start |
+| Max session lifetime | 8 hours | Long-running work needs session rotation |
+| Cold start | ~5-15s (microVM boot) | First invoke per session has visible latency |
+| Filesystem persistence | 14 days after last use | Agent state survives across session restarts |
+| Streaming response | `text/event-stream` over HTTP/2 | Real-time token delivery, translatable to ACP |
+| Parallelism | Independent microVM per session | No resource contention between sessions |
+| Cost model | CPU-seconds + peak memory | Idle sessions cost nothing after termination |
+
+### Comparison with local ACP
+
+| Concern | ACP (local subprocess) | agentcore-acp (remote) |
+|---------|----------------------|------------------------|
 | Agent location | Same container | Remote microVM |
-| Startup | Already running (subprocess) | Cold start on first invoke (~5-15s) |
+| Startup | Already running | Cold start on first invoke (~5-15s) |
 | Session state | In-memory (process) | Persistent filesystem (/mnt/workspace) |
-| Credential isolation | Shared pod env | Fully isolated (IAM + Gateway) |
-| Tool permission prompt | Supported (mid-turn stdin) | Not supported — must trust all tools |
-| Streaming format | ACP JSON-RPC notifications | HTTP/2 event-stream (`data:` lines) |
+| Credential isolation | Shared pod env | Fully isolated (IAM + AgentCore Gateway) |
+| Tool permission prompt | Supported (mid-turn) | Not supported — agents run autonomously |
 | Max session duration | Unlimited (until pod dies) | 8 hours (configurable) |
-| Idle behavior | Stays alive (in pool) | Auto-terminates after idle timeout |
-| Resume after kill | Lost (unless session/save) | Automatic (filesystem persists 14 days) |
-| Parallelism | One process per thread, shared CPU | One microVM per session, independent |
-| Cost model | Always-on pod cost | Pay per CPU-second + peak memory |
+| Resume after restart | Lost (unless session/save) | Automatic (filesystem persists) |
+| Parallelism | Shared CPU per pod | One microVM per session |
+
+---
+
+## 6. Implementation Plan
+
+### Phase 1: Python PoC
+
+Minimal `agentcore-acp` in Python (fastest path to validation):
+
+1. ACP stdio server (read JSON-RPC from stdin, write to stdout)
+2. `session/new` → generate runtimeSessionId
+3. `session/prompt` → `boto3.client('bedrock-agentcore').invoke_agent_runtime()` with streaming
+4. Parse `response["response"].iter_lines()` → emit ACP content notifications
+5. Package as a single script or small pip package
+
+**Deliverable:** Working end-to-end demo: Discord message → OAB → agentcore-acp → AgentCore → streaming reply in Discord.
+
+### Phase 2: Production hardening
+
+1. Proper error handling (throttling, session terminated, cold start detection)
+2. Cold start UX: emit a "⏳ Starting agent environment..." notification before streaming begins
+3. Session resume logic (detect if session was idle-terminated, re-invoke transparently)
+4. Config file support (runtime ARN, region, payload template, timeout)
+5. Logging and observability (structured logs, latency metrics)
+
+### Phase 3: Advanced features
+
+1. Multi-runtime routing within a single adapter instance
+2. `InvokeAgentRuntimeCommand` support for deterministic operations (exposed as an ACP tool?)
+3. Rust rewrite for performance/single-binary distribution (if Python overhead is measurable)
+4. Integration with AgentCore Gateway MCP for tool access
 
 ---
 
 ## 7. Open Questions
 
-1. **Payload format standardization** — Different AgentCore runtimes may expect different payload schemas (`{"prompt": "..."}` vs raw text vs MCP). Do we need a `payload_template` config field?
+1. **Payload format** — Different AgentCore runtimes may expect different payload schemas (`{"prompt": "..."}` vs raw text vs MCP). Do we need a `--payload-template` flag?
 
-2. **Response format parsing** — If the agent runtime returns structured JSON (not plain text streaming), how do we extract the "message" portion? May need a configurable response extractor.
+2. **Session context passthrough** — Should the adapter forward OAB's sender context (user name, channel, etc.) in the payload so the remote agent knows who's asking?
 
-3. **OAuth-based invocation** — AgentCore docs state that OAuth-integrated runtimes cannot use the SDK; they require raw HTTPS. If a runtime uses AgentCore Identity/Gateway with OAuth, OpenAB would need to use `reqwest` directly instead of the AWS SDK. How common is this pattern?
+3. **Human-in-the-loop** — ACP supports mid-turn tool permission prompts. AgentCore agents run autonomously. Is this acceptable, or do we need a callback mechanism via the adapter?
 
-4. **Human-in-the-loop** — ACP supports mid-turn tool permission prompts (agent asks user "can I run this command?"). AgentCore agents run autonomously. Is this acceptable, or do we need a callback mechanism?
+4. **Cold start notification** — How should the adapter signal to OAB that the agent is booting? Options: immediate ACP notification ("Starting environment..."), or let OAB's existing stall detection handle it.
 
-5. **Multi-agent routing UX** — How should users specify which agent handles which message? Options: @mention, channel binding, slash command, or auto-detect.
+5. **Cancel semantics** — AgentCore has `StopRuntimeSession` but no mid-invoke cancel. Should `cancel` kill the entire session (losing state), or just be a no-op?
 
-6. **Error recovery** — If `InvokeAgentRuntime` fails (throttling, session terminated), should OpenAB auto-retry with a new session, or surface the error to the user?
+6. **Multi-agent routing** — Single adapter routing to multiple runtimes, or multiple adapter instances? Former is more convenient, latter is simpler.
+
+7. **Language choice for production** — Python (fast to write, boto3 native), Rust (single binary, matches OAB ecosystem), or Node.js (middle ground)?
 
 ---
 
 ## 8. Alternatives Considered
 
-### A. Keep ACP-only, run OpenAB on AgentCore
+### A. OAB native SDK backend (not recommended for now)
 
-Deploy the entire OpenAB + agent container on AgentCore Runtime instead. This works but:
+Add `backend = "agentcore"` directly inside OAB with AWS SDK calls. This works but:
+- Violates the "thin bridge" philosophy — OAB shouldn't understand AWS specifics
+- Adds `aws-sdk-bedrockagentcore` as a compile-time dependency to OAB
+- Different release cycle (AgentCore API changes shouldn't require OAB rebuild)
+- Breaks the consistent "all agents are ACP subprocesses" mental model
+
+May revisit if the ACP translation layer proves to be a bottleneck.
+
+### B. Deploy OAB itself on AgentCore
+
+Run the entire OpenAB + agent container on AgentCore Runtime. This works but:
 - Still couples agent to container
 - Doesn't leverage AgentCore's multi-session isolation
-- Doesn't enable multi-agent routing from one OpenAB instance
-- Loses the "thin bridge" philosophy — OpenAB becomes the thing being hosted, not the router
+- Doesn't enable dynamic routing from one OAB instance
+- Loses the thin bridge role
 
-### B. WebSocket relay to AgentCore
+### C. WebSocket relay to AgentCore
 
-Instead of SDK invoke, have a persistent WebSocket between OpenAB and a custom proxy that talks to AgentCore. Rejected because:
-- Adds another service to deploy and maintain
-- `InvokeAgentRuntime` already supports streaming; no need for an intermediary
-- Increases complexity without clear benefit
+Persistent WebSocket between OAB and a custom proxy. Rejected:
+- Adds another service to deploy
+- `InvokeAgentRuntime` already streams; no intermediary needed
+- More moving parts, same result
 
-### C. MCP-based integration via AgentCore Gateway
+### D. MCP-based integration via AgentCore Gateway
 
-Use AgentCore Gateway's MCP endpoint as the tool layer, keeping agents local. This is complementary (we could support it for tools) but doesn't solve the core problem of agent lifecycle coupling.
+Use Gateway's MCP endpoint as a tool layer for local agents. Complementary (could add for tools) but doesn't solve the agent lifecycle coupling problem.
 
 ---
 
@@ -269,3 +301,4 @@ Use AgentCore Gateway's MCP endpoint as the tool layer, keeping agents local. Th
 - [AgentCore Session Storage (Preview)](https://aws.amazon.com/about-aws/whats-new/2026/03/bedrock-agentcore-runtime-session-storage/)
 - [Handle Long-Running Agents](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-long-run.html)
 - [OpenAB DESIGN.md](../../DESIGN.md) — "Thin Bridge" philosophy
+- [ADR: openab-agent](./openab-agent.md) — Native agent pattern (similar standalone approach)
