@@ -916,6 +916,19 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
     // If [agentcore] is set and [agent] command was not explicitly provided,
     // synthesize agent config to spawn the bundled agentcore-acp adapter.
     if let Some(ref ac) = config.agentcore {
+        // Validate ARN format: arn:aws:bedrock-agentcore:REGION:ACCOUNT:runtime/ID
+        let parts: Vec<&str> = ac.runtime_arn.split(':').collect();
+        anyhow::ensure!(
+            parts.len() >= 6
+                && parts[0] == "arn"
+                && parts[2] == "bedrock-agentcore"
+                && !parts[3].is_empty()
+                && parts[5].starts_with("runtime/"),
+            "agentcore.runtime_arn is not a valid AgentCore Runtime ARN \
+             (expected arn:aws:bedrock-agentcore:REGION:ACCOUNT:runtime/ID, got \"{}\")",
+            ac.runtime_arn
+        );
+
         if !config.agent.command_explicit {
             config.agent = AgentConfig {
                 command: "uv".into(),
@@ -1360,5 +1373,18 @@ runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test"
         let ac = cfg.agentcore.unwrap();
         assert_eq!(ac.region(), "us-east-1");
         assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Stop);
+    }
+
+    #[test]
+    fn agentcore_rejects_invalid_arn() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "not-a-valid-arn"
+"#;
+        let err = parse_config(toml, "test").unwrap_err();
+        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
     }
 }
