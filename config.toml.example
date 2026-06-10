@@ -52,6 +52,14 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 #                                       # omitted = auto-detect from list (non-empty → false, empty → true)
 # allowed_users = ["U5678"]             # only checked when allow_all_users = false
 
+# --- AgentCore Runtime (alternative to [agent]) ---
+# When [agentcore] is set and [agent].command is not explicitly provided,
+# OAB auto-spawns the bundled agentcore-acp adapter. No manual wiring needed.
+# [agentcore]
+# runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
+# region = "us-east-1"           # default: us-east-1
+# cancel_strategy = "stop"       # "stop" (default) or "noop"
+
 [agent]
 command = "kiro-cli"
 args = ["acp", "--trust-all-tools"]

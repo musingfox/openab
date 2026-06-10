@@ -65,11 +65,31 @@ impl<'de> Deserialize<'de> for AllowBots {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentCoreConfig {
+    /// AgentCore Runtime ARN (required)
+    pub runtime_arn: String,
+    /// AWS region (default: us-east-1)
+    #[serde(default = "default_agentcore_region")]
+    pub region: String,
+    /// Cancel strategy: "noop" or "stop" (default: stop)
+    #[serde(default = "default_agentcore_cancel_strategy")]
+    pub cancel_strategy: String,
+}
+
+fn default_agentcore_region() -> String {
+    "us-east-1".into()
+}
+fn default_agentcore_cancel_strategy() -> String {
+    "stop".into()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub discord: Option<DiscordConfig>,
     pub slack: Option<SlackConfig>,
     pub gateway: Option<GatewayConfig>,
+    pub agentcore: Option<AgentCoreConfig>,
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
@@ -854,8 +874,32 @@ async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
 }
 
 fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
-    let config: Config = toml::from_str(expanded)
+    let mut config: Config = toml::from_str(expanded)
         .map_err(|e| anyhow::anyhow!("failed to parse config from {source}: {e}"))?;
+
+    // If [agentcore] is set and [agent] command was not explicitly provided,
+    // synthesize agent config to spawn the bundled agentcore-acp adapter.
+    if let Some(ref ac) = config.agentcore {
+        if config.agent.command == default_agent_command() {
+            config.agent = AgentConfig {
+                command: "uv".into(),
+                args: vec![
+                    "run".into(),
+                    "--script".into(),
+                    "agentcore-acp/agentcore_acp.py".into(),
+                    "--runtime-arn".into(),
+                    ac.runtime_arn.clone(),
+                    "--region".into(),
+                    ac.region.clone(),
+                    "--cancel-strategy".into(),
+                    ac.cancel_strategy.clone(),
+                ],
+                working_dir: config.agent.working_dir.clone(),
+                env: config.agent.env.clone(),
+                inherit_env: config.agent.inherit_env.clone(),
+            };
+        }
+    }
 
     // Validate max_buffered_messages > 0 (tokio::sync::mpsc::channel panics on 0)
     // and max_batch_tokens > 0 (otherwise the consumer's token-cap check forces every
@@ -1229,5 +1273,56 @@ command = "echo"
             toml::from_str("bot_token = \"x\"\napp_token = \"y\"\nassistant_mode = false\n")
                 .unwrap();
         assert!(!cfg2.assistant_mode);
+    }
+
+    #[test]
+    fn agentcore_config_synthesizes_agent_command() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
+region = "us-west-2"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.agent.command, "uv");
+        assert!(cfg.agent.args.contains(&"--runtime-arn".to_string()));
+        assert!(cfg
+            .agent
+            .args
+            .contains(&"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent".to_string()));
+        assert!(cfg.agent.args.contains(&"us-west-2".to_string()));
+    }
+
+    #[test]
+    fn agentcore_config_does_not_override_explicit_agent() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agent]
+command = "my-custom-agent"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.agent.command, "my-custom-agent");
+    }
+
+    #[test]
+    fn agentcore_config_defaults() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let ac = cfg.agentcore.unwrap();
+        assert_eq!(ac.region, "us-east-1");
+        assert_eq!(ac.cancel_strategy, "stop");
     }
 }
