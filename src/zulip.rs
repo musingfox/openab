@@ -127,6 +127,7 @@ fn email_is_bot(email: &str) -> bool {
 /// DMs (where channel-level allowlisting is N/A but user-level still applies).
 /// `sender_id` is the numeric sender ID as a string. Lists hold numeric IDs as
 /// strings to match the schema parity with Slack/Discord.
+#[cfg(test)]
 pub fn allowlist_accepts(
     stream_id: Option<&str>,
     sender_id: &str,
@@ -1378,7 +1379,7 @@ pub async fn run_zulip_adapter(
                 let channel_allowed = params.allow_all_channels
                     || stream_id
                         .as_deref()
-                        .map_or(true, |sid| params.allowed_channels.contains(sid));
+                        .is_none_or(|sid| params.allowed_channels.contains(sid));
                 if !channel_allowed {
                     debug!(
                         stream_id = ?stream_id,
