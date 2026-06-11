@@ -736,6 +736,7 @@ impl AdapterRouter {
                                     }
                                 }
                                 AcpEvent::ToolStart { id, title } if !title.is_empty() => {
+                                    // Live indicator: assistant status line vs emoji reaction.
                                     if assistant_status {
                                         let _ = adapter
                                             .set_status(
@@ -745,63 +746,72 @@ impl AdapterRouter {
                                             .await;
                                     } else {
                                         reactions.set_tool(&title).await;
-                                        let title = sanitize_title(&title);
-                                        if let Some(slot) =
-                                            tool_lines.iter_mut().find(|e| e.id == id)
-                                        {
-                                            slot.title = title;
-                                            slot.state = ToolState::Running;
-                                        } else {
-                                            tool_lines.push(ToolEntry {
-                                                id,
-                                                title,
-                                                state: ToolState::Running,
-                                            });
-                                        }
-                                        if let Some(tx) = &buf_tx {
-                                            let _ = tx.send(compose_display(
-                                                &tool_lines,
-                                                &text_buf,
-                                                true,
-                                                tool_display,
-                                            ));
-                                        }
+                                    }
+                                    // Record the tool in BOTH modes so the finalized message keeps
+                                    // a tool summary (compose_display, gated by tool_display). In
+                                    // assistant_mode the status line is transient and cleared before
+                                    // the reply, so without this the message would retain no record
+                                    // of which tools ran.
+                                    let title = sanitize_title(&title);
+                                    if let Some(slot) =
+                                        tool_lines.iter_mut().find(|e| e.id == id)
+                                    {
+                                        slot.title = title;
+                                        slot.state = ToolState::Running;
+                                    } else {
+                                        tool_lines.push(ToolEntry {
+                                            id,
+                                            title,
+                                            state: ToolState::Running,
+                                        });
+                                    }
+                                    // Post+edit live update (no-op under native streaming: buf_tx is None).
+                                    if let Some(tx) = &buf_tx {
+                                        let _ = tx.send(compose_display(
+                                            &tool_lines,
+                                            &text_buf,
+                                            true,
+                                            tool_display,
+                                        ));
                                     }
                                 }
                                 AcpEvent::ToolDone { id, title, status } => {
+                                    // Live indicator: assistant status line vs emoji reaction.
                                     if assistant_status {
                                         let _ = adapter
                                             .set_status(&thread_channel, "Thinking…")
                                             .await;
                                     } else {
                                         reactions.set_thinking().await;
-                                        let new_state = if status == "completed" {
-                                            ToolState::Completed
-                                        } else {
-                                            ToolState::Failed
-                                        };
-                                        if let Some(slot) =
-                                            tool_lines.iter_mut().find(|e| e.id == id)
-                                        {
-                                            if !title.is_empty() {
-                                                slot.title = sanitize_title(&title);
-                                            }
-                                            slot.state = new_state;
-                                        } else if !title.is_empty() {
-                                            tool_lines.push(ToolEntry {
-                                                id,
-                                                title: sanitize_title(&title),
-                                                state: new_state,
-                                            });
+                                    }
+                                    // Update the tool's state in BOTH modes (see ToolStart) so the
+                                    // finalized message's tool summary reflects completion/failure.
+                                    let new_state = if status == "completed" {
+                                        ToolState::Completed
+                                    } else {
+                                        ToolState::Failed
+                                    };
+                                    if let Some(slot) =
+                                        tool_lines.iter_mut().find(|e| e.id == id)
+                                    {
+                                        if !title.is_empty() {
+                                            slot.title = sanitize_title(&title);
                                         }
-                                        if let Some(tx) = &buf_tx {
-                                            let _ = tx.send(compose_display(
-                                                &tool_lines,
-                                                &text_buf,
-                                                true,
-                                                tool_display,
-                                            ));
-                                        }
+                                        slot.state = new_state;
+                                    } else if !title.is_empty() {
+                                        tool_lines.push(ToolEntry {
+                                            id,
+                                            title: sanitize_title(&title),
+                                            state: new_state,
+                                        });
+                                    }
+                                    if let Some(tx) = &buf_tx {
+                                        let _ = tx.send(compose_display(
+                                            &tool_lines,
+                                            &text_buf,
+                                            true,
+                                            tool_display,
+                                        ));
                                     }
                                 }
                                 AcpEvent::ConfigUpdate { options } => {
