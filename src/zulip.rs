@@ -3658,9 +3658,10 @@ mod tests {
         assert!(!entry.is_bot, "human entry must be classified is_bot==false");
     }
 
-    /// H4: count above the user allowlist + channel-only warning. allow_all_users
-    /// FALSE, allowed_users EMPTY, allowed_channels={42}, max=2; two same-thread
-    /// non-mention bots → exactly one channel-only warning, empty log.
+    /// H4: bot turns are independent of the human user allowlist.
+    /// allow_all_users FALSE, allowed_users EMPTY, allowed_channels={42}, max=2;
+    /// two same-thread non-mention bots → first dispatches, second emits exactly
+    /// one channel-only warning.
     #[tokio::test(flavor = "current_thread")]
     async fn event_loop_restrictive_user_allowlist_still_counts_and_warns_channel_only() {
         let canned = vec![
@@ -3692,9 +3693,11 @@ mod tests {
             1,
             "channel-only warning fires despite the empty user allowlist"
         );
-        assert!(
-            sink.log.lock().unwrap().is_empty(),
-            "empty user allowlist blocks dispatch for both events"
+        let log = sink.log.lock().unwrap();
+        assert_eq!(
+            log.iter().filter(|e| e.sender_id == "8").count(),
+            1,
+            "human user allowlist must not block the first bot event; the turn limit blocks the second"
         );
     }
 
