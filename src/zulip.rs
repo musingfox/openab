@@ -1372,15 +1372,26 @@ pub async fn run_zulip_adapter(
                     tracker.on_human_message(&key);
                 }
 
-                if !allowlist_accepts(
-                    stream_id.as_deref(),
-                    &sender_id,
-                    params.allow_all_channels,
-                    params.allow_all_users,
-                    &params.allowed_channels,
-                    &params.allowed_users,
-                ) {
-                    debug!(stream_id = ?stream_id, sender_id = %sender_id, "zulip allowlist denied");
+                // Channel access applies to every sender. User access applies
+                // only to humans; bot senders are gated below by
+                // allow_bot_messages + trusted_bot_ids.
+                let channel_allowed = params.allow_all_channels
+                    || stream_id
+                        .as_deref()
+                        .map_or(true, |sid| params.allowed_channels.contains(sid));
+                if !channel_allowed {
+                    debug!(
+                        stream_id = ?stream_id,
+                        sender_id = %sender_id,
+                        "zulip channel allowlist denied"
+                    );
+                    continue;
+                }
+                if !is_bot
+                    && !params.allow_all_users
+                    && !params.allowed_users.contains(&sender_id)
+                {
+                    debug!(sender_id = %sender_id, "zulip user allowlist denied");
                     continue;
                 }
 
@@ -2892,6 +2903,52 @@ mod tests {
         assert!(
             !log.iter().any(|e| e.sender_id == "8"),
             "non-mentioned bot (8) must NOT dispatch under Mentions, got {log:?}"
+        );
+    }
+
+    /// Bot senders use trusted_bot_ids, not the human allowed_users list.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_loop_trusted_bot_bypasses_human_user_allowlist() {
+        let canned = vec![
+            users_me_ok(),
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","queue_id":"q1","last_event_id":-1}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[{"id":1,"type":"message","flags":["mentioned"],"message":{"stream_id":42,"subject":"x","sender_id":7,"sender_email":"relay-bot@example.com","content":"hi"}}]}"#.into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![("Content-Type", "application/json".into())],
+                body: r#"{"result":"success","events":[]}"#.into(),
+            },
+        ];
+        let base = spawn_mock(canned).await;
+        let adapter = Arc::new(ZulipAdapter::new(base, "b@x", "k"));
+        let mut params = make_params(&["42"]);
+        params.allow_all_users = false;
+        params.allowed_users = set(&["1086121"]);
+        params.allow_bot_messages = AllowBots::Mentions;
+        params.trusted_bot_ids = set(&["7"]);
+        let sink = Arc::new(RecordingSink::new());
+        let (tx, rx) = watch::channel(false);
+
+        let sink_clone = sink.clone();
+        let handle =
+            tokio::spawn(async move { run_zulip_adapter(adapter, params, sink_clone, rx).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+        let log = sink.log.lock().unwrap();
+        assert!(
+            log.iter().any(|e| e.sender_id == "7"),
+            "trusted bot must bypass the human allowed_users list, got {log:?}"
         );
     }
 
