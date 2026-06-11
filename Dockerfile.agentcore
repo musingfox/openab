@@ -31,7 +31,7 @@ ENV PATH="/home/agent/.local/bin:${PATH}"
 WORKDIR /home/agent
 
 COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
-COPY --chown=agent:agent agentcore-acp/agentcore_acp.py /opt/agentcore-acp/agentcore_acp.py
+COPY --chown=agent:agent agentcore/acp/agentcore_acp.py /opt/agentcore/acp/agentcore_acp.py
 
 USER agent
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \

@@ -47,7 +47,7 @@ If you need full control, use `[agent]` directly:
 ```toml
 [agent]
 command = "uv"
-args = ["run", "--script", "/opt/agentcore-acp/agentcore_acp.py", "--runtime-arn", "arn:aws:...", "--region", "us-east-1"]
+args = ["run", "--script", "/opt/agentcore/acp/agentcore_acp.py", "--runtime-arn", "arn:aws:...", "--region", "us-east-1"]
 ```
 
 ### Priority rules
@@ -69,6 +69,8 @@ docker pull ghcr.io/openabdev/openab-agentcore:latest
 > **Note:** AWS does not currently offer a pre-built managed Kiro runtime. You build and deploy the container yourself. This applies to all coding agents (Claude Code, Codex, Cursor, etc.) — AgentCore hosts your container, it doesn't provide one. This may change as AgentCore evolves.
 
 ### 1. Build the container (arm64 required)
+
+A ready-to-build Kiro runtime is at `agentcore/runtimes/kiro/`. Or build your own:
 
 ```dockerfile
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023

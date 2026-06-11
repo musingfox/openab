@@ -935,7 +935,7 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
                 args: vec![
                     "run".into(),
                     "--script".into(),
-                    "/opt/agentcore-acp/agentcore_acp.py".into(),
+                    "/opt/agentcore/acp/agentcore_acp.py".into(),
                     "--runtime-arn".into(),
                     ac.runtime_arn.clone(),
                     "--region".into(),
