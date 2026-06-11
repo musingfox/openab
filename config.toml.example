@@ -157,6 +157,10 @@ tables = "code"  # "code" (default) | "bullets" | "off"
 [reactions]
 enabled = true
 remove_after_reply = false
+# tool_display = "full"                 # "full" (default) | "compact" | "none"
+#                                       # Controls how tool calls appear in the final message.
+#                                       # Applies to both assistant_mode and post+edit mode.
+#                                       # Set "none" to hide the tool summary entirely.
 
 [reactions.emojis]
 queued = "👀"
