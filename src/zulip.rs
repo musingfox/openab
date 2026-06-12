@@ -1116,6 +1116,7 @@ fn build_dispatch_parts(
         arrived_at: std::time::Instant::now(),
         estimated_tokens,
         other_bot_present: false,
+        recipient: None,
     };
     (evt.thread_key.clone(), trigger_channel, buf)
 }
@@ -4818,6 +4819,7 @@ mod tests {
             working_dir: "/tmp".to_string(),
             env: Default::default(),
             inherit_env: vec![],
+            command_explicit: true,
         }
     }
 
@@ -4946,10 +4948,12 @@ mod tests {
             crate::markdown::TableMode::Code,
             60,
             30,
+            std::collections::HashMap::new(),
+            std::path::PathBuf::from("/tmp"),
         );
 
         let thread_key = "fake_zulip:t1";
-        pool.get_or_create(thread_key).await.expect("pool get_or_create");
+        pool.get_or_create(thread_key, None).await.expect("pool get_or_create");
 
         let trigger = e2e_message_ref();
         let reactions = std::sync::Arc::new(crate::reactions::StatusReactionController::new(
@@ -4969,6 +4973,7 @@ mod tests {
                 &trigger,
                 reactions,
                 false,
+                None,
             )
             .await
             .expect("stream_prompt_blocks");
@@ -5005,10 +5010,12 @@ mod tests {
             crate::markdown::TableMode::Code,
             60,
             30,
+            std::collections::HashMap::new(),
+            std::path::PathBuf::from("/tmp"),
         );
 
         let thread_key = "fake_default:t1";
-        pool.get_or_create(thread_key).await.expect("pool get_or_create");
+        pool.get_or_create(thread_key, None).await.expect("pool get_or_create");
 
         let trigger = e2e_message_ref();
         let reactions = std::sync::Arc::new(crate::reactions::StatusReactionController::new(
@@ -5028,6 +5035,7 @@ mod tests {
                 &trigger,
                 reactions,
                 false,
+                None,
             )
             .await
             .expect("stream_prompt_blocks");

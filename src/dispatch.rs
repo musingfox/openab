@@ -1630,7 +1630,7 @@ mod tests {
     async fn consumer_dispatch_preserves_thread_route_while_refreshing_origin_event_id() {
         let mock = Arc::new(MockDispatchTarget::new());
         let target: Arc<dyn DispatchTarget> = mock.clone();
-        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter::default());
         let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(1);
 
         let mut msg = make_msg("hi", 10);
