@@ -8,13 +8,14 @@ RUN touch src/main.rs && cargo build --release
 
 # --- Runtime stage ---
 FROM node:22-bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git procps ripgrep tini bubblewrap socat unzip && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git procps ripgrep tini bubblewrap socat unzip jq && rm -rf /var/lib/apt/lists/*
 
 # Install pi-acp adapter and Pi coding agent CLI.
 # The Pi coding agent npm package was renamed from @mariozechner/pi-coding-agent to @earendil-works/pi-coding-agent.
 ARG PI_ACP_VERSION=0.0.27
 ARG PI_CODING_AGENT_VERSION=0.75.5
-RUN npm install -g pi-acp@${PI_ACP_VERSION} @earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION} --retry 3
+ARG MCP_REMOTE_VERSION=0.1.38
+RUN npm install -g pi-acp@${PI_ACP_VERSION} @earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION} mcp-remote@${MCP_REMOTE_VERSION} --retry 3
 
 # Install gh CLI (matches other Dockerfiles)
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
