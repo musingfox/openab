@@ -214,13 +214,27 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// Opaque handle returned by `build_app`.
+///
+/// Holds background-task guards (e.g. the feishu WebSocket shutdown sender)
+/// that must remain alive for the lifetime of the server.  Drop this only after
+/// `axum::serve` returns.
+pub struct AppHandle {
+    /// Keeping this alive signals the feishu WS task to keep running.
+    /// Dropping it triggers shutdown via the watch channel.
+    pub feishu_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+}
+
 /// Build the full gateway application.
 ///
 /// Assembles AppState (reading env vars), mounts all adapter routes, wires the
-/// OAB WebSocket handler and the native adapter, and returns the ready-to-serve
-/// `Router`. The caller is responsible for binding a `TcpListener` and calling
+/// OAB WebSocket handler and the native adapter, spawns background tasks
+/// (feishu WebSocket, eviction loop), and returns the ready-to-serve `Router`
+/// plus an `AppHandle` that must be kept alive until the server exits.
+///
+/// The caller is responsible for binding a `TcpListener` and calling
 /// `axum::serve`.
-pub fn build_app() -> Router {
+pub async fn build_app() -> (Router, AppHandle) {
     let ws_token = std::env::var("GATEWAY_WS_TOKEN").ok();
 
     if ws_token.is_none() {
@@ -429,5 +443,32 @@ pub fn build_app() -> Router {
         });
     }
 
-    app.with_state(state)
+    // Resolve feishu bot identity and spawn feishu WebSocket long-connection if configured
+    let (feishu_shutdown_tx, feishu_shutdown_rx) = tokio::sync::watch::channel(false);
+    let feishu_shutdown_tx_opt = if let Some(ref f) = state.feishu {
+        f.resolve_bot_identity().await;
+        let ws_mode = adapters::feishu::FeishuConfig::from_env()
+            .map(|c| c.connection_mode == adapters::feishu::ConnectionMode::Websocket)
+            .unwrap_or(false);
+        if ws_mode {
+            match adapters::feishu::start_websocket(f, state.event_tx.clone(), feishu_shutdown_rx)
+                .await
+            {
+                Ok(_handle) => info!("feishu websocket task spawned"),
+                Err(e) => tracing::error!(err = %e, "feishu websocket startup failed"),
+            }
+        }
+        Some(feishu_shutdown_tx)
+    } else {
+        None
+    };
+
+    // Background task: evict expired media files (colocate store, TTL 2 min)
+    tokio::spawn(store::eviction_loop());
+
+    let handle = AppHandle {
+        feishu_shutdown_tx: feishu_shutdown_tx_opt,
+    };
+
+    (app.with_state(state), handle)
 }

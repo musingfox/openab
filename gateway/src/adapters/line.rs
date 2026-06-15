@@ -655,6 +655,7 @@ mod tests {
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(crate::LINE_WEBHOOK_CONCURRENCY_MAX)),
             client: reqwest::Client::new(),
+            native_senders: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let body = axum::body::Bytes::from(

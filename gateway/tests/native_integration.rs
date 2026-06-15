@@ -21,10 +21,12 @@ use futures_util::{SinkExt, StreamExt};
 /// Clears auth env so the OAB-side `/ws` accepts connections without a token.
 async fn spawn_full_app() -> u16 {
     std::env::remove_var("GATEWAY_WS_TOKEN");
-    let app = openab_gateway::build_app();
+    let (app, _handle) = openab_gateway::build_app().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
+        // keep _handle alive for the duration of the server task
+        let _h = _handle;
         axum::serve(listener, app).await.unwrap();
     });
     // brief moment for the listener task to be scheduled

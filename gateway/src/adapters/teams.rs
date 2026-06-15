@@ -666,6 +666,7 @@ mod tests {
             reply_token_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             line_webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(crate::LINE_WEBHOOK_CONCURRENCY_MAX)),
             client: reqwest::Client::new(),
+            native_senders: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 

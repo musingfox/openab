@@ -210,13 +210,38 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::{connect_async, tungstenite::Message as TMsg};
 
+    fn make_app_state(
+        senders: NativeSenders,
+        event_tx: broadcast::Sender<String>,
+    ) -> Arc<crate::AppState> {
+        use std::time::Instant;
+        use tokio::sync::Semaphore;
+        Arc::new(crate::AppState {
+            telegram_bot_token: None,
+            telegram_secret_token: None,
+            line_channel_secret: None,
+            line_access_token: None,
+            teams: None,
+            teams_service_urls: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            feishu: None,
+            google_chat: None,
+            wecom: None,
+            ws_token: None,
+            event_tx,
+            reply_token_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            line_webhook_semaphore: Arc::new(Semaphore::new(crate::LINE_WEBHOOK_CONCURRENCY_MAX)),
+            client: reqwest::Client::new(),
+            native_senders: senders,
+        })
+    }
+
     fn make_state() -> (NativeSenders, broadcast::Sender<String>, broadcast::Receiver<String>) {
         let senders: NativeSenders = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, event_rx) = broadcast::channel::<String>(64);
         (senders, event_tx, event_rx)
     }
 
-    async fn spawn_server(app: Router) -> u16 {
+    async fn spawn_server(app: axum::Router) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -225,11 +250,15 @@ mod tests {
         port
     }
 
+    fn build_router(senders: NativeSenders, event_tx: broadcast::Sender<String>) -> axum::Router {
+        router().with_state(make_app_state(senders, event_tx))
+    }
+
     // Example 1: inbound text → GatewayEvent(platform=native, schema=openab.gateway.event.v1)
     #[tokio::test]
     async fn inbound_text_produces_native_gateway_event() {
         let (senders, event_tx, mut event_rx) = make_state();
-        let app = router(senders, event_tx);
+        let app = build_router(senders, event_tx);
         let port = spawn_server(app).await;
 
         let url = format!("ws://127.0.0.1:{port}/native/ws");
@@ -257,7 +286,7 @@ mod tests {
     #[tokio::test]
     async fn outbound_reply_pushes_text_to_ws_client() {
         let (senders, event_tx, mut event_rx) = make_state();
-        let app = router(senders.clone(), event_tx);
+        let app = build_router(senders.clone(), event_tx);
         let port = spawn_server(app).await;
 
         let url = format!("ws://127.0.0.1:{port}/native/ws");
@@ -318,7 +347,7 @@ mod tests {
     #[tokio::test]
     async fn reply_routes_to_target_client_only() {
         let (senders, event_tx, mut event_rx) = make_state();
-        let app = router(senders.clone(), event_tx);
+        let app = build_router(senders.clone(), event_tx);
         let port = spawn_server(app).await;
 
         let url = format!("ws://127.0.0.1:{port}/native/ws");
@@ -400,7 +429,7 @@ mod tests {
         use axum::body::Body;
 
         let (senders, event_tx, _) = make_state();
-        let app = router(senders, event_tx);
+        let app = build_router(senders, event_tx);
 
         let req = Request::builder()
             .uri("/native")
