@@ -3,6 +3,10 @@ name = "openab-gateway"
 version = "0.5.4"
 edition = "2021"
 
+[lib]
+name = "openab_gateway"
+path = "src/lib.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
@@ -31,3 +35,4 @@ urlencoding = "2"
 
 [dev-dependencies]
 wiremock = "0.6"
+tower = { version = "0.5", features = ["util"] }
