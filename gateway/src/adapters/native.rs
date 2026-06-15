@@ -12,6 +12,7 @@
 ///   platform=native) whose `channel.id` matches a connected browser's connection ID
 ///   → pushes `{"type":"message","text":"..."}` over that WS connection.
 use crate::schema::*;
+use crate::AppState;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -80,9 +81,11 @@ document.getElementById('input').addEventListener('keydown', e => { if(e.key==='
 // ─── WS handler — one connection per browser tab ──────────────────────────────
 
 pub async fn ws_handler(
-    State((senders, event_tx)): State<(NativeSenders, broadcast::Sender<String>)>,
+    State(state): State<Arc<AppState>>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    let senders = state.native_senders.clone();
+    let event_tx = state.event_tx.clone();
     ws.on_upgrade(move |socket| handle_browser(socket, senders, event_tx))
 }
 
@@ -184,14 +187,17 @@ pub async fn dispatch_reply(senders: &NativeSenders, reply: &GatewayReply) {
 
 /// Build the native-adapter sub-router to be merged into the main axum Router.
 ///
+/// The router uses `Arc<AppState>` as its state (extracted from the parent
+/// app's shared state), so it must be merged *before* `with_state` is called
+/// on the parent router.
+///
 /// Routes exposed:
 ///   GET /native        → browser UI
 ///   GET /native/ws     → browser WebSocket
-pub fn router(senders: NativeSenders, event_tx: broadcast::Sender<String>) -> Router {
+pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/native", get(ui_handler))
         .route("/native/ws", get(ws_handler))
-        .with_state((senders, event_tx))
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

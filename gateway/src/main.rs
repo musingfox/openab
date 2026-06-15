@@ -72,6 +72,8 @@ pub struct AppState {
     pub line_webhook_semaphore: Arc<Semaphore>,
     /// Shared HTTP client for media downloads and API calls
     pub client: reqwest::Client,
+    /// Per-connection sender handles for the native adapter (E3)
+    pub native_senders: adapters::native::NativeSenders,
 }
 
 // --- WebSocket handler (OAB connects here) ---
@@ -196,6 +198,13 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                     warn!("reply for wecom but adapter not configured");
                                 }
                             }
+                            "native" => {
+                                adapters::native::dispatch_reply(
+                                    &state_for_recv.native_senders,
+                                    &reply,
+                                )
+                                .await;
+                            }
                             other => warn!(platform = other, "unknown reply platform"),
                         }
                     }
@@ -233,10 +242,15 @@ async fn main() -> Result<()> {
 
     let (event_tx, _) = broadcast::channel::<String>(256);
     let reply_token_cache: ReplyTokenCache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let native_senders: adapters::native::NativeSenders =
+        Arc::new(Mutex::new(HashMap::new()));
 
-    let mut app = Router::new()
+    let mut app: Router<Arc<AppState>> = Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health));
+
+    // Native adapter — always mounted (router merged before with_state)
+    app = app.merge(adapters::native::router());
 
     // Telegram adapter
     let telegram_bot_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
@@ -390,6 +404,7 @@ async fn main() -> Result<()> {
         reply_token_cache,
         line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
         client,
+        native_senders,
     });
 
     // Background task: sweep expired reply tokens every REPLY_TOKEN_TTL_SECS
